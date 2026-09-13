@@ -4610,19 +4610,33 @@ Commercial support is available at
 			position: relative;
 			isolation: isolate;
 		}
+		/* حلقه‌ی نئون با دو لایه ساخته می‌شود، نه با mask: چون این پنل روی header/main یک
+		   zoom غیر-۱ (۱.۲۵ دسکتاپ / ۰.۹ موبایل، چند خط پایین‌تر) می‌گذارد و mask چندلایه‌ی
+		   ترکیبی (content-box + composite:exclude) زیر zoom در کرومیوم درست کامپوزیت نمی‌شود -
+		   دقیقاً همون چیزی که باعث می‌شد کل گرادیان به‌صورت یک مستطیل چرخان و ماسک‌نشده دیده بشه.
+		   این روش mask را کنار می‌گذارد: ::before گرادیان را کامل زیر کارت می‌کشد، ::after با
+		   همون رنگ پس‌زمینه‌ی خود کارت (روشن/تاریک) همه‌جا به‌جز یک حلقه‌ی ۲ پیکسلی را می‌پوشاند -
+		   نتیجه‌ی یکسان، ولی صرفاً با رنگ‌آمیزی ساده‌ی جعبه‌ها، بدون هیچ کامپوزیت مسک‌ای. */
 		.neon-orbit::before {
 			content: '';
 			position: absolute;
 			inset: 0;
 			z-index: 0;
 			border-radius: inherit;
-			padding: 2px;
 			opacity: 0.5;
 			pointer-events: none;
-			-webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-			-webkit-mask-composite: xor;
-			mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-			mask-composite: exclude;
+		}
+		.neon-orbit::after {
+			content: '';
+			position: absolute;
+			inset: 2px;
+			z-index: 0;
+			border-radius: inherit;
+			pointer-events: none;
+			background: #ffffff;
+		}
+		.dark .neon-orbit::after {
+			background: #111a2e;
 		}
 		.neon-orbit > * {
 			position: relative;
