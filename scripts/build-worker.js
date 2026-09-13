@@ -23,6 +23,9 @@ const KEY16 = [22, 52, 5, 89, 102, 160, 34, 225, 124, 171, 221, 25, 173, 103, 93
 const KEY1 = 69;
 const CHUNK_SIZE = 120;
 const PLACEHOLDER = '/*__PAYLOAD_BLOCK__*/';
+const VERSION_PLACEHOLDER = '__CURRENT_VERSION__';
+// همان الگویی که داخل normal.js مقدار نسخه را اعلام می‌کند، مثلاً: const CURRENT_VERSION = '2.2.0';
+const VERSION_REGEX = /const\s+CURRENT_VERSION\s*=\s*['"]([^'"]+)['"]/;
 
 function xorWithKey16(buf) {
   const out = Buffer.alloc(buf.length);
@@ -70,13 +73,27 @@ function main() {
 ${arrText}
 ], ${KEY1});`;
 
+  // نسخه (CURRENT_VERSION) را از داخل خودِ normal.js می‌خوانیم
+  const versionMatch = source.match(VERSION_REGEX);
+  if (!versionMatch) {
+    throw new Error('الگوی "const CURRENT_VERSION = \'x.x.x\'" داخل normal.js پیدا نشد.');
+  }
+  const currentVersion = versionMatch[1];
+
   const template = fs.readFileSync(TEMPLATE_PATH, 'utf8');
   if (!template.includes(PLACEHOLDER)) {
     throw new Error(`نشانگر ${PLACEHOLDER} داخل worker.template.js پیدا نشد.`);
   }
-  const finalCode = template.replace(PLACEHOLDER, payloadBlock);
+  if (!template.includes(VERSION_PLACEHOLDER)) {
+    throw new Error(`نشانگر ${VERSION_PLACEHOLDER} داخل worker.template.js پیدا نشد.`);
+  }
+
+  const finalCode = template
+    .replace(PLACEHOLDER, payloadBlock)
+    .replace(VERSION_PLACEHOLDER, currentVersion);
+
   fs.writeFileSync(OUTPUT_PATH, finalCode, 'utf8');
-  console.log(`worker.js generated. Payload array length: ${arr.length}`);
+  console.log(`worker.js generated. Payload array length: ${arr.length}. CURRENT_VERSION: ${currentVersion}`);
 }
 
 main();
