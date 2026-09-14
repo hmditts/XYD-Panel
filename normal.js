@@ -4804,9 +4804,15 @@ Commercial support is available at
 			display: inline-block;
 			animation: liveValuePulse 0.55s ease-out;
 		}
-		/* نئون چرخان با opacity 0.5 دور هر یک از سه کارت مصرف - هر کارت سرعت/جهت متفاوت */
-		@keyframes neonOrbitSpin {
-			to { transform: rotate(360deg); }
+		/* نور نئون با یک درخشش ملایم و ثابت دور هر کارت + یک جرقه‌ی نور که به آرامی
+		   دور لبه‌ی کارت سر می‌خورد (نه یک گوه‌ی درشت که کل کارت دور خودش بچرخد). */
+		@keyframes neonOrbitTravel {
+			0% { background-position: 0% 0%; }
+			100% { background-position: 400% 0%; }
+		}
+		@keyframes neonOrbitGlow {
+			0%, 100% { opacity: 0.35; }
+			50% { opacity: 0.7; }
 		}
 		.neon-orbit {
 			position: relative;
@@ -4814,19 +4820,19 @@ Commercial support is available at
 		}
 		/* حلقه‌ی نئون با دو لایه ساخته می‌شود، نه با mask: چون این پنل روی header/main یک
 		   zoom غیر-۱ (۱.۲۵ دسکتاپ / ۰.۹ موبایل، چند خط پایین‌تر) می‌گذارد و mask چندلایه‌ی
-		   ترکیبی (content-box + composite:exclude) زیر zoom در کرومیوم درست کامپوزیت نمی‌شود -
-		   دقیقاً همون چیزی که باعث می‌شد کل گرادیان به‌صورت یک مستطیل چرخان و ماسک‌نشده دیده بشه.
-		   این روش mask را کنار می‌گذارد: ::before گرادیان را کامل زیر کارت می‌کشد، ::after با
+		   ترکیبی (content-box + composite:exclude) زیر zoom در کرومیوم درست کامپوزیت نمی‌شود.
+		   این روش mask را کنار می‌گذارد: ::before نور را کامل زیر کارت می‌کشد، ::after با
 		   همون رنگ پس‌زمینه‌ی خود کارت (روشن/تاریک) همه‌جا به‌جز یک حلقه‌ی ۲ پیکسلی را می‌پوشاند -
-		   نتیجه‌ی یکسان، ولی صرفاً با رنگ‌آمیزی ساده‌ی جعبه‌ها، بدون هیچ کامپوزیت مسک‌ای. */
+		   نتیجه یک حلقه‌ی نازک دور کارت، بدون هیچ کامپوزیت مسک‌ای. */
 		.neon-orbit::before {
 			content: '';
 			position: absolute;
 			inset: 0;
 			z-index: 0;
 			border-radius: inherit;
-			opacity: 0.5;
 			pointer-events: none;
+			background-size: 400% 100%;
+			animation: neonOrbitTravel 6s linear infinite, neonOrbitGlow 3s ease-in-out infinite;
 		}
 		.neon-orbit::after {
 			content: '';
@@ -4845,16 +4851,17 @@ Commercial support is available at
 			z-index: 1;
 		}
 		.neon-orbit-1::before {
-			background: conic-gradient(from 0deg, transparent 0%, #fb923c 16%, transparent 38%, transparent 62%, #fb923c 84%, transparent 100%);
-			animation: neonOrbitSpin 4s linear infinite;
+			background-image: linear-gradient(90deg, transparent 0%, #fb923c 8%, transparent 20%, transparent 75%, #fb923c 87%, transparent 100%);
+			animation-duration: 5s, 3s;
 		}
 		.neon-orbit-2::before {
-			background: conic-gradient(from 0deg, transparent 0%, #c084fc 16%, transparent 38%, transparent 62%, #c084fc 84%, transparent 100%);
-			animation: neonOrbitSpin 7s linear infinite reverse;
+			background-image: linear-gradient(90deg, transparent 0%, #c084fc 8%, transparent 20%, transparent 75%, #c084fc 87%, transparent 100%);
+			animation-duration: 7.5s, 3.4s;
+			animation-direction: reverse, normal;
 		}
 		.neon-orbit-3::before {
-			background: conic-gradient(from 0deg, transparent 0%, #60a5fa 16%, transparent 38%, transparent 62%, #60a5fa 84%, transparent 100%);
-			animation: neonOrbitSpin 5.5s linear infinite;
+			background-image: linear-gradient(90deg, transparent 0%, #60a5fa 8%, transparent 20%, transparent 75%, #60a5fa 87%, transparent 100%);
+			animation-duration: 6.2s, 3.8s;
 		}
 	</style>
 </head>
@@ -6172,7 +6179,6 @@ Commercial support is available at
 						<button type="button" onclick="pinnedLocationAdd()" class="px-3 py-2 bg-gray-600 hover:bg-gray-700 dark:bg-zinc-600 dark:hover:bg-zinc-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">افزودن</button>
 						<button type="button" onclick="savePinnedLocations()" id="save-pinned-locations-btn" class="px-3 py-2 bg-emerald-700 hover:bg-emerald-800 dark:bg-emerald-600 dark:hover:bg-emerald-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
 					</div>
-					<span class="text-[10px] text-gray-400 dark:text-zinc-500 block font-normal mt-1">این لیست فقط تعیین می‌کند کاربر جدید چه کشورهایی بگیرد و دکمه‌ی «بروزرسانی لوکیشن‌ها» چه کشورهایی را (بدون حذف چیزی) به کاربرای موجود اضافه کند؛ کشورهایی که از این لیست برداشته شوند برای کاربرایی که از قبل دارنشون همچنان کار می‌کنند و ترمیم خودکار می‌شوند. حداکثر ۲۰ لوکیشن به ازای هر کاربر.</span>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
@@ -6183,7 +6189,6 @@ Commercial support is available at
 						<input type="text" id="global-clean-ip-input" dir="ltr" placeholder="104.20.25.138" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 						<button type="button" onclick="saveGlobalCleanIp()" id="save-global-clean-ip-btn" class="px-3 py-2 bg-sky-700 hover:bg-sky-800 dark:bg-sky-600 dark:hover:bg-sky-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
 					</div>
-					<span class="text-[10px] text-gray-400 dark:text-zinc-500 block font-normal mt-1">این آی‌پی به‌صورت پیش‌فرض در فیلد «آی‌پی‌های تمیز کلودفلر» هنگام ایجاد کاربر جدید قرار می‌گیرد.</span>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
@@ -6205,7 +6210,6 @@ Commercial support is available at
 						<input type="text" id="inline-proxy-ip-input" dir="ltr" placeholder="178.105.227.210" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 						<button type="button" onclick="saveInlineProxyIp()" id="save-inline-proxy-ip-btn" class="px-3 py-2 bg-orange-700 hover:bg-orange-800 dark:bg-orange-600 dark:hover:bg-orange-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
 					</div>
-					<span class="text-[10px] text-gray-400 dark:text-zinc-500 block font-normal mt-1">این آی‌پی به‌صورت خودکار در قالب یک بلوک proxyip به انتهای Path کانفیگ‌های بدون لوکیشن اختصاصی (فقط /XYZ) اضافه می‌شود؛ روی کانفیگ‌های لوکیشن‌دار (مثل XYZ/T-u-r) اثری ندارد.</span>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
@@ -6213,7 +6217,6 @@ Commercial support is available at
 						کلید API پنل مادر
 					</label>
 					<button type="button" onclick="generateMasterKey()" id="generate-master-key-btn" class="w-full py-2 bg-purple-700 hover:bg-purple-800 dark:bg-purple-600 dark:hover:bg-purple-700 text-white rounded-md text-xs font-bold transition shadow-sm">🔑 ساخت / بازسازی کلید مادر</button>
-					<span class="text-[10px] text-gray-400 dark:text-zinc-500 block font-normal mt-1">کلید فقط یک‌بار، همین‌جا نمایش داده می‌شود و بعداً از هیچ‌جا قابل مشاهده نیست. با ساخت کلید جدید، کلید قبلی بلافاصله از کار می‌افتد.</span>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">🔒 تغییر رمز عبور مدیریت</h4>
@@ -6343,24 +6346,9 @@ Commercial support is available at
 			<button onclick="bulkToggleStatus(0)" class="px-3 py-1.5 bg-amber-50 dark:bg-amber-950/20 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 rounded-md text-xs font-bold transition border border-amber-200 dark:border-amber-900/50 flex items-center gap-1">
 				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg> غیرفعال‌سازی
 			</button>
-			<button onclick="bulkReset('volume')" class="px-3 py-1.5 bg-blue-50 dark:bg-blue-950/20 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/30 rounded-md text-xs font-bold transition border border-blue-200 dark:border-blue-900/50 flex items-center gap-1">
-				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"></path></svg> ریست حجم
-			</button>
-			<button onclick="bulkReset('req')" class="px-3 py-1.5 bg-sky-50 dark:bg-sky-950/20 text-sky-600 dark:text-sky-400 hover:bg-sky-100 dark:hover:bg-sky-900/30 rounded-md text-xs font-bold transition border border-sky-200 dark:border-sky-900/50 flex items-center gap-1">
-				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg> ریست ریکوئست
-			</button>
-			<button onclick="bulkReset('time')" class="px-3 py-1.5 bg-purple-50 dark:bg-purple-950/20 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/30 rounded-md text-xs font-bold transition border border-purple-200 dark:border-purple-900/50 flex items-center gap-1">
-				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> ریست زمان
-			</button>
 			<button onclick="bulkReset('locations')" title="کشورهای پین‌شده‌ی فعلی (تنظیمات > لوکیشن‌ها) رو که کاربر هنوز نداره، از مخزن VIP براش می‌سازد و اضافه می‌کند - چیزی که از قبل داره حذف نمی‌شود" class="px-3 py-1.5 bg-teal-50 dark:bg-teal-950/20 text-teal-600 dark:text-teal-400 hover:bg-teal-100 dark:hover:bg-teal-900/30 rounded-md text-xs font-bold transition border border-teal-200 dark:border-teal-900/50 flex items-center gap-1">
 				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> بروزرسانی لوکیشن‌ها
 			</button>
-			<div class="flex items-center gap-1 px-2 py-1 bg-rose-50 dark:bg-rose-950/20 rounded-md border border-rose-200 dark:border-rose-900/50">
-				<select id="bulk-remove-location-select" class="text-xs font-bold bg-transparent text-rose-600 dark:text-rose-400 focus:outline-none"></select>
-				<button onclick="bulkRemoveLocation()" title="این کشور رو از لیست کانفیگ‌های کاربرای انتخاب‌شده پاک می‌کند (پاکسازی دستی)" class="px-2 py-0.5 text-rose-600 dark:text-rose-400 hover:text-rose-800 dark:hover:text-rose-300 rounded text-xs font-bold transition flex items-center gap-1">
-					<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg> حذف کشور
-				</button>
-			</div>
 			<button onclick="bulkDelete()" class="px-3 py-1.5 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-450 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-md text-xs font-bold transition border border-red-200 dark:border-red-900/50 flex items-center gap-1">
 				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg> حذف گروهی
 			</button>
@@ -6542,6 +6530,13 @@ ${COMMON_TOAST_HTML}
 			if (applyBtn) applyBtn.classList.add('hidden');
 		}
 		function toggleSelectAllUsers(el) {
+			if (el.checked) {
+				document.body.classList.add('selection-mode-active');
+				const modeBtn = document.getElementById('toggle-select-mode-btn');
+				if (modeBtn) {
+					modeBtn.classList.add('bg-blue-600', 'text-white', 'border-blue-600', 'dark:border-blue-600');
+				}
+			}
 			const checkboxes = document.querySelectorAll('input[name="select-user"]');
 			checkboxes.forEach(cb => {
 				cb.checked = el.checked;
@@ -6607,6 +6602,7 @@ ${COMMON_TOAST_HTML}
 					alert('✅ عملیات حذف گروهی انجام شد. ' + successCount + ' کاربر با موفقیت حذف شدند.');
 				} finally {
 					buttons.forEach(btn => btn.disabled = false);
+					window.selectedUsernames.clear();
 					updateBulkActionsBar();
 					await loadUsers(true);
 				}
@@ -6643,6 +6639,7 @@ ${COMMON_TOAST_HTML}
 					alert('✅ عملیات ' + actionText + ' با موفقیت برای تمامی کاربران واجد شرایط اعمال شد.');
 				} finally {
 					buttons.forEach(btn => btn.disabled = false);
+					window.selectedUsernames.clear();
 					updateBulkActionsBar();
 					await loadUsers(true);
 				}
@@ -6689,6 +6686,7 @@ ${COMMON_TOAST_HTML}
 					alert(msg);
 				} finally {
 					buttons.forEach(btn => btn.disabled = false);
+					window.selectedUsernames.clear();
 					updateBulkActionsBar();
 					await loadUsers(true);
 				}
@@ -6724,6 +6722,7 @@ ${COMMON_TOAST_HTML}
 					alert('✅ کشور ' + flag + ' ' + country + ' از ' + removedCount + ' کاربر (از بین ' + usernames.length + ' انتخاب‌شده) حذف شد.');
 				} finally {
 					buttons.forEach(btn => btn.disabled = false);
+					window.selectedUsernames.clear();
 					updateBulkActionsBar();
 					await loadUsers(true);
 				}
@@ -7647,48 +7646,23 @@ async function executeRocketCreate() {
 			});
 			renderFilteredUsers(filtered, serverTime);
 		}
-		function renderGlobalLocationBadges(users, proxyFlagCache) {
+		function renderGlobalLocationBadges() {
 			const container = document.getElementById('global-location-badges');
 			if (!container) return;
-			proxyFlagCache = proxyFlagCache || {};
-			const sourceUser = (users || []).find(u => u.user_proxy_iata || u.user_socks5 || u.user_proxy_ip);
-			if (!sourceUser) {
+			const list = (window.PINNED_LOCATIONS_CACHE && window.PINNED_LOCATIONS_CACHE.length > 0)
+				? window.PINNED_LOCATIONS_CACHE
+				: (window.PINNED_LOCATIONS_DEFAULT_FALLBACK || []);
+			if (!list || list.length === 0) {
 				container.classList.add('hidden');
 				container.innerHTML = '';
 				return;
 			}
-			let inner = '';
-			if (sourceUser.user_proxy_iata) {
-				const iata = sourceUser.user_proxy_iata.toUpperCase();
-				const flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(iata) : '🌐';
-				inner = '<span title="کشور: ' + iata + '" class="text-base leading-none drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)]">' + flag + '</span>';
-			} else {
-				let proxyList = [];
-				try {
-					if (sourceUser.user_socks5 && sourceUser.user_socks5.trim().startsWith("[")) {
-						proxyList = JSON.parse(sourceUser.user_socks5);
-					} else {
-						proxyList = [sourceUser.user_socks5 || sourceUser.user_proxy_ip];
-					}
-				} catch(e) {
-					proxyList = [sourceUser.user_socks5 || sourceUser.user_proxy_ip];
-				}
-				const flagsHtmlArray = proxyList.map(item => {
-					const targetProxy = typeof item === 'object' && item !== null ? item.proxy : item;
-					const targetCountry = typeof item === 'object' && item !== null ? item.country : null;
-					if (targetCountry && typeof getFlagEmoji === 'function') {
-						return '<span title="کشور: ' + targetCountry + '" class="text-base leading-none drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)] flex items-center justify-center">' + getFlagEmoji(targetCountry) + '</span>';
-					}
-					const cachedFlag = proxyFlagCache[targetProxy];
-					if (cachedFlag && typeof cachedFlag === 'string' && /^[a-zA-Z]{2}$/.test(cachedFlag) && typeof getFlagEmoji === 'function') {
-						return '<span title="پـروکـسـی اختصاصی" class="text-base leading-none drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)] flex items-center justify-center">' + getFlagEmoji(cachedFlag) + '</span>';
-					}
-					return '<span data-proxy="' + targetProxy + '" title="پـروکـسـی اختصاصی" class="async-proxy-flag text-base leading-none drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)] flex items-center justify-center">⏳</span>';
-				});
-				inner = '<div class="flex flex-wrap justify-center gap-1.5" dir="ltr">' + flagsHtmlArray.join('') + '</div>';
-			}
-			container.setAttribute('data-username', sourceUser.username);
-			container.innerHTML = '<span class="text-[10px] font-bold text-gray-500 dark:text-zinc-400">کشور آی‌پی ثابت</span>' + inner;
+			const flagsHtmlArray = list.map(function(cc) {
+				const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
+				return '<span title="' + cc + '" class="text-base leading-none drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)] flex items-center justify-center">' + flag + '</span>';
+			});
+			container.innerHTML = '<span class="text-[10px] font-bold text-gray-500 dark:text-zinc-400">لوکیشن‌های پین‌شده</span>' +
+				'<div class="flex flex-wrap justify-center gap-1.5" dir="ltr">' + flagsHtmlArray.join('') + '</div>';
 			container.classList.remove('hidden');
 		}
 		function renderFilteredUsers(users, serverTime) {
@@ -7718,8 +7692,6 @@ async function executeRocketCreate() {
 				loadingState.classList.add('hidden');
 				emptyState.classList.add('hidden');
 				tableContainer.classList.remove('hidden');
-				let proxyFlagCache = {};
-				try { proxyFlagCache = JSON.parse(localStorage.getItem('proxy_flag_cache_v2') || '{}'); } catch(e) {}
 				tbody.innerHTML = users.map(user => {
 					let daysRemaining = 'نامحدود';
 					let daysPercent = 100;
@@ -7834,10 +7806,7 @@ async function executeRocketCreate() {
 				}).join('');
 				updateBulkActionsBar();
 				if (typeof renderGlobalLocationBadges === 'function') {
-					renderGlobalLocationBadges(window.allUsers, proxyFlagCache);
-				}
-				if (typeof loadProxyFlags === 'function') {
-					setTimeout(loadProxyFlags, 50);
+					renderGlobalLocationBadges();
 				}
 				if (window.usersSortable) {
 					window.usersSortable.destroy();
@@ -9092,6 +9061,7 @@ window.renderPinnedLocationsList = function() {
 			'<button type="button" onclick="pinnedLocationRemove(' + i + ')" class="p-1 rounded text-red-500 hover:text-red-700">✕</button>' +
 			'</div>';
 	}).join('');
+	if (typeof renderGlobalLocationBadges === 'function') renderGlobalLocationBadges();
 };
 window.pinnedLocationMoveUp = function(i) {
 	const arr = window.PINNED_LOCATIONS_CACHE;
