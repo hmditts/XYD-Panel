@@ -71,6 +71,49 @@ async function checkAutoResets(env, ctx) {
 		await env.DB.prepare("DELETE FROM daily_traffic WHERE date < ?").bind(cutoffDateStr).run();
 	} catch (e) { }
 }
+// ---- محدودیت کل ریکوئست روزانه‌ی اکانت (global_req_limit) --------------------------------------
+// همون عددی که کارت "Request" توی داشبورد نشون می‌ده (req_today ذخیره‌شده در D1 + GLOBAL_REQ_COUNT
+// هنوز-flush-نشده‌ی همین ایزوله) با سقفی که ادمین در تنظیمات ست کرده مقایسه می‌شه. نتیجه (فقط یک
+// بایت "0"/"1") با TTL کوتاه روی caches.default کش می‌شه تا این چک روی هر اتصال/هارتبیت، دیتابیس
+// رو صدا نزنه. چون req_today خودش دقیقاً همون لحظه‌ای که تاریخ UTC عوض می‌شه ریست می‌شه (تابع
+// trackRequest)، این قفل هم خودکار و بدون نیاز به هیچ کار اضافه‌ای سر ساعت 00:00 UTC آزاد می‌شه -
+// از عمد هیچ فیلدی روی جدول users نوشته نمی‌شه (بر خلاف قطعیِ per-user)، چون این یک محدودیتِ
+// موقتِ سراسریه، نه غیرفعال‌سازی دائمیِ یک کاربر خاص.
+const GLOBAL_REQ_LIMIT_DEFAULT = 75000;
+const GLOBAL_REQ_LIMIT_CACHE_TTL_SECONDS = 20;
+function globalReqLimitCacheRequest() {
+	return new Request("https://internal.zeus/global_req_limit_status");
+}
+async function isGlobalReqLimitReached(env, ctx) {
+	try {
+		const cached = await caches.default.match(globalReqLimitCacheRequest());
+		if (cached) return (await cached.text()) === "1";
+	} catch (e) { }
+	let reached = false;
+	try {
+		const [limitRow, todayRow, dateRow] = await Promise.all([
+			env.DB.prepare("SELECT value FROM settings WHERE key = 'global_req_limit'").first(),
+			env.DB.prepare("SELECT value FROM settings WHERE key = 'req_today'").first(),
+			env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first(),
+		]);
+		const limit = limitRow && limitRow.value !== undefined && limitRow.value !== null && limitRow.value !== "" ? parseInt(limitRow.value) || 0 : GLOBAL_REQ_LIMIT_DEFAULT;
+		const today = new Date().toISOString().split("T")[0];
+		// اگر آخرین flush مربوط به دیروز (یا قبل‌تر) باشه، یعنی هنوز هیچ ایزوله‌ای برای امروز چیزی
+		// commit نکرده - req_today فعلاً متعلق به دیروزه، پس نباید به‌عنوان مصرف امروز حساب بشه.
+		const dbTodayTotal = dateRow && dateRow.value === today && todayRow ? parseInt(todayRow.value) || 0 : 0;
+		const liveTotal = dbTodayTotal + GLOBAL_REQ_COUNT;
+		reached = limit > 0 && liveTotal >= limit;
+	} catch (e) {
+		reached = false;
+	}
+	try {
+		const res = new Response(reached ? "1" : "0", { headers: { "Cache-Control": `max-age=${GLOBAL_REQ_LIMIT_CACHE_TTL_SECONDS}` } });
+		const task = caches.default.put(globalReqLimitCacheRequest(), res);
+		if (ctx) ctx.waitUntil(task);
+		else task.catch(() => { });
+	} catch (e) { }
+	return reached;
+}
 // کلید روزانه به وقت UTC، به فرم YYYY-MM-DD - ریست ساعت 00:00 UTC
 function utcDateKey(ts) {
 	return new Date(ts).toISOString().split("T")[0];
@@ -2903,6 +2946,14 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 						closeSocketQuietly(serverSock);
 						return;
 					}
+					// محدودیت کل ریکوئست روزانه‌ی اکانت: بر خلاف بالا، عمداً هیچ فیلدی روی users نوشته
+					// نمی‌شه (کاربر is_active می‌مونه) - فقط همین سوکت باز بسته می‌شه. با رد شدن تاریخ
+					// UTC، isGlobalReqLimitReached خودش false برمی‌گرده و کاربر می‌تونه دوباره وصل بشه.
+					if (await isGlobalReqLimitReached(env, ctx)) {
+						clearTimeout(heartbeat);
+						closeSocketQuietly(serverSock);
+						return;
+					}
 					if (isIpLimitExpired) {
 						/* Bypassed: clearTimeout(heartbeat); closeSocketQuietly(serverSock); return; */
 					}
@@ -3165,6 +3216,10 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				return;
 			}
 			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) > user.limit_req) {
+				serverSock.close();
+				return;
+			}
+			if (await isGlobalReqLimitReached(env, ctx)) {
 				serverSock.close();
 				return;
 			}
@@ -4967,8 +5022,8 @@ Commercial support is available at
 			</div>
 		</div>
 	</header>
-	<main class="max-w-6xl mx-auto px-4 py-8 pb-56 md:pb-32 relative z-10">
-<div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+	<main class="max-w-6xl mx-auto px-4 pt-4 pb-56 md:pb-32 relative z-10">
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
 	<div id="card-cf-requests" onclick="openUsageChart('requests')" class="neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
 		<div class="flex items-center justify-center gap-1.5 relative z-10">
 			<div class="p-1 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-md flex-shrink-0">
@@ -5057,7 +5112,7 @@ Commercial support is available at
 		<div id="loading-state" class="text-center py-12">
 			<span class="text-gray-500 dark:text-gray-400">در حال بارگذاری کاربران...</span>
 		</div>
-		<div class="mb-5 flex flex-col md:flex-row gap-2 justify-between items-center bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2 shadow-sm">
+		<div class="mb-4 flex flex-col md:flex-row gap-2 justify-between items-center bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2 shadow-sm">
 			<div class="flex items-center gap-2 shrink-0">
 				<button onclick="openCreateModal()" title="افزودن کاربر" class="scale-[0.7] p-2 rounded-full bg-green-50 dark:bg-green-950/30 border-2 border-green-600 dark:border-green-700/60 hover:bg-green-100 dark:hover:bg-green-900/50 transition-all duration-300 text-green-700 dark:text-green-400 shadow-sm hover:shadow hover:scale-[0.77] cursor-pointer inline-flex items-center justify-center shrink-0">
 					<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
@@ -5093,9 +5148,6 @@ Commercial support is available at
 					<option value="expiry-asc">⏳ کمترین زمان باقی‌مانده</option>
 				</select>
 			</div>
-		</div>
-		<div class="flex items-center justify-between mb-4">
-			<h2 class="text-lg font-bold text-gray-800 dark:text-zinc-200">لیست کاربران</h2>
 		</div>
 		<div id="users-table-container" class="hidden pb-4 px-1">
 			<div id="users-tbody" class="grid grid-cols-2 md:grid-cols-3 gap-1.5 text-sm"></div>
@@ -6216,6 +6268,17 @@ Commercial support is available at
 					<div class="flex items-center gap-2">
 						<input type="text" id="global-clean-ip-input" dir="ltr" placeholder="104.20.25.138" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 						<button type="button" onclick="saveGlobalCleanIp()" id="save-global-clean-ip-btn" class="px-3 py-2 bg-sky-700 hover:bg-sky-800 dark:bg-sky-600 dark:hover:bg-sky-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
+					</div>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
+						<svg class="w-4 h-4 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
+						محدودیت کل ریکوئست روزانه
+					</label>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mb-1.5 leading-relaxed">با رسیدن مجموع ریکوئست امروز کل اکانت (همون عدد کارت Request) به این سقف، اتصال تمام کاربران قطع می‌شود و تا ریست روزانه‌ی بعدی (۰۰:۰۰ UTC) دوباره وصل نمی‌شوند.</p>
+					<div class="flex items-center gap-2">
+						<input type="number" id="global-req-limit-input" dir="ltr" min="0" step="1000" placeholder="75000" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						<button type="button" onclick="saveGlobalReqLimit()" id="save-global-req-limit-btn" class="px-3 py-2 bg-orange-700 hover:bg-orange-800 dark:bg-orange-600 dark:hover:bg-orange-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
 					</div>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
@@ -7789,7 +7852,7 @@ async function executeRocketCreate() {
 					const isChecked = (window.selectedUsernames && window.selectedUsernames.has(user.username)) ? 'checked' : '';
 					const onlineBadgeColor = onlineCount >= 3 ? 'bg-red-600' : (onlineCount === 2 ? 'bg-yellow-500' : 'bg-green-600');
 					const onlineBadge = user.is_online === 1
-						? '<span class="px-2 py-0.5 inline-flex items-center justify-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" dir="rtl">' + user.online_count + '</span>'
+						? '<span class="min-w-[20px] h-5 px-1 inline-flex items-center justify-center text-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1">' + user.online_count + '</span>'
 						: '';
 					return '<div class="group transition-all drop-shadow-sm bg-white/60 dark:bg-zinc-900/40 rounded-md border border-gray-200 dark:border-zinc-800 p-1 flex flex-col items-center gap-1 text-center" data-username="' + user.username + '">' +
 							'<div class="flex items-center justify-center flex-wrap gap-1 w-full">' +
@@ -9159,6 +9222,44 @@ window.saveGlobalCleanIp = async function() {
 		if (btn) btn.disabled = false;
 	}
 };
+window.DEFAULT_GLOBAL_REQ_LIMIT = 75000;
+window.GLOBAL_REQ_LIMIT = window.DEFAULT_GLOBAL_REQ_LIMIT;
+window.loadGlobalReqLimitSetting = async function() {
+	let value = window.DEFAULT_GLOBAL_REQ_LIMIT;
+	try {
+		const res = await fetch('/api/settings/bulk');
+		const data = await res.json();
+		if (data && data.global_req_limit !== undefined && data.global_req_limit !== null && String(data.global_req_limit).trim() !== '') {
+			const parsed = parseInt(data.global_req_limit);
+			if (!isNaN(parsed) && parsed >= 0) value = parsed;
+		}
+	} catch (e) {}
+	window.GLOBAL_REQ_LIMIT = value;
+	const input = document.getElementById('global-req-limit-input');
+	if (input) input.value = value;
+	return value;
+};
+window.saveGlobalReqLimit = async function() {
+	const input = document.getElementById('global-req-limit-input');
+	const parsed = input ? parseInt(input.value) : NaN;
+	const val = (!isNaN(parsed) && parsed >= 0) ? parsed : window.DEFAULT_GLOBAL_REQ_LIMIT;
+	const btn = document.getElementById('save-global-req-limit-btn');
+	if (btn) btn.disabled = true;
+	try {
+		await fetch('/api/settings/bulk', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ settings: { global_req_limit: val } })
+		});
+		window.GLOBAL_REQ_LIMIT = val;
+		if (input) input.value = val;
+		showToast('✅ محدودیت کل ریکوئست روزانه ذخیره شد.');
+	} catch (e) {
+		showToast('❌ ذخیره‌سازی محدودیت کل ریکوئست ناموفق بود.');
+	} finally {
+		if (btn) btn.disabled = false;
+	}
+};
 window.OTHER_CLEAN_IPS = [];
 window.loadOtherCleanIpsSetting = async function() {
 	let raw = '';
@@ -10246,6 +10347,7 @@ function applySelectedIps() {
 			initVipCache();
 			loadUsers();
 			window.loadGlobalCleanIpSetting();
+			window.loadGlobalReqLimitSetting();
 			window.loadOtherCleanIpsSetting();
 			window.loadInlineProxyIpSetting();
 			window.populatePinnedLocationSelects();
