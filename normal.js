@@ -201,51 +201,141 @@ function getRandomIps(cachedIpsData, operator, count) {
 async function checkAutoRotates(env, ctx) {
 }
 
-// Fixed loc-N <-> country mapping. This order is permanent: loc-0=UZ, loc-1=KZ,
-// loc-2=TR, loc-3=LY, loc-4=NL, loc-5=AL, loc-6=EE, loc-7=BG, loc-8=LV,
-// loc-9=SE, loc-10=NO, loc-11=GB, loc-12=US, loc-13=ES, loc-14=BE. New users
-// always get exactly these 15 slots, in this order, provisioned from the VIP pool.
-// replaceBrokenProxy() already keeps each slot locked to its own country when
-// healing a broken proxy, so once a slot is tagged with one of these codes it
-// never drifts to another country.
-// NOTE: AE (formerly loc-3) was dropped from the set per updated request.
-const PINNED_DEFAULT_LOCATIONS = ["UZ", "KZ", "TR", "LY", "NL", "AL", "EE", "BG", "LV", "SE", "NO", "GB", "US", "ES", "BE"];
+// Default set of countries auto-provisioned for a brand-new user, and the set
+// that the "بروزرسانی لوکیشن‌ها" bulk action adds to already-existing users
+// (see reset_action === "locations" below). This is now just the built-in
+// FALLBACK: the real, admin-editable list lives in the `settings` table under
+// the key "pinned_locations" (see getPinnedLocationsSetting()). This constant
+// is only used if that setting has never been saved yet (fresh install), so
+// existing deployments keep working unchanged after this update.
+// replaceBrokenProxy() keeps each slot locked to its own country when healing
+// a broken proxy, so once a slot is tagged with a country it never drifts to
+// another country - regardless of whether that country is still "pinned".
+const PINNED_DEFAULT_LOCATIONS_FALLBACK = ["UZ", "KZ", "TR", "LY", "NL", "AL", "EE", "BG", "LV", "SE", "NO", "GB", "US", "ES", "BE"];
+// Hard cap on how many location slots a single user can accumulate over time
+// via the additive "بروزرسانی لوکیشن‌ها" action (see below). Provisioning a
+// brand-new user is NOT capped by this (a new user always gets the full
+// current pinned list, even if that list itself has grown past this number).
+const MAX_LOCATIONS_PER_USER = 20;
 const MASTER_KEY_BLOCKED_PATHS = ["/api/change-password", "/api/auto-update-setup", "/api/update-panel", "/api/update-panel-github"];
+
+// Full ISO 3166-1 alpha-2 -> alpha-3 table (249 entries), used to compute a
+// permanent WS path segment for ANY country in the VIP proxy repository -
+// not just the ones currently pinned in settings. This is what makes "پین
+// بودن" purely a statement about which countries get auto-added to the
+// default sub/config list; it has no bearing on whether a country's path
+// works or whether it gets auto-healed - every country in proxy_vip/*.txt
+// gets a working path and healing from the moment it's ever assigned to a
+// user, pinned or not.
+const ISO_ALPHA3_MAP = {
+	AD: "AND", AE: "ARE", AF: "AFG", AG: "ATG", AI: "AIA", AL: "ALB",
+	AM: "ARM", AO: "AGO", AQ: "ATA", AR: "ARG", AS: "ASM", AT: "AUT",
+	AU: "AUS", AW: "ABW", AX: "ALA", AZ: "AZE", BA: "BIH", BB: "BRB",
+	BD: "BGD", BE: "BEL", BF: "BFA", BG: "BGR", BH: "BHR", BI: "BDI",
+	BJ: "BEN", BL: "BLM", BM: "BMU", BN: "BRN", BO: "BOL", BQ: "BES",
+	BR: "BRA", BS: "BHS", BT: "BTN", BV: "BVT", BW: "BWA", BY: "BLR",
+	BZ: "BLZ", CA: "CAN", CC: "CCK", CD: "COD", CF: "CAF", CG: "COG",
+	CH: "CHE", CI: "CIV", CK: "COK", CL: "CHL", CM: "CMR", CN: "CHN",
+	CO: "COL", CR: "CRI", CU: "CUB", CV: "CPV", CW: "CUW", CX: "CXR",
+	CY: "CYP", CZ: "CZE", DE: "DEU", DJ: "DJI", DK: "DNK", DM: "DMA",
+	DO: "DOM", DZ: "DZA", EC: "ECU", EE: "EST", EG: "EGY", EH: "ESH",
+	ER: "ERI", ES: "ESP", ET: "ETH", FI: "FIN", FJ: "FJI", FK: "FLK",
+	FM: "FSM", FO: "FRO", FR: "FRA", GA: "GAB", GB: "GBR", GD: "GRD",
+	GE: "GEO", GF: "GUF", GG: "GGY", GH: "GHA", GI: "GIB", GL: "GRL",
+	GM: "GMB", GN: "GIN", GP: "GLP", GQ: "GNQ", GR: "GRC", GS: "SGS",
+	GT: "GTM", GU: "GUM", GW: "GNB", GY: "GUY", HK: "HKG", HM: "HMD",
+	HN: "HND", HR: "HRV", HT: "HTI", HU: "HUN", ID: "IDN", IE: "IRL",
+	IL: "ISR", IM: "IMN", IN: "IND", IO: "IOT", IQ: "IRQ", IR: "IRN",
+	IS: "ISL", IT: "ITA", JE: "JEY", JM: "JAM", JO: "JOR", JP: "JPN",
+	KE: "KEN", KG: "KGZ", KH: "KHM", KI: "KIR", KM: "COM", KN: "KNA",
+	KP: "PRK", KR: "KOR", KW: "KWT", KY: "CYM", KZ: "KAZ", LA: "LAO",
+	LB: "LBN", LC: "LCA", LI: "LIE", LK: "LKA", LR: "LBR", LS: "LSO",
+	LT: "LTU", LU: "LUX", LV: "LVA", LY: "LBY", MA: "MAR", MC: "MCO",
+	MD: "MDA", ME: "MNE", MF: "MAF", MG: "MDG", MH: "MHL", MK: "MKD",
+	ML: "MLI", MM: "MMR", MN: "MNG", MO: "MAC", MP: "MNP", MQ: "MTQ",
+	MR: "MRT", MS: "MSR", MT: "MLT", MU: "MUS", MV: "MDV", MW: "MWI",
+	MX: "MEX", MY: "MYS", MZ: "MOZ", NA: "NAM", NC: "NCL", NE: "NER",
+	NF: "NFK", NG: "NGA", NI: "NIC", NL: "NLD", NO: "NOR", NP: "NPL",
+	NR: "NRU", NU: "NIU", NZ: "NZL", OM: "OMN", PA: "PAN", PE: "PER",
+	PF: "PYF", PG: "PNG", PH: "PHL", PK: "PAK", PL: "POL", PM: "SPM",
+	PN: "PCN", PR: "PRI", PS: "PSE", PT: "PRT", PW: "PLW", PY: "PRY",
+	QA: "QAT", RE: "REU", RO: "ROU", RS: "SRB", RU: "RUS", RW: "RWA",
+	SA: "SAU", SB: "SLB", SC: "SYC", SD: "SDN", SE: "SWE", SG: "SGP",
+	SH: "SHN", SI: "SVN", SJ: "SJM", SK: "SVK", SL: "SLE", SM: "SMR",
+	SN: "SEN", SO: "SOM", SR: "SUR", SS: "SSD", ST: "STP", SV: "SLV",
+	SX: "SXM", SY: "SYR", SZ: "SWZ", TC: "TCA", TD: "TCD", TF: "ATF",
+	TG: "TGO", TH: "THA", TJ: "TJK", TK: "TKL", TL: "TLS", TM: "TKM",
+	TN: "TUN", TO: "TON", TR: "TUR", TT: "TTO", TV: "TUV", TW: "TWN",
+	TZ: "TZA", UA: "UKR", UG: "UGA", UM: "UMI", US: "USA", UY: "URY",
+	UZ: "UZB", VA: "VAT", VC: "VCT", VE: "VEN", VG: "VGB", VI: "VIR",
+	VN: "VNM", VU: "VUT", WF: "WLF", WS: "WSM", YE: "YEM", YT: "MYT",
+	ZA: "ZAF", ZM: "ZMB", ZW: "ZWE",
+};
+// Legacy path segments that must NEVER change because they're already baked
+// into links that were issued before this table existed (e.g. GB's segment
+// was "G-b", 2 letters, not the standard 3-letter "G-b-r" this table would
+// otherwise produce). Only add an entry here for a code whose already-issued
+// segment doesn't match the auto-generated one below.
+const LOCATION_PATH_CODE_OVERRIDES = { GB: "G-b" };
+function computePathSegmentFromAlpha3(alpha3) {
+	return alpha3
+		.split("")
+		.map((ch, i) => (i === 0 ? ch : ch.toLowerCase()))
+		.join("-");
+}
+// Built once at module load: every possible path segment -> its country code,
+// so incoming requests can be matched in O(1) instead of scanning the table.
+const PATH_SEGMENT_TO_COUNTRY = (() => {
+	const map = {};
+	for (const cc in ISO_ALPHA3_MAP) map[computePathSegmentFromAlpha3(ISO_ALPHA3_MAP[cc])] = cc;
+	for (const cc in LOCATION_PATH_CODE_OVERRIDES) {
+		const autoSeg = computePathSegmentFromAlpha3(ISO_ALPHA3_MAP[cc]);
+		if (autoSeg !== LOCATION_PATH_CODE_OVERRIDES[cc]) delete map[autoSeg];
+		map[LOCATION_PATH_CODE_OVERRIDES[cc]] = cc;
+	}
+	return map;
+})();
 // Display code shown in the WS path in place of the old sequential "loc-N"
-// suffix. Keyed by country (not by array index) so a slot keeps the same
-// path segment even after replaceBrokenProxy() heals it in place, or if a
-// slot's position in user_socks5 ever changes. Any proxy whose country isn't
-// one of these 15 falls back to the old "loc-<index>" suffix.
-// NOTE: AE's old code ("U-a-e") was intentionally removed here - any
-// previously-issued links using the "/U-a-e" path segment will no longer
-// match a country and will fall back to the legacy "/loc-N" / "?loc=" lookup
-// instead, which most likely will NOT resolve for those old links (they were
-// never generated with a "/loc-N" suffix in the first place, since v8 already
-// replaced it). Re-add an AE entry here if those old links still need to work.
-const LOCATION_PATH_CODES = { UZ: "U-z-b", KZ: "K-a-z", TR: "T-u-r", LY: "L-b-y", NL: "N-l-d", AL: "A-l-b", EE: "E-s-t", BG: "B-g-r", LV: "L-v-a", SE: "S-w-e", NO: "N-o-r", GB: "G-b", US: "U-s-a", ES: "E-s-p", BE: "B-e-l" };
+// suffix. Works for ANY ISO country code that has a VIP proxy list, not just
+// currently-pinned ones - keyed by country (not array index) so a slot keeps
+// the same path segment even after replaceBrokenProxy() heals it in place,
+// or if a slot's position in user_socks5 ever changes. Only a country code
+// this table has never heard of (not valid ISO 3166-1) falls back to the old
+// "loc-<index>" suffix.
 function getLocationPathSegment(countryCode, locIdx) {
-	if (countryCode && LOCATION_PATH_CODES[countryCode.toUpperCase()]) {
-		return LOCATION_PATH_CODES[countryCode.toUpperCase()];
+	if (countryCode) {
+		const cc = countryCode.toUpperCase();
+		if (LOCATION_PATH_CODE_OVERRIDES[cc]) return LOCATION_PATH_CODE_OVERRIDES[cc];
+		if (ISO_ALPHA3_MAP[cc]) return computePathSegmentFromAlpha3(ISO_ALPHA3_MAP[cc]);
 	}
 	return "loc-" + locIdx;
 }
+// Reverse of getLocationPathSegment(): given the last path segment of an
+// incoming request, returns the country code it belongs to, or null.
+function getCountryForPathSegment(segment) {
+	return PATH_SEGMENT_TO_COUNTRY[segment] || null;
+}
 // How many candidate proxy lines per country to live-test when provisioning a
 // new user. Kept low (unlike replaceBrokenProxy's 15) because this runs once
-// per new user across all countries in PINNED_DEFAULT_LOCATIONS in the same
-// request/invocation, and Cloudflare Workers cap subrequests per invocation -
-// each candidate line can cost up to 2 subrequests (socks5:// and http://
-// variants), plus 1 list fetch per country. Raise it if you have subrequest
-// budget to spare.
-// ⚠️ Now that this list has 15 countries instead of 5: worst case is
-// 15 * (1 list fetch + 3 * 2 candidate tests) = 105 subrequests for a single
-// invocation, which is already over the Workers Free plan's 50-subrequest-
-// per-invocation cap (Paid plans get far more headroom - 10,000/invocation).
-// testVipCountryProxy() fails gracefully per-country (falls back to an
-// untested line) rather than crashing, so going over the cap degrades quality
-// - some slots quietly skip live-testing - it won't break provisioning
-// outright. Still, if you're on the Free plan, consider lowering this to 1
-// (15 * 3 = 45 subrequests, safely under 50) or testing countries in smaller
-// sequential batches instead of all-at-once.
+// per new user across all countries in the current pinned_locations setting
+// (see getPinnedLocationsSetting()) in the same request/invocation, and
+// Cloudflare Workers cap subrequests per invocation - each candidate line can
+// cost up to 2 subrequests (socks5:// and http:// variants), plus 1 list
+// fetch per country. Raise it if you have subrequest budget to spare.
+// ⚠️ The pinned list is now admin-editable and can grow past 15: at N
+// countries, worst case is N * (1 list fetch + 3 * 2 candidate tests) =
+// 7N subrequests for a single invocation - e.g. 15 countries = 105, already
+// over the Workers Free plan's 50-subrequest-per-invocation cap (Paid plans
+// get far more headroom - 10,000/invocation). The additive "بروزرسانی
+// لوکیشن‌ها" update (mergePinnedLocationsForUser) only tests the countries a
+// user doesn't already have, so it's cheaper than this per-invocation worst
+// case in practice - but a brand-new user still tests the full current list
+// at once. testVipCountryProxy() fails gracefully per-country (falls back to
+// an untested line) rather than crashing, so going over the cap degrades
+// quality - some slots quietly skip live-testing - it won't break
+// provisioning outright. Still, if you're on the Free plan and the pinned
+// list has grown large, consider lowering this to 1 or testing countries in
+// smaller sequential batches instead of all-at-once.
 const PINNED_PROVISION_TEST_LIMIT = 3;
 
 // Fetch proxy_vip/<country>.txt, shuffle it, and live-test a handful of
@@ -306,18 +396,57 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 	}
 }
 
-// Builds the permanent 15-slot proxy list for a new (or reset) user: always
-// PINNED_DEFAULT_LOCATIONS.length entries, always in that exact order, so
-// loc-0..loc-14 map to UZ/KZ/TR/LY/NL/AL/EE/BG/LV/SE/NO/GB/US/ES/BE no matter
-// what the VIP pool currently has. A country whose pool is empty/unreachable still
-// gets its slot (proxy: "", meaning that config falls back to a direct
-// connection until healed).
-async function buildPinnedDefaultProxyList() {
-	const results = await Promise.all(PINNED_DEFAULT_LOCATIONS.map((cc) => testVipCountryProxy(cc)));
-	return PINNED_DEFAULT_LOCATIONS.map((cc, i) => ({
+// Builds the permanent proxy list for a BRAND-NEW user: one slot per country
+// in `locations` (the current pinned_locations setting - see
+// getPinnedLocationsSetting()), in that exact order, so loc-0..loc-N map to
+// them no matter what the VIP pool currently has. A country whose pool is
+// empty/unreachable still gets its slot (proxy: "", meaning that config
+// falls back to a direct connection until healed).
+// NOTE: this always builds the list from scratch and is only meant for a
+// user that doesn't have any locations yet. For updating an EXISTING user
+// without discarding what they already have, use mergePinnedLocationsForUser
+// below instead - it's what "بروزرسانی لوکیشن‌ها" (reset_action: "locations")
+// calls.
+async function buildPinnedDefaultProxyList(locations) {
+	const results = await Promise.all(locations.map((cc) => testVipCountryProxy(cc)));
+	return locations.map((cc, i) => ({
 		proxy: (results[i] && results[i].proxy) || "",
 		country: cc,
 	}));
+}
+
+// Additive update for an EXISTING user: tests and appends only the pinned
+// countries this user doesn't already have (matched by the `country` tag on
+// each {proxy, country} slot); every slot already present - pinned or not -
+// is left completely untouched (not re-tested, not removed). This is what
+// makes changing the pinned_locations setting non-destructive: a country
+// that gets un-pinned later keeps working for anyone who already has it,
+// and replaceBrokenProxy() keeps auto-healing it forever regardless of its
+// current pinned status.
+// Never grows a user past MAX_LOCATIONS_PER_USER. If there isn't room for
+// every missing pinned country, as many as fit are added and the rest are
+// returned in `cappedOut` so the caller can warn the admin (nothing is
+// auto-deleted to make room - the admin removes something manually via the
+// "حذف کشور از کاربران" bulk action instead).
+async function mergePinnedLocationsForUser(existingProxyList, pinnedLocations) {
+	const list = Array.isArray(existingProxyList) ? existingProxyList.slice() : [];
+	const haveCountries = new Set(
+		list
+			.map((p) => (typeof p === "object" && p !== null ? p.country : null))
+			.filter(Boolean)
+			.map((cc) => String(cc).toUpperCase())
+	);
+	const missing = pinnedLocations.filter((cc) => !haveCountries.has(cc));
+	const room = Math.max(0, MAX_LOCATIONS_PER_USER - list.length);
+	const toAdd = missing.slice(0, room);
+	const cappedOut = missing.slice(room);
+	if (toAdd.length > 0) {
+		const results = await Promise.all(toAdd.map((cc) => testVipCountryProxy(cc)));
+		toAdd.forEach((cc, i) => {
+			list.push({ proxy: (results[i] && results[i].proxy) || "", country: cc });
+		});
+	}
+	return { list, added: toAdd, cappedOut };
 }
 
 async function replaceBrokenProxy(username, env, oldProxy) {
@@ -1409,12 +1538,58 @@ const Router = {
 							await env.DB.prepare("UPDATE users SET created_at = CURRENT_TIMESTAMP, first_connection_time = NULL, is_active = 1 WHERE username = ?").bind(username).run();
 							for (const [lockK] of GLOBAL_WRITE_LOCK.entries()) { if (lockK.endsWith("_first_conn")) GLOBAL_WRITE_LOCK.delete(lockK); }
 						} else if (body.reset_action === "locations") {
-							// On-demand retrofit for an existing user: re-provision the fixed
-							// loc-0..loc-14 = UZ/KZ/TR/LY/NL/AL/EE/BG/LV/SE/NO/GB/US/ES/BE set
-							// from the live VIP pool, replacing whatever that user's proxy slots
-							// currently hold.
-							const pinnedList = await buildPinnedDefaultProxyList();
-							await env.DB.prepare("UPDATE users SET user_socks5 = ?, auto_rotate_user_proxy = 1 WHERE username = ?").bind(JSON.stringify(pinnedList), username).run();
+							// Additive retrofit for an existing user: adds any currently-pinned
+							// country (getPinnedLocationsSetting()) this user doesn't already
+							// have. Everything already on the user - pinned or not - is left
+							// untouched (see mergePinnedLocationsForUser() for why: an unpinned
+							// country must keep working for anyone who already has it).
+							const pinnedLocations = await getPinnedLocationsSetting(env);
+							const existingRow = await env.DB.prepare("SELECT user_socks5 FROM users WHERE username = ?").bind(username).first();
+							let existingList = [];
+							try {
+								if (existingRow && existingRow.user_socks5 && existingRow.user_socks5.trim().startsWith("[")) {
+									existingList = JSON.parse(existingRow.user_socks5);
+								}
+							} catch (e) {
+								existingList = [];
+							}
+							const { list: mergedList, cappedOut } = await mergePinnedLocationsForUser(existingList, pinnedLocations);
+							await env.DB.prepare("UPDATE users SET user_socks5 = ?, auto_rotate_user_proxy = 1 WHERE username = ?").bind(JSON.stringify(mergedList), username).run();
+							const locUser = await env.DB.prepare("SELECT uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
+							if (locUser) await invalidateUserAuthCache(ctx, locUser.uuid, locUser.trojan_hash);
+							// cappedOut: pinned countries this user hit MAX_LOCATIONS_PER_USER
+							// before receiving (nothing is auto-deleted to make room - see the
+							// comment on MAX_LOCATIONS_PER_USER). The panel surfaces this per
+							// username so the admin can manually free up a slot if they want them.
+							return new Response(JSON.stringify({ success: true, username, capped: cappedOut.length > 0, cappedCountries: cappedOut }), { headers: { "Content-Type": "application/json" } });
+						} else if (body.reset_action === "remove_location") {
+							// Manual cleanup: strips one specific country (body.country, e.g.
+							// "TR") out of this user's proxy list, if present. Independent of
+							// the additive "locations" action above - un-pinning a country in
+							// settings never does this automatically; the admin has to pick
+							// this action explicitly per country/user(s).
+							const targetCountry = String(body.country || "").trim().toUpperCase();
+							if (!targetCountry) {
+								return new Response(JSON.stringify({ error: "Missing country" }), { status: 400, headers: { "Content-Type": "application/json" } });
+							}
+							const rmRow = await env.DB.prepare("SELECT user_socks5 FROM users WHERE username = ?").bind(username).first();
+							let rmList = [];
+							try {
+								if (rmRow && rmRow.user_socks5 && rmRow.user_socks5.trim().startsWith("[")) {
+									rmList = JSON.parse(rmRow.user_socks5);
+								}
+							} catch (e) {
+								rmList = [];
+							}
+							const beforeLen = rmList.length;
+							rmList = rmList.filter((p) => !(typeof p === "object" && p !== null && (p.country || "").toUpperCase() === targetCountry));
+							const removed = rmList.length < beforeLen;
+							if (removed) {
+								await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(rmList), username).run();
+								const rmUser = await env.DB.prepare("SELECT uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
+								if (rmUser) await invalidateUserAuthCache(ctx, rmUser.uuid, rmUser.trojan_hash);
+							}
+							return new Response(JSON.stringify({ success: true, username, removed }), { headers: { "Content-Type": "application/json" } });
 						}
 						const resetUser = await env.DB.prepare("SELECT uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
 						if (resetUser) await invalidateUserAuthCache(ctx, resetUser.uuid, resetUser.trojan_hash);
@@ -1680,14 +1855,14 @@ const Router = {
 							finalConnType = connection_type;
 						}
 						const trojanHash = sha224Pure(finalUuid);
-						// Every new user is always pinned to the fixed 15-location set
-						// (loc-0=UZ, loc-1=KZ, loc-2=TR, loc-3=LY, loc-4=NL, loc-5=AL,
-						// loc-6=EE, loc-7=BG, loc-8=LV, loc-9=SE, loc-10=NO, loc-11=GB,
-						// loc-12=US, loc-13=ES, loc-14=BE) - whatever was submitted for
-						// user_socks5 is ignored on create. The actual VIP proxies are
-						// fetched/tested in the background right after insert (see
-						// ctx.waitUntil below) so this request doesn't have to wait on
-						// 15 rounds of live proxy testing.
+						// Every new user is always pinned to whatever the current
+						// pinned_locations setting holds (see getPinnedLocationsSetting();
+						// falls back to the built-in 15-country default if that setting
+						// was never saved) - whatever was submitted for user_socks5 is
+						// ignored on create. The actual VIP proxies are fetched/tested in
+						// the background right after insert (see ctx.waitUntil below) so
+						// this request doesn't have to wait on a full round of live
+						// proxy testing.
 						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, 1, start_on_first_connect ? 1 : 0, null, trojanHash, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1)
 							.run();
@@ -1697,7 +1872,8 @@ const Router = {
 						if (ctx) {
 							ctx.waitUntil((async () => {
 								try {
-									const pinnedList = await buildPinnedDefaultProxyList();
+									const pinnedLocations = await getPinnedLocationsSetting(env);
+									const pinnedList = await buildPinnedDefaultProxyList(pinnedLocations);
 									await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(pinnedList), username).run();
 								} catch (e) { }
 								// The row above may already have been cached (with a null user_socks5)
@@ -1926,6 +2102,31 @@ async function getOtherCleanIpsSetting(env) {
 			.filter((ip) => ip.length > 0);
 	} catch (e) {
 		return [];
+	}
+}
+// Reads the admin-editable pinned-locations list from the settings table
+// (see the "لوکیشن‌ها" section of the settings modal / saveLocations() on
+// the client side). Falls back to PINNED_DEFAULT_LOCATIONS_FALLBACK if the
+// setting was never saved, is malformed, or ends up empty after validation -
+// so a fresh install (or a corrupted value) never breaks user provisioning.
+// Only valid ISO 3166-1 alpha-2 codes are kept; duplicates are dropped,
+// order is preserved (this order becomes loc-0..loc-N for new users).
+async function getPinnedLocationsSetting(env) {
+	if (!env || !env.DB) return PINNED_DEFAULT_LOCATIONS_FALLBACK;
+	try {
+		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'pinned_locations'").first();
+		if (!row || !row.value) return PINNED_DEFAULT_LOCATIONS_FALLBACK;
+		const parsed = JSON.parse(row.value);
+		if (!Array.isArray(parsed)) return PINNED_DEFAULT_LOCATIONS_FALLBACK;
+		const cleaned = [];
+		for (const raw of parsed) {
+			if (typeof raw !== "string") continue;
+			const cc = raw.trim().toUpperCase();
+			if (cc && ISO_ALPHA3_MAP[cc] && !cleaned.includes(cc)) cleaned.push(cc);
+		}
+		return cleaned.length > 0 ? cleaned : PINNED_DEFAULT_LOCATIONS_FALLBACK;
+	} catch (e) {
+		return PINNED_DEFAULT_LOCATIONS_FALLBACK;
 	}
 }
 const SubscriptionService = {
@@ -2447,14 +2648,15 @@ function getSelectedUserProxy(userSocks5, request) {
 	if (request) {
 		try {
 			const url = new URL(request.url);
-			// New format: last path segment is one of LOCATION_PATH_CODES'
-			// values (e.g. "K-a-z") - map it back to the country, then find
-			// that country's slot in this user's own proxy list. Falls back
-			// to the legacy "/loc-N" suffix (or a "?loc=" query param) for
-			// any already-issued link, or any country outside the pinned 5.
+			// New format: last path segment is a path code for any ISO country
+			// (see getLocationPathSegment/getCountryForPathSegment near the top
+			// of the file) - map it back to the country, then find that
+			// country's slot in this user's own proxy list. Falls back to the
+			// legacy "/loc-N" suffix (or a "?loc=" query param) for any
+			// already-issued link, or any segment that isn't a valid country path.
 			const segments = url.pathname.split("/").filter(Boolean);
 			const lastSeg = decodeURIComponent(segments[segments.length - 1] || "");
-			const countryForCode = Object.keys(LOCATION_PATH_CODES).find((cc) => LOCATION_PATH_CODES[cc] === lastSeg);
+			const countryForCode = getCountryForPathSegment(lastSeg);
 			if (countryForCode) {
 				idx = proxyList.findIndex((p) => typeof p === "object" && p !== null && (p.country || "").toUpperCase() === countryForCode);
 			} else {
@@ -5957,6 +6159,22 @@ Commercial support is available at
 					</label>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5 justify-between">
+						<span class="flex items-center gap-1.5">
+							<svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+							لوکیشن‌ها
+						</span>
+						<span id="pinned-locations-count" class="text-[10px] font-normal text-gray-400 dark:text-zinc-500"></span>
+					</label>
+					<div id="pinned-locations-list" class="max-h-48 overflow-y-auto border border-gray-200 dark:border-amoled-border rounded-md bg-white dark:bg-amoled-input mb-2"></div>
+					<div class="flex items-center gap-2">
+						<select id="pinned-location-add-select" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100"></select>
+						<button type="button" onclick="pinnedLocationAdd()" class="px-3 py-2 bg-gray-600 hover:bg-gray-700 dark:bg-zinc-600 dark:hover:bg-zinc-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">افزودن</button>
+						<button type="button" onclick="savePinnedLocations()" id="save-pinned-locations-btn" class="px-3 py-2 bg-emerald-700 hover:bg-emerald-800 dark:bg-emerald-600 dark:hover:bg-emerald-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
+					</div>
+					<span class="text-[10px] text-gray-400 dark:text-zinc-500 block font-normal mt-1">این لیست فقط تعیین می‌کند کاربر جدید چه کشورهایی بگیرد و دکمه‌ی «بروزرسانی لوکیشن‌ها» چه کشورهایی را (بدون حذف چیزی) به کاربرای موجود اضافه کند؛ کشورهایی که از این لیست برداشته شوند برای کاربرایی که از قبل دارنشون همچنان کار می‌کنند و ترمیم خودکار می‌شوند. حداکثر ۲۰ لوکیشن به ازای هر کاربر.</span>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.636 5.636a9 9 0 1012.728 0M12 3v9"></path></svg>
 						آیپی تمیز سراسری
@@ -6134,9 +6352,15 @@ Commercial support is available at
 			<button onclick="bulkReset('time')" class="px-3 py-1.5 bg-purple-50 dark:bg-purple-950/20 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/30 rounded-md text-xs font-bold transition border border-purple-200 dark:border-purple-900/50 flex items-center gap-1">
 				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> ریست زمان
 			</button>
-			<button onclick="bulkReset('locations')" title="پروکسی‌های 15 کشور پین‌شده (شامل اسپانیا و بلژیک) رو دوباره از مخزن VIP برای کاربران انتخاب‌شده می‌سازد" class="px-3 py-1.5 bg-teal-50 dark:bg-teal-950/20 text-teal-600 dark:text-teal-400 hover:bg-teal-100 dark:hover:bg-teal-900/30 rounded-md text-xs font-bold transition border border-teal-200 dark:border-teal-900/50 flex items-center gap-1">
-				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> بروزرسانی لوکیشن‌ها (+ES/BE)
+			<button onclick="bulkReset('locations')" title="کشورهای پین‌شده‌ی فعلی (تنظیمات > لوکیشن‌ها) رو که کاربر هنوز نداره، از مخزن VIP براش می‌سازد و اضافه می‌کند - چیزی که از قبل داره حذف نمی‌شود" class="px-3 py-1.5 bg-teal-50 dark:bg-teal-950/20 text-teal-600 dark:text-teal-400 hover:bg-teal-100 dark:hover:bg-teal-900/30 rounded-md text-xs font-bold transition border border-teal-200 dark:border-teal-900/50 flex items-center gap-1">
+				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> بروزرسانی لوکیشن‌ها
 			</button>
+			<div class="flex items-center gap-1 px-2 py-1 bg-rose-50 dark:bg-rose-950/20 rounded-md border border-rose-200 dark:border-rose-900/50">
+				<select id="bulk-remove-location-select" class="text-xs font-bold bg-transparent text-rose-600 dark:text-rose-400 focus:outline-none"></select>
+				<button onclick="bulkRemoveLocation()" title="این کشور رو از لیست کانفیگ‌های کاربرای انتخاب‌شده پاک می‌کند (پاکسازی دستی)" class="px-2 py-0.5 text-rose-600 dark:text-rose-400 hover:text-rose-800 dark:hover:text-rose-300 rounded text-xs font-bold transition flex items-center gap-1">
+					<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg> حذف کشور
+				</button>
+			</div>
 			<button onclick="bulkDelete()" class="px-3 py-1.5 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-450 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-md text-xs font-bold transition border border-red-200 dark:border-red-900/50 flex items-center gap-1">
 				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg> حذف گروهی
 			</button>
@@ -6428,16 +6652,18 @@ ${COMMON_TOAST_HTML}
 			const usernames = Array.from(window.selectedUsernames);
 			if (usernames.length === 0) return;
 			let actionName = '';
-			if (actionType === 'volume') actionName = 'حجم مصرفی';
-			else if (actionType === 'req') actionName = 'تعداد ریکوئست‌ها';
-			else if (actionType === 'time') actionName = 'زمان اشتراک';
-			else if (actionType === 'locations') actionName = 'لیست لوکیشن‌ها (شامل اسپانیا و بلژیک)';
-			if (await customConfirm('آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟')) {
+			let confirmText = '';
+			if (actionType === 'volume') { actionName = 'حجم مصرفی'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
+			else if (actionType === 'req') { actionName = 'تعداد ریکوئست‌ها'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
+			else if (actionType === 'time') { actionName = 'زمان اشتراک'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
+			else if (actionType === 'locations') { actionName = 'بروزرسانی لوکیشن‌ها'; confirmText = 'کشورهای پین‌شده‌ی فعلی (تنظیمات > لوکیشن‌ها) که ' + usernames.length + ' کاربر انتخاب‌شده هنوز ندارن اضافه می‌شه؛ چیزی که از قبل دارن حذف نمی‌شه. ادامه بدم؟'; }
+			if (await customConfirm(confirmText)) {
 				const bar = document.getElementById('bulk-actions-bar');
 				const buttons = bar.querySelectorAll('button');
 				buttons.forEach(btn => btn.disabled = true);
 				try {
 					let successCount = 0;
+					const cappedUsernames = [];
 					await Promise.all(usernames.map(async (uname) => {
 						try {
 							const res = await fetch('/api/users/' + encodeURIComponent(uname), {
@@ -6445,10 +6671,57 @@ ${COMMON_TOAST_HTML}
 								headers: { 'Content-Type': 'application/json' },
 								body: JSON.stringify({ reset_action: actionType })
 							});
-							if (res.ok) successCount++;
+							if (res.ok) {
+								successCount++;
+								if (actionType === 'locations') {
+									try {
+										const data = await res.json();
+										if (data && data.capped) cappedUsernames.push(uname);
+									} catch (e) {}
+								}
+							}
 						} catch(e) {}
 					}));
-					alert('✅ عملیات ریست گروهی ' + actionName + ' با موفقیت برای ' + successCount + ' کاربر اعمال شد.');
+					let msg = '✅ عملیات ' + actionName + ' با موفقیت برای ' + successCount + ' کاربر اعمال شد.';
+					if (cappedUsernames.length > 0) {
+						msg += '\\n\\n⚠️ این کاربرا به سقف ' + MAX_LOCATIONS_PER_USER_CLIENT + ' لوکیشن رسیدن و بعضی کشورای جدید براشون اضافه نشد (برای جا باز کردن، یه کشور قدیمی رو دستی حذف کنید): ' + cappedUsernames.join('، ');
+					}
+					alert(msg);
+				} finally {
+					buttons.forEach(btn => btn.disabled = false);
+					updateBulkActionsBar();
+					await loadUsers(true);
+				}
+			}
+		}
+		const MAX_LOCATIONS_PER_USER_CLIENT = 20;
+		async function bulkRemoveLocation() {
+			const usernames = Array.from(window.selectedUsernames);
+			if (usernames.length === 0) return;
+			const select = document.getElementById('bulk-remove-location-select');
+			const country = select && select.value;
+			if (!country) return;
+			const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(country) : '🌐';
+			if (await customConfirm(flag + ' ' + country + ' از لیست کانفیگ‌های ' + usernames.length + ' کاربر انتخاب‌شده حذف بشه؟ این کار غیرقابل بازگشت است (اگه دوباره لازمش داشتید باید از «بروزرسانی لوکیشن‌ها» یا افزودن دستی دوباره اضافه‌ش کنید).')) {
+				const bar = document.getElementById('bulk-actions-bar');
+				const buttons = bar.querySelectorAll('button');
+				buttons.forEach(btn => btn.disabled = true);
+				try {
+					let removedCount = 0;
+					await Promise.all(usernames.map(async (uname) => {
+						try {
+							const res = await fetch('/api/users/' + encodeURIComponent(uname), {
+								method: 'PUT',
+								headers: { 'Content-Type': 'application/json' },
+								body: JSON.stringify({ reset_action: 'remove_location', country: country })
+							});
+							if (res.ok) {
+								const data = await res.json();
+								if (data && data.removed) removedCount++;
+							}
+						} catch(e) {}
+					}));
+					alert('✅ کشور ' + flag + ' ' + country + ' از ' + removedCount + ' کاربر (از بین ' + usernames.length + ' انتخاب‌شده) حذف شد.');
 				} finally {
 					buttons.forEach(btn => btn.disabled = false);
 					updateBulkActionsBar();
@@ -8270,9 +8543,61 @@ function downloadZeusSource() {
 			}
 			const rawPath = "/XYZ";
 			const inlineProxySegment = (typeof window.buildInlineProxyIpSegment === 'function') ? window.buildInlineProxyIpSegment(window.INLINE_PROXY_IP) : "";
-			const LOCATION_PATH_CODES = { UZ: "U-z-b", KZ: "K-a-z", TR: "T-u-r", LY: "L-b-y", NL: "N-l-d", AL: "A-l-b", EE: "E-s-t", BG: "B-g-r", LV: "L-v-a", SE: "S-w-e", NO: "N-o-r", GB: "G-b", US: "U-s-a", ES: "E-s-p", BE: "B-e-l" };
+			// Same ISO 3166-1 alpha-2 -> alpha-3 table as the server-side one (see
+			// getLocationPathSegment() near the top of the worker source) -
+			// duplicated here because this runs in the browser. Works for ANY
+			// country in the VIP repo, not just currently-pinned ones.
+			const ISO_ALPHA3_MAP = {
+				AD: "AND", AE: "ARE", AF: "AFG", AG: "ATG", AI: "AIA", AL: "ALB",
+				AM: "ARM", AO: "AGO", AQ: "ATA", AR: "ARG", AS: "ASM", AT: "AUT",
+				AU: "AUS", AW: "ABW", AX: "ALA", AZ: "AZE", BA: "BIH", BB: "BRB",
+				BD: "BGD", BE: "BEL", BF: "BFA", BG: "BGR", BH: "BHR", BI: "BDI",
+				BJ: "BEN", BL: "BLM", BM: "BMU", BN: "BRN", BO: "BOL", BQ: "BES",
+				BR: "BRA", BS: "BHS", BT: "BTN", BV: "BVT", BW: "BWA", BY: "BLR",
+				BZ: "BLZ", CA: "CAN", CC: "CCK", CD: "COD", CF: "CAF", CG: "COG",
+				CH: "CHE", CI: "CIV", CK: "COK", CL: "CHL", CM: "CMR", CN: "CHN",
+				CO: "COL", CR: "CRI", CU: "CUB", CV: "CPV", CW: "CUW", CX: "CXR",
+				CY: "CYP", CZ: "CZE", DE: "DEU", DJ: "DJI", DK: "DNK", DM: "DMA",
+				DO: "DOM", DZ: "DZA", EC: "ECU", EE: "EST", EG: "EGY", EH: "ESH",
+				ER: "ERI", ES: "ESP", ET: "ETH", FI: "FIN", FJ: "FJI", FK: "FLK",
+				FM: "FSM", FO: "FRO", FR: "FRA", GA: "GAB", GB: "GBR", GD: "GRD",
+				GE: "GEO", GF: "GUF", GG: "GGY", GH: "GHA", GI: "GIB", GL: "GRL",
+				GM: "GMB", GN: "GIN", GP: "GLP", GQ: "GNQ", GR: "GRC", GS: "SGS",
+				GT: "GTM", GU: "GUM", GW: "GNB", GY: "GUY", HK: "HKG", HM: "HMD",
+				HN: "HND", HR: "HRV", HT: "HTI", HU: "HUN", ID: "IDN", IE: "IRL",
+				IL: "ISR", IM: "IMN", IN: "IND", IO: "IOT", IQ: "IRQ", IR: "IRN",
+				IS: "ISL", IT: "ITA", JE: "JEY", JM: "JAM", JO: "JOR", JP: "JPN",
+				KE: "KEN", KG: "KGZ", KH: "KHM", KI: "KIR", KM: "COM", KN: "KNA",
+				KP: "PRK", KR: "KOR", KW: "KWT", KY: "CYM", KZ: "KAZ", LA: "LAO",
+				LB: "LBN", LC: "LCA", LI: "LIE", LK: "LKA", LR: "LBR", LS: "LSO",
+				LT: "LTU", LU: "LUX", LV: "LVA", LY: "LBY", MA: "MAR", MC: "MCO",
+				MD: "MDA", ME: "MNE", MF: "MAF", MG: "MDG", MH: "MHL", MK: "MKD",
+				ML: "MLI", MM: "MMR", MN: "MNG", MO: "MAC", MP: "MNP", MQ: "MTQ",
+				MR: "MRT", MS: "MSR", MT: "MLT", MU: "MUS", MV: "MDV", MW: "MWI",
+				MX: "MEX", MY: "MYS", MZ: "MOZ", NA: "NAM", NC: "NCL", NE: "NER",
+				NF: "NFK", NG: "NGA", NI: "NIC", NL: "NLD", NO: "NOR", NP: "NPL",
+				NR: "NRU", NU: "NIU", NZ: "NZL", OM: "OMN", PA: "PAN", PE: "PER",
+				PF: "PYF", PG: "PNG", PH: "PHL", PK: "PAK", PL: "POL", PM: "SPM",
+				PN: "PCN", PR: "PRI", PS: "PSE", PT: "PRT", PW: "PLW", PY: "PRY",
+				QA: "QAT", RE: "REU", RO: "ROU", RS: "SRB", RU: "RUS", RW: "RWA",
+				SA: "SAU", SB: "SLB", SC: "SYC", SD: "SDN", SE: "SWE", SG: "SGP",
+				SH: "SHN", SI: "SVN", SJ: "SJM", SK: "SVK", SL: "SLE", SM: "SMR",
+				SN: "SEN", SO: "SOM", SR: "SUR", SS: "SSD", ST: "STP", SV: "SLV",
+				SX: "SXM", SY: "SYR", SZ: "SWZ", TC: "TCA", TD: "TCD", TF: "ATF",
+				TG: "TGO", TH: "THA", TJ: "TJK", TK: "TKL", TL: "TLS", TM: "TKM",
+				TN: "TUN", TO: "TON", TR: "TUR", TT: "TTO", TV: "TUV", TW: "TWN",
+				TZ: "TZA", UA: "UKR", UG: "UGA", UM: "UMI", US: "USA", UY: "URY",
+				UZ: "UZB", VA: "VAT", VC: "VCT", VE: "VEN", VG: "VGB", VI: "VIR",
+				VN: "VNM", VU: "VUT", WF: "WLF", WS: "WSM", YE: "YEM", YT: "MYT",
+				ZA: "ZAF", ZM: "ZMB", ZW: "ZWE",
+			};
+			const LOCATION_PATH_CODE_OVERRIDES = { GB: "G-b" };
 			function getLocationPathSegment(countryCode, locIdx) {
-				if (countryCode && LOCATION_PATH_CODES[countryCode.toUpperCase()]) return LOCATION_PATH_CODES[countryCode.toUpperCase()];
+				if (countryCode) {
+					const cc = countryCode.toUpperCase();
+					if (LOCATION_PATH_CODE_OVERRIDES[cc]) return LOCATION_PATH_CODE_OVERRIDES[cc];
+					if (ISO_ALPHA3_MAP[cc]) return ISO_ALPHA3_MAP[cc].split("").map(function(ch, i) { return i === 0 ? ch : ch.toLowerCase(); }).join("-");
+				}
 				return "loc-" + locIdx;
 			}
 			let proxyList = [];
@@ -8719,6 +9044,118 @@ window.saveOtherCleanIps = async function() {
 		if (btn) btn.disabled = false;
 	}
 };
+window.PINNED_LOCATIONS_DEFAULT_FALLBACK = ["UZ", "KZ", "TR", "LY", "NL", "AL", "EE", "BG", "LV", "SE", "NO", "GB", "US", "ES", "BE"];
+window.PINNED_LOCATIONS_CACHE = window.PINNED_LOCATIONS_DEFAULT_FALLBACK.slice();
+window.ALL_ISO_COUNTRIES_LIST = [
+	"AD", "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR", "AS", "AT", "AU", "AW", "AX", "AZ", "BA",
+	"BB", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO", "BQ", "BR", "BS", "BT", "BV",
+	"BW", "BY", "BZ", "CA", "CC", "CD", "CF", "CG", "CH", "CI", "CK", "CL", "CM", "CN", "CO", "CR", "CU",
+	"CV", "CW", "CX", "CY", "CZ", "DE", "DJ", "DK", "DM", "DO", "DZ", "EC", "EE", "EG", "EH", "ER", "ES",
+	"ET", "FI", "FJ", "FK", "FM", "FO", "FR", "GA", "GB", "GD", "GE", "GF", "GG", "GH", "GI", "GL", "GM",
+	"GN", "GP", "GQ", "GR", "GS", "GT", "GU", "GW", "GY", "HK", "HM", "HN", "HR", "HT", "HU", "ID", "IE",
+	"IL", "IM", "IN", "IO", "IQ", "IR", "IS", "IT", "JE", "JM", "JO", "JP", "KE", "KG", "KH", "KI", "KM",
+	"KN", "KP", "KR", "KW", "KY", "KZ", "LA", "LB", "LC", "LI", "LK", "LR", "LS", "LT", "LU", "LV", "LY",
+	"MA", "MC", "MD", "ME", "MF", "MG", "MH", "MK", "ML", "MM", "MN", "MO", "MP", "MQ", "MR", "MS", "MT",
+	"MU", "MV", "MW", "MX", "MY", "MZ", "NA", "NC", "NE", "NF", "NG", "NI", "NL", "NO", "NP", "NR", "NU",
+	"NZ", "OM", "PA", "PE", "PF", "PG", "PH", "PK", "PL", "PM", "PN", "PR", "PS", "PT", "PW", "PY", "QA",
+	"RE", "RO", "RS", "RU", "RW", "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI", "SJ", "SK", "SL", "SM",
+	"SN", "SO", "SR", "SS", "ST", "SV", "SX", "SY", "SZ", "TC", "TD", "TF", "TG", "TH", "TJ", "TK", "TL",
+	"TM", "TN", "TO", "TR", "TT", "TV", "TW", "TZ", "UA", "UG", "UM", "US", "UY", "UZ", "VA", "VC", "VE",
+	"VG", "VI", "VN", "VU", "WF", "WS", "YE", "YT", "ZA", "ZM", "ZW"
+];
+window.loadPinnedLocationsSetting = async function() {
+	let list = window.PINNED_LOCATIONS_DEFAULT_FALLBACK.slice();
+	try {
+		const res = await fetch('/api/settings/bulk');
+		const data = await res.json();
+		if (data && typeof data.pinned_locations === 'string' && data.pinned_locations.trim() !== '') {
+			const parsed = JSON.parse(data.pinned_locations);
+			if (Array.isArray(parsed) && parsed.length > 0) list = parsed;
+		}
+	} catch (e) {}
+	window.PINNED_LOCATIONS_CACHE = list;
+	window.renderPinnedLocationsList();
+	return list;
+};
+window.renderPinnedLocationsList = function() {
+	const container = document.getElementById('pinned-locations-list');
+	const countEl = document.getElementById('pinned-locations-count');
+	if (countEl) countEl.innerText = window.PINNED_LOCATIONS_CACHE.length + ' کشور';
+	if (!container) return;
+	const lastIdx = window.PINNED_LOCATIONS_CACHE.length - 1;
+	container.innerHTML = window.PINNED_LOCATIONS_CACHE.map(function(cc, i) {
+		const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
+		return '<div class="flex items-center gap-2 py-1.5 px-2 border-b border-gray-100 dark:border-zinc-800 last:border-0">' +
+			'<span class="flex-1 text-xs font-bold text-gray-800 dark:text-zinc-200">' + flag + ' ' + cc + '</span>' +
+			'<button type="button" onclick="pinnedLocationMoveUp(' + i + ')" ' + (i === 0 ? 'disabled' : '') + ' class="p-1 rounded text-gray-500 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed">▲</button>' +
+			'<button type="button" onclick="pinnedLocationMoveDown(' + i + ')" ' + (i === lastIdx ? 'disabled' : '') + ' class="p-1 rounded text-gray-500 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed">▼</button>' +
+			'<button type="button" onclick="pinnedLocationRemove(' + i + ')" class="p-1 rounded text-red-500 hover:text-red-700">✕</button>' +
+			'</div>';
+	}).join('');
+};
+window.pinnedLocationMoveUp = function(i) {
+	const arr = window.PINNED_LOCATIONS_CACHE;
+	if (i <= 0 || i >= arr.length) return;
+	const tmp = arr[i - 1];
+	arr[i - 1] = arr[i];
+	arr[i] = tmp;
+	window.renderPinnedLocationsList();
+};
+window.pinnedLocationMoveDown = function(i) {
+	const arr = window.PINNED_LOCATIONS_CACHE;
+	if (i < 0 || i >= arr.length - 1) return;
+	const tmp = arr[i + 1];
+	arr[i + 1] = arr[i];
+	arr[i] = tmp;
+	window.renderPinnedLocationsList();
+};
+window.pinnedLocationRemove = function(i) {
+	window.PINNED_LOCATIONS_CACHE.splice(i, 1);
+	window.renderPinnedLocationsList();
+};
+window.pinnedLocationAdd = function() {
+	const select = document.getElementById('pinned-location-add-select');
+	if (!select || !select.value) return;
+	const cc = select.value;
+	if (window.PINNED_LOCATIONS_CACHE.indexOf(cc) === -1) {
+		window.PINNED_LOCATIONS_CACHE.push(cc);
+		window.renderPinnedLocationsList();
+	} else {
+		showToast('این کشور از قبل توی لیست پین‌شده‌هاست.');
+	}
+};
+window.savePinnedLocations = async function() {
+	const btn = document.getElementById('save-pinned-locations-btn');
+	if (btn) btn.disabled = true;
+	try {
+		await fetch('/api/settings/bulk', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ settings: { pinned_locations: JSON.stringify(window.PINNED_LOCATIONS_CACHE) } })
+		});
+		showToast('✅ لیست لوکیشن‌های پین‌شده ذخیره شد.');
+	} catch (e) {
+		showToast('❌ ذخیره‌سازی لوکیشن‌ها ناموفق بود.');
+	} finally {
+		if (btn) btn.disabled = false;
+	}
+};
+window.populatePinnedLocationSelects = function() {
+	const addSelect = document.getElementById('pinned-location-add-select');
+	const bulkSelect = document.getElementById('bulk-remove-location-select');
+	[addSelect, bulkSelect].forEach(function(select) {
+		if (!select) return;
+		select.innerHTML = '';
+		window.ALL_ISO_COUNTRIES_LIST.forEach(function(cc) {
+			const option = document.createElement('option');
+			option.value = cc;
+			const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
+			option.textContent = flag + ' ' + cc;
+			select.appendChild(option);
+		});
+	});
+};
+
 function generateInlineProxyJunkClient(len) {
 	len = len || 10;
 	const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -9626,6 +10063,8 @@ function applySelectedIps() {
 			window.loadGlobalCleanIpSetting();
 			window.loadOtherCleanIpsSetting();
 			window.loadInlineProxyIpSetting();
+			window.populatePinnedLocationSelects();
+			window.loadPinnedLocationsSetting();
 			window.usersRefreshIntervalId = null;
 			window.startRefreshInterval = function(intervalMs) {
 				if (window.usersRefreshIntervalId) {
@@ -10561,9 +11000,61 @@ ${COMMON_TOAST_HTML}
 			}
 			const rawPath = "/XYZ";
 			const inlineProxySegment = buildInlineProxyIpSegment(window.INLINE_PROXY_IP);
-			const LOCATION_PATH_CODES = { UZ: "U-z-b", KZ: "K-a-z", TR: "T-u-r", LY: "L-b-y", NL: "N-l-d", AL: "A-l-b", EE: "E-s-t", BG: "B-g-r", LV: "L-v-a", SE: "S-w-e", NO: "N-o-r", GB: "G-b", US: "U-s-a", ES: "E-s-p", BE: "B-e-l" };
+			// Same ISO 3166-1 alpha-2 -> alpha-3 table as the server-side one (see
+			// getLocationPathSegment() near the top of the worker source) -
+			// duplicated here because this runs in the browser. Works for ANY
+			// country in the VIP repo, not just currently-pinned ones.
+			const ISO_ALPHA3_MAP = {
+				AD: "AND", AE: "ARE", AF: "AFG", AG: "ATG", AI: "AIA", AL: "ALB",
+				AM: "ARM", AO: "AGO", AQ: "ATA", AR: "ARG", AS: "ASM", AT: "AUT",
+				AU: "AUS", AW: "ABW", AX: "ALA", AZ: "AZE", BA: "BIH", BB: "BRB",
+				BD: "BGD", BE: "BEL", BF: "BFA", BG: "BGR", BH: "BHR", BI: "BDI",
+				BJ: "BEN", BL: "BLM", BM: "BMU", BN: "BRN", BO: "BOL", BQ: "BES",
+				BR: "BRA", BS: "BHS", BT: "BTN", BV: "BVT", BW: "BWA", BY: "BLR",
+				BZ: "BLZ", CA: "CAN", CC: "CCK", CD: "COD", CF: "CAF", CG: "COG",
+				CH: "CHE", CI: "CIV", CK: "COK", CL: "CHL", CM: "CMR", CN: "CHN",
+				CO: "COL", CR: "CRI", CU: "CUB", CV: "CPV", CW: "CUW", CX: "CXR",
+				CY: "CYP", CZ: "CZE", DE: "DEU", DJ: "DJI", DK: "DNK", DM: "DMA",
+				DO: "DOM", DZ: "DZA", EC: "ECU", EE: "EST", EG: "EGY", EH: "ESH",
+				ER: "ERI", ES: "ESP", ET: "ETH", FI: "FIN", FJ: "FJI", FK: "FLK",
+				FM: "FSM", FO: "FRO", FR: "FRA", GA: "GAB", GB: "GBR", GD: "GRD",
+				GE: "GEO", GF: "GUF", GG: "GGY", GH: "GHA", GI: "GIB", GL: "GRL",
+				GM: "GMB", GN: "GIN", GP: "GLP", GQ: "GNQ", GR: "GRC", GS: "SGS",
+				GT: "GTM", GU: "GUM", GW: "GNB", GY: "GUY", HK: "HKG", HM: "HMD",
+				HN: "HND", HR: "HRV", HT: "HTI", HU: "HUN", ID: "IDN", IE: "IRL",
+				IL: "ISR", IM: "IMN", IN: "IND", IO: "IOT", IQ: "IRQ", IR: "IRN",
+				IS: "ISL", IT: "ITA", JE: "JEY", JM: "JAM", JO: "JOR", JP: "JPN",
+				KE: "KEN", KG: "KGZ", KH: "KHM", KI: "KIR", KM: "COM", KN: "KNA",
+				KP: "PRK", KR: "KOR", KW: "KWT", KY: "CYM", KZ: "KAZ", LA: "LAO",
+				LB: "LBN", LC: "LCA", LI: "LIE", LK: "LKA", LR: "LBR", LS: "LSO",
+				LT: "LTU", LU: "LUX", LV: "LVA", LY: "LBY", MA: "MAR", MC: "MCO",
+				MD: "MDA", ME: "MNE", MF: "MAF", MG: "MDG", MH: "MHL", MK: "MKD",
+				ML: "MLI", MM: "MMR", MN: "MNG", MO: "MAC", MP: "MNP", MQ: "MTQ",
+				MR: "MRT", MS: "MSR", MT: "MLT", MU: "MUS", MV: "MDV", MW: "MWI",
+				MX: "MEX", MY: "MYS", MZ: "MOZ", NA: "NAM", NC: "NCL", NE: "NER",
+				NF: "NFK", NG: "NGA", NI: "NIC", NL: "NLD", NO: "NOR", NP: "NPL",
+				NR: "NRU", NU: "NIU", NZ: "NZL", OM: "OMN", PA: "PAN", PE: "PER",
+				PF: "PYF", PG: "PNG", PH: "PHL", PK: "PAK", PL: "POL", PM: "SPM",
+				PN: "PCN", PR: "PRI", PS: "PSE", PT: "PRT", PW: "PLW", PY: "PRY",
+				QA: "QAT", RE: "REU", RO: "ROU", RS: "SRB", RU: "RUS", RW: "RWA",
+				SA: "SAU", SB: "SLB", SC: "SYC", SD: "SDN", SE: "SWE", SG: "SGP",
+				SH: "SHN", SI: "SVN", SJ: "SJM", SK: "SVK", SL: "SLE", SM: "SMR",
+				SN: "SEN", SO: "SOM", SR: "SUR", SS: "SSD", ST: "STP", SV: "SLV",
+				SX: "SXM", SY: "SYR", SZ: "SWZ", TC: "TCA", TD: "TCD", TF: "ATF",
+				TG: "TGO", TH: "THA", TJ: "TJK", TK: "TKL", TL: "TLS", TM: "TKM",
+				TN: "TUN", TO: "TON", TR: "TUR", TT: "TTO", TV: "TUV", TW: "TWN",
+				TZ: "TZA", UA: "UKR", UG: "UGA", UM: "UMI", US: "USA", UY: "URY",
+				UZ: "UZB", VA: "VAT", VC: "VCT", VE: "VEN", VG: "VGB", VI: "VIR",
+				VN: "VNM", VU: "VUT", WF: "WLF", WS: "WSM", YE: "YEM", YT: "MYT",
+				ZA: "ZAF", ZM: "ZMB", ZW: "ZWE",
+			};
+			const LOCATION_PATH_CODE_OVERRIDES = { GB: "G-b" };
 			function getLocationPathSegment(countryCode, locIdx) {
-				if (countryCode && LOCATION_PATH_CODES[countryCode.toUpperCase()]) return LOCATION_PATH_CODES[countryCode.toUpperCase()];
+				if (countryCode) {
+					const cc = countryCode.toUpperCase();
+					if (LOCATION_PATH_CODE_OVERRIDES[cc]) return LOCATION_PATH_CODE_OVERRIDES[cc];
+					if (ISO_ALPHA3_MAP[cc]) return ISO_ALPHA3_MAP[cc].split("").map(function(ch, i) { return i === 0 ? ch : ch.toLowerCase(); }).join("-");
+				}
 				return "loc-" + locIdx;
 			}
 			let proxyList = [];
