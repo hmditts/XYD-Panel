@@ -6314,7 +6314,6 @@ Commercial support is available at
 						<svg class="w-4 h-4 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
 						محدودیت کل ریکوئست روزانه
 					</label>
-					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mb-1.5 leading-relaxed">با رسیدن مجموع ریکوئست امروز کل اکانت (همون عدد کارت Request) به این سقف، اتصال تمام کاربران قطع می‌شود و تا ریست روزانه‌ی بعدی (۰۰:۰۰ UTC) دوباره وصل نمی‌شوند.</p>
 					<div class="flex items-center gap-2">
 						<input type="number" id="global-req-limit-input" dir="ltr" min="0" step="1000" placeholder="75000" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 						<button type="button" onclick="saveGlobalReqLimit()" id="save-global-req-limit-btn" class="px-3 py-2 bg-orange-700 hover:bg-orange-800 dark:bg-orange-600 dark:hover:bg-orange-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
@@ -7891,7 +7890,7 @@ async function executeRocketCreate() {
 					const isChecked = (window.selectedUsernames && window.selectedUsernames.has(user.username)) ? 'checked' : '';
 					const onlineBadgeColor = onlineCount >= 3 ? 'bg-red-600' : (onlineCount === 2 ? 'bg-yellow-500' : 'bg-green-600');
 					const onlineBadge = user.is_online === 1
-						? '<span class="min-w-[20px] h-5 px-1 inline-flex items-center justify-center text-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1">' + user.online_count + '</span>'
+						? '<span class="min-w-[20px] h-5 px-1 inline-flex items-center justify-center text-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="display:inline-block;transform:translateX(0.6px)">' + user.online_count + '</span></span>'
 						: '';
 					return '<div class="group transition-all drop-shadow-sm bg-white/60 dark:bg-zinc-900/40 rounded-md border border-gray-200 dark:border-zinc-800 p-1 flex flex-col items-center gap-1 text-center" data-username="' + user.username + '">' +
 							'<div class="flex items-center justify-center flex-wrap gap-1 w-full">' +
@@ -8619,19 +8618,11 @@ function downloadZeusSource() {
 			return niceNorm * base;
 		}
 
-		function smoothChartPath(points) {
+		function straightChartPath(points) {
 			if (points.length < 2) return points.length ? ('M ' + points[0][0].toFixed(2) + ' ' + points[0][1].toFixed(2)) : '';
 			let d = 'M ' + points[0][0].toFixed(2) + ' ' + points[0][1].toFixed(2);
-			for (let i = 0; i < points.length - 1; i++) {
-				const p0 = points[i === 0 ? i : i - 1];
-				const p1 = points[i];
-				const p2 = points[i + 1];
-				const p3 = points[i + 2 < points.length ? i + 2 : i + 1];
-				const c1x = p1[0] + (p2[0] - p0[0]) / 6;
-				const c1y = p1[1] + (p2[1] - p0[1]) / 6;
-				const c2x = p2[0] - (p3[0] - p1[0]) / 6;
-				const c2y = p2[1] - (p3[1] - p1[1]) / 6;
-				d += ' C ' + c1x.toFixed(2) + ' ' + c1y.toFixed(2) + ', ' + c2x.toFixed(2) + ' ' + c2y.toFixed(2) + ', ' + p2[0].toFixed(2) + ' ' + p2[1].toFixed(2);
+			for (let i = 1; i < points.length; i++) {
+				d += ' L ' + points[i][0].toFixed(2) + ' ' + points[i][1].toFixed(2);
 			}
 			return d;
 		}
@@ -8698,7 +8689,7 @@ function downloadZeusSource() {
 			const xAt = (i) => padL + (n === 1 ? innerW / 2 : (i * innerW) / (n - 1));
 			const yAt = (v) => padT + innerH - (Math.min(v, niceMax) / niceMax) * innerH;
 			const points = series.map((d, i) => [xAt(i), yAt(d.value || 0)]);
-			const linePath = smoothChartPath(points);
+			const linePath = straightChartPath(points);
 			const baseline = (padT + innerH).toFixed(2);
 			const areaPath = linePath + ' L ' + points[n - 1][0].toFixed(2) + ' ' + baseline + ' L ' + points[0][0].toFixed(2) + ' ' + baseline + ' Z';
 			const gridCount = 4;
