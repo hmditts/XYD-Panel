@@ -4954,12 +4954,11 @@ Commercial support is available at
 	<main class="max-w-6xl mx-auto px-4 py-8 pb-56 md:pb-32 relative z-10">
 <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
 	<div id="card-cf-requests" class="neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
-		<div class="grid grid-cols-[1fr_auto_1fr] items-center relative z-10">
-			<span></span>
-			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">مصرف Request</span>
-			<div class="p-1 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-md flex-shrink-0 justify-self-end">
+		<div class="flex items-center justify-center gap-1.5 relative z-10">
+			<div class="p-1 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-md flex-shrink-0">
 				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
 			</div>
+			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Request</span>
 		</div>
 		<div class="relative z-10 min-w-0 flex-1 w-full mt-1">
 			<div class="grid grid-cols-3 gap-1 w-full mb-1.5">
@@ -4986,19 +4985,18 @@ Commercial support is available at
 		</div>
 	</div>
 	<div id="card-d1-usage" class="neon-orbit neon-orbit-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-purple-400 dark:hover:border-purple-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
-		<div class="grid grid-cols-[1fr_auto_1fr] items-center relative z-10">
-			<span></span>
-			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">مصرف D1</span>
-			<div class="p-1 bg-purple-50 dark:bg-purple-950/30 text-purple-600 dark:text-purple-400 rounded-md flex-shrink-0 justify-self-end">
+		<div class="flex items-center justify-center gap-1.5 relative z-10">
+			<div class="p-1 bg-purple-50 dark:bg-purple-950/30 text-purple-600 dark:text-purple-400 rounded-md flex-shrink-0">
 				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"></path></svg>
 			</div>
+			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">D1</span>
 		</div>
 		<div class="relative z-10 min-w-0 flex-1 w-full mt-1">
-			<div class="grid grid-cols-2 gap-2 w-full">
+			<div class="grid grid-cols-2 gap-2 w-full mb-1.5">
 				<div class="flex flex-col items-start justify-center">
-					<div class="flex items-baseline gap-1">
+					<div class="flex items-baseline gap-1" dir="ltr">
+						<span class="text-[9px] font-bold text-gray-400 leading-none">100k /</span>
 						<span class="text-sm font-black text-purple-600 dark:text-purple-400 transition-all leading-none" id="stat-d1-writes">0</span>
-						<span class="text-[9px] font-bold text-gray-400 leading-none">/ 100k</span>
 					</div>
 					<span class="text-[9px] font-medium text-gray-500 dark:text-zinc-400 mt-1">نوشتن</span>
 				</div>
@@ -5010,15 +5008,17 @@ Commercial support is available at
 					<span class="text-[9px] font-medium text-gray-500 dark:text-zinc-400 mt-1">خواندن</span>
 				</div>
 			</div>
+			<div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1 mt-1">
+				<div id="stat-d1-progress" class="bg-purple-500 h-1 rounded-full transition-all duration-500" style="width: 0%"></div>
+			</div>
 		</div>
 	</div>
 	<div class="neon-orbit neon-orbit-3 col-span-2 lg:col-span-1 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
-		<div class="grid grid-cols-[1fr_auto_1fr] items-center relative z-10">
-			<span></span>
-			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">ترافیک</span>
-			<div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0 justify-self-end">
+		<div class="flex items-center justify-center gap-1.5 relative z-10">
+			<div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0">
 				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
 			</div>
+			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Traffic</span>
 		</div>
 		<div class="relative z-10 min-w-0 flex-1 w-full mt-1">
 			<div class="grid grid-cols-3 gap-1 w-full">
@@ -6202,7 +6202,6 @@ Commercial support is available at
 						<textarea id="other-clean-ips-input" dir="ltr" rows="3" placeholder="104.18.39.219&#10;185.148.105.218" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 resize-none"></textarea>
 						<button type="button" onclick="saveOtherCleanIps()" id="save-other-clean-ips-btn" class="px-3 py-2 bg-teal-700 hover:bg-teal-800 dark:bg-teal-600 dark:hover:bg-teal-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap self-stretch">ذخیره</button>
 					</div>
-					<span class="text-[10px] text-gray-400 dark:text-zinc-500 block font-normal mt-1">هر آی‌پی در یک خط جدا. به ازای هر آی‌پی، یک کانفیگ اضافه (با همان آدرس و با پرچم 🇩🇪) به کانفیگ‌های هر کاربر اضافه می‌شود؛ Path این کانفیگ‌ها از تنظیم Proxy IP بالا ساخته می‌شود.</span>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
@@ -7518,6 +7517,8 @@ async function executeRocketCreate() {
 				const d1Writes = data.d1Writes || 0;
 				setStatWithLivePulse('stat-d1-writes', d1Writes >= 1000 ? (d1Writes / 1000).toFixed(1) + 'k' : d1Writes);
 				setStatWithLivePulse('stat-d1-reads', d1Reads >= 1000000 ? (d1Reads / 1000000).toFixed(2) + 'M' : (d1Reads >= 1000 ? (d1Reads / 1000).toFixed(1) + 'k' : d1Reads));
+				const d1ProgressPercent = Math.min((d1Writes / 100000) * 100, 100);
+				document.getElementById('stat-d1-progress').style.width = d1ProgressPercent + '%';
 				const cfRequests = data.cfRequestsToday || 0;
 				const reqCard = document.getElementById('card-cf-requests');
 				const warningBtn = document.getElementById('cf-warning-btn');
@@ -7647,8 +7648,7 @@ async function executeRocketCreate() {
 				const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
 				return '<span title="' + cc + '" class="text-base leading-none drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)] flex items-center justify-center">' + flag + '</span>';
 			});
-			container.innerHTML = '<span class="text-[10px] font-bold text-gray-500 dark:text-zinc-400">لوکیشن‌های پین‌شده</span>' +
-				'<div class="flex flex-wrap justify-center gap-1.5" dir="ltr">' + flagsHtmlArray.join('') + '</div>';
+			container.innerHTML = '<div class="flex flex-wrap justify-center gap-1.5" dir="ltr">' + flagsHtmlArray.join('') + '</div>';
 			container.classList.remove('hidden');
 		}
 		function renderFilteredUsers(users, serverTime) {
