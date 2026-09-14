@@ -4995,13 +4995,13 @@ Commercial support is available at
 			<div class="grid grid-cols-2 gap-2 w-full mb-1.5">
 				<div class="flex flex-col items-start justify-center">
 					<div class="flex items-baseline gap-1" dir="ltr">
-						<span class="text-[9px] font-bold text-gray-400 leading-none">100k /</span>
 						<span class="text-sm font-black text-purple-600 dark:text-purple-400 transition-all leading-none" id="stat-d1-writes">0</span>
+						<span class="text-[9px] font-bold text-gray-400 leading-none">/ 100k</span>
 					</div>
 					<span class="text-[9px] font-medium text-gray-500 dark:text-zinc-400 mt-1">نوشتن</span>
 				</div>
 				<div class="flex flex-col items-end justify-center border-r border-gray-100 dark:border-zinc-800 pr-2">
-					<div class="flex items-baseline gap-1">
+					<div class="flex items-baseline gap-1" dir="ltr">
 						<span class="text-sm font-black text-purple-600 dark:text-purple-400 transition-all leading-none" id="stat-d1-reads">0</span>
 						<span class="text-[9px] font-bold text-gray-400 leading-none">/ 5M</span>
 					</div>
