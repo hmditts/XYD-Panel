@@ -3,6 +3,9 @@ const ACTIVE_CONNECTIONS_COUNT = new Map();
 const GLOBAL_LAST_ACTIVE_WRITE = new Map();
 const GLOBAL_LAST_DB_WRITE = new Map();
 const GLOBAL_WRITE_LOCK = new Map();
+// Serializes read-merge-write cycles on `active_ips` per username within the same isolate
+// (promise-chaining mutex). See persistActiveIp() near getActiveIpCount() for why this exists.
+const GLOBAL_ACTIVE_IPS_WRITE_LOCK = new Map();
 const DNS_CACHE = new Map();
 const USER_REQ_CACHE = new Map();
 const LOGIN_ATTEMPTS = new Map();
@@ -2148,6 +2151,45 @@ const DbService = {
 		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 	},
 };
+// Fix (device-counter bug): user rows served from the 10s auth cache (getCachedAuthUser)
+// carry a possibly-stale `active_ips`. Writing that stale snapshot back to D1 on every new
+// connection / heartbeat tick could silently erase other devices' entries when several
+// connections for the same account land within the same 10s window (last write wins).
+//
+// Fix, scoped to stay cheap: only at the moment we were ALREADY about to write (the caller
+// still does its own isNewIp / 15-min throttling on the cached copy - unchanged, and cheap),
+// re-read just the `active_ips` column fresh from D1, merge this one IP onto THAT copy, and
+// write the merge back. This keeps the extra D1 read bound to the existing write frequency
+// instead of every connection/heartbeat. A per-username promise-chain lock serializes this
+// within the same isolate so two near-simultaneous writes for the same user can't still race
+// each other on the read step.
+async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
+	const run = async () => {
+		let freshIps = {};
+		try {
+			const row = await env.DB.prepare("SELECT active_ips FROM users WHERE uuid = ?").bind(uuid).first();
+			freshIps = JSON.parse((row && row.active_ips) || "{}");
+		} catch (e) { }
+		for (const [ip, data] of Object.entries(freshIps)) {
+			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+			if (now - lastSeen > 180000 && ip !== clientIP) delete freshIps[ip];
+		}
+		if (freshIps[clientIP] && typeof freshIps[clientIP] === "object") {
+			freshIps[clientIP].timestamp = now;
+			freshIps[clientIP].count = (freshIps[clientIP].count || 0) + 1;
+		} else {
+			freshIps[clientIP] = { timestamp: now, count: 1 };
+		}
+		try {
+			await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, uuid).run();
+		} catch (e) { }
+	};
+	const prior = GLOBAL_ACTIVE_IPS_WRITE_LOCK.get(username) || Promise.resolve();
+	const chained = prior.then(run, run);
+	GLOBAL_ACTIVE_IPS_WRITE_LOCK.set(username, chained);
+	if (ctx) ctx.waitUntil(chained);
+	else await chained;
+}
 function getActiveIpCount(activeIpsJson) {
 	if (!activeIpsJson) return 0;
 	try {
@@ -2975,7 +3017,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 								return tB - tA;
 							});
 							/* Bypassed: if (user.ip_limit && user.ip_limit > 0 && sortedIps.indexOf(clientIP) >= user.ip_limit) isIpLimitExpired = true; */
-							if (hasChanges || needsDbUpdateForTimestamp || isIpLimitExpired) updatedActiveIps = JSON.stringify(activeIps);
+							if (hasChanges || needsDbUpdateForTimestamp || isIpLimitExpired) updatedActiveIps = true;
 						}
 					}
 					if (isExpired) {
@@ -2996,9 +3038,10 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					if (isIpLimitExpired) {
 						/* Bypassed: clearTimeout(heartbeat); closeSocketQuietly(serverSock); return; */
 					}
-					if (updatedActiveIps !== null) {
+					if (updatedActiveIps) {
 						GLOBAL_LAST_DB_WRITE.set(username, nowTime);
-						await env.DB.prepare("UPDATE users SET last_active = ?, active_ips = ? WHERE username = ?").bind(nowTime, updatedActiveIps, username).run();
+						GLOBAL_LAST_ACTIVE_WRITE.set(username, nowTime);
+						await persistActiveIp(env, ctx, validUUID, username, clientIP, nowTime);
 					} else if (nowTime - (GLOBAL_LAST_DB_WRITE.get(username) || 0) >= 900000) {
 						GLOBAL_LAST_DB_WRITE.set(username, nowTime);
 						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(nowTime, username).run();
@@ -3350,13 +3393,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				if (needIpWrite || needTimeWrite) {
 					GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
 					GLOBAL_LAST_DB_WRITE.set(username, now);
-					const updateTask = async () => {
-						try {
-							await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), now, reqUUID).run();
-						} catch (e) { }
-					};
-					if (ctx) ctx.waitUntil(updateTask());
-					else updateTask();
+					persistActiveIp(env, ctx, reqUUID, username, clientIP, now);
 				}
 			}
 			isHeaderParsed = true;
@@ -7890,7 +7927,7 @@ async function executeRocketCreate() {
 					const isChecked = (window.selectedUsernames && window.selectedUsernames.has(user.username)) ? 'checked' : '';
 					const onlineBadgeColor = onlineCount >= 3 ? 'bg-red-600' : (onlineCount === 2 ? 'bg-yellow-500' : 'bg-green-600');
 					const onlineBadge = user.is_online === 1
-						? '<span class="min-w-[20px] h-5 px-1 relative inline-flex items-center justify-center text-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
+						? '<span class="min-w-[20px] h-5 px-1 relative inline-flex items-center justify-center text-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:40%;left:60%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
 						: '';
 					return '<div class="group transition-all drop-shadow-sm bg-white/60 dark:bg-zinc-900/40 rounded-md border border-gray-200 dark:border-zinc-800 p-1 flex flex-col items-center gap-1 text-center" data-username="' + user.username + '">' +
 							'<div class="flex items-center justify-center flex-wrap gap-1 w-full">' +
