@@ -91,7 +91,16 @@ async function checkAutoResets(env, ctx) {
 // سر ساعت 00:00 UTC آزاد می‌شه - عمداً هیچ فیلدی روی جدول users نوشته نمی‌شه (بر خلاف قطعیِ
 // per-user)، چون این یک محدودیتِ موقتِ سراسریه، نه غیرفعال‌سازی دائمیِ یک کاربر خاص.
 const GLOBAL_REQ_LIMIT_DEFAULT = 75000;
-const GLOBAL_REQ_LIMIT_CACHE_TTL_SECONDS = 20;
+// تی‌تی‌ال کش نتیجه‌ی نهایی (0/1) - چون خودتون گفتید چند ده‌ثانیه/چند دقیقه تاخیر مهم نیست، این عدد
+// از ۲۰ به ۶۰ ثانیه افزایش پیدا کرد تا تعداد دفعاتی که این تابع به‌جای cache باید واقعاً به D1/Cloudflare
+// سر بزنه، حدود ۳ برابر کمتر بشه (مستقیماً هزینه‌ی D1 read و درخواست به Cloudflare API رو کم می‌کنه).
+const GLOBAL_REQ_LIMIT_CACHE_TTL_SECONDS = 60;
+// فقط وقتی شمارنده‌ی خودِ پنل به این نسبت از سقف نزدیک شده، زحمت صدا زدن Cloudflare GraphQL API
+// (که یک HTTP fetch واقعی به خارج از Workers هست، نه یک خواندن ارزان از D1) رو به خودمون می‌دیم.
+// در بقیه‌ی روز (مثلاً وقتی مصرف ۱۰٪ سقفه) اصلاً به کلودفلر سر نمی‌زنیم و فقط شمارنده‌ی خودِ پنل
+// (که همیشه در دسترسه و رایگانه) ملاک قرار می‌گیره. این تنها جایی هست که "لایه‌ی دومِ" کلودفلر واقعاً
+// لازمه: نزدیکی به سقف، جایی که دقت بیشتر اهمیت داره.
+const GLOBAL_REQ_LIMIT_CF_CHECK_THRESHOLD_RATIO = 0.9;
 function globalReqLimitCacheRequest() {
 	return new Request("https://internal.zeus/global_req_limit_status");
 }
@@ -103,29 +112,35 @@ async function isGlobalReqLimitReached(env, ctx) {
 	let reached = false;
 	try {
 		const today = new Date().toISOString().split("T")[0];
-		const [limitRow, todayRow, dateRow, liveCf] = await Promise.all([
-			env.DB.prepare("SELECT value FROM settings WHERE key = 'global_req_limit'").first(),
-			env.DB.prepare("SELECT value FROM settings WHERE key = 'req_today'").first(),
-			env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first(),
-			getCfUsage(env),
-		]);
-		const limit = limitRow && limitRow.value !== undefined && limitRow.value !== null && limitRow.value !== "" ? parseInt(limitRow.value) || 0 : GLOBAL_REQ_LIMIT_DEFAULT;
+		// به‌جای ۳ کوئری جدای SELECT ... first() (که هر کدوم یه رفت‌وبرگشت جدا به D1 هست)، هر سه
+		// کلید توی یک کوئری با IN (...) خونده می‌شن - نتیجه یکیه، ولی یک رفت‌وبرگشت D1 به‌جای سه‌تا.
+		const settingsRows = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('global_req_limit','req_today','req_last_date')").all();
+		const settingsMap = {};
+		(settingsRows.results || []).forEach((r) => { settingsMap[r.key] = r.value; });
+		const limitVal = settingsMap.global_req_limit;
+		const limit = limitVal !== undefined && limitVal !== null && limitVal !== "" ? parseInt(limitVal) || 0 : GLOBAL_REQ_LIMIT_DEFAULT;
 		// اگر آخرین flush مربوط به دیروز (یا قبل‌تر) باشه، یعنی هنوز هیچ ایزوله‌ای برای امروز چیزی
 		// commit نکرده - req_today فعلاً متعلق به دیروزه، پس نباید به‌عنوان مصرف امروز حساب بشه.
-		let dbTodayTotal = dateRow && dateRow.value === today && todayRow ? parseInt(todayRow.value) || 0 : 0;
-		const cfTodayTotal = (liveCf && liveCf.today) || 0;
-		if (cfTodayTotal > dbTodayTotal) {
-			dbTodayTotal = cfTodayTotal;
-			const persistTask = (async () => {
-				try {
-					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTodayTotal), String(dbTodayTotal)).run();
-					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
-				} catch (e) { }
-			})();
-			if (ctx) ctx.waitUntil(persistTask);
-			else persistTask.catch(() => { });
+		let dbTodayTotal = settingsMap.req_last_date === today && settingsMap.req_today !== undefined ? parseInt(settingsMap.req_today) || 0 : 0;
+		let liveTotal = dbTodayTotal + GLOBAL_REQ_COUNT;
+		// فقط اگه به آستانه‌ی نزدیکی به سقف رسیده باشیم، برای اطمینان بیشتر سراغ عدد واقعیِ کلودفلر
+		// می‌ریم. تا قبل از اون آستانه، شمارنده‌ی خودِ پنل به‌تنهایی کافیه و هیچ fetch خارجی‌ای زده نمی‌شه.
+		if (limit > 0 && liveTotal >= limit * GLOBAL_REQ_LIMIT_CF_CHECK_THRESHOLD_RATIO) {
+			const liveCf = await getCfUsage(env);
+			const cfTodayTotal = (liveCf && liveCf.today) || 0;
+			if (cfTodayTotal > dbTodayTotal) {
+				dbTodayTotal = cfTodayTotal;
+				liveTotal = dbTodayTotal + GLOBAL_REQ_COUNT;
+				const persistTask = (async () => {
+					try {
+						await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTodayTotal), String(dbTodayTotal)).run();
+						await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
+					} catch (e) { }
+				})();
+				if (ctx) ctx.waitUntil(persistTask);
+				else persistTask.catch(() => { });
+			}
 		}
-		const liveTotal = dbTodayTotal + GLOBAL_REQ_COUNT;
 		reached = limit > 0 && liveTotal >= limit;
 	} catch (e) {
 		reached = false;
@@ -3561,7 +3576,7 @@ async function getCfUsage(env) {
 	const nowTime = Date.now();
 	const todayStr = new Date().toISOString().split("T")[0];
 	
-	if (CF_USAGE_CACHE && (nowTime - CF_USAGE_LAST_FETCH < 15000) && CF_USAGE_CACHE_DATE === todayStr) {
+	if (CF_USAGE_CACHE && (nowTime - CF_USAGE_LAST_FETCH < 60000) && CF_USAGE_CACHE_DATE === todayStr) {
 		return CF_USAGE_CACHE;
 	}
 	try {
