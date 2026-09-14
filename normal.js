@@ -202,8 +202,9 @@ async function checkAutoRotates(env, ctx) {
 }
 
 // Default set of countries auto-provisioned for a brand-new user, and the set
-// that the "بروزرسانی لوکیشن‌ها" bulk action adds to already-existing users
-// (see reset_action === "locations" below). This is now just the built-in
+// that gets added to already-existing users automatically whenever the admin
+// saves the pinned-locations list in settings (see reset_action === "locations"
+// below, and applyPinnedLocationsToAllUsers() on the client). This is now just the built-in
 // FALLBACK: the real, admin-editable list lives in the `settings` table under
 // the key "pinned_locations" (see getPinnedLocationsSetting()). This constant
 // is only used if that setting has never been saved yet (fresh install), so
@@ -213,7 +214,9 @@ async function checkAutoRotates(env, ctx) {
 // another country - regardless of whether that country is still "pinned".
 const PINNED_DEFAULT_LOCATIONS_FALLBACK = ["UZ", "KZ", "TR", "LY", "NL", "AL", "EE", "BG", "LV", "SE", "NO", "GB", "US", "ES", "BE"];
 // Hard cap on how many location slots a single user can accumulate over time
-// via the additive "بروزرسانی لوکیشن‌ها" action (see below). Provisioning a
+// via the additive per-user "locations" reset action (see below), which now
+// runs automatically for every user right after the admin saves the pinned
+// list in settings. Provisioning a
 // brand-new user is NOT capped by this (a new user always gets the full
 // current pinned list, even if that list itself has grown past this number).
 const MAX_LOCATIONS_PER_USER = 20;
@@ -405,8 +408,8 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 // NOTE: this always builds the list from scratch and is only meant for a
 // user that doesn't have any locations yet. For updating an EXISTING user
 // without discarding what they already have, use mergePinnedLocationsForUser
-// below instead - it's what "بروزرسانی لوکیشن‌ها" (reset_action: "locations")
-// calls.
+// below instead - it's what reset_action: "locations" calls, which now runs
+// automatically for every existing user right after the pinned list is saved.
 async function buildPinnedDefaultProxyList(locations) {
 	const results = await Promise.all(locations.map((cc) => testVipCountryProxy(cc)));
 	return locations.map((cc, i) => ({
@@ -721,7 +724,7 @@ const __WORKER_EXPORT__ = {
 			if (url.pathname === "/ppannell") {
 				return await Router.handlePanel(request, env);
 			}
-			if (url.pathname.startsWith("/status/")) {
+			if (url.pathname.startsWith("/profile/")) {
 				return await Router.handleUserStatus(url, env);
 			}
 			return new Response(HTML_TEMPLATES.nginx, {
@@ -814,7 +817,7 @@ self.addEventListener("activate", (e) => {
 });
 self.addEventListener("fetch", (e) => {
 	const url = new URL(e.request.url);
-	if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/sub/") || url.pathname.startsWith("/feed/") || url.pathname.startsWith("/status/") || url.pathname.startsWith("/stream/")) {
+	if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/notes/") || url.pathname.startsWith("/bundle/") || url.pathname.startsWith("/profile/") || url.pathname.startsWith("/stream/")) {
 		return;
 	}
 	if (STATIC_ASSETS.includes(e.request.url)) {
@@ -834,7 +837,7 @@ const Router = {
 	return upgradeHeader === "websocket";
 	},
 	isSubscriptionPath(pathname) {
-		return pathname.startsWith("/sub/") || pathname.startsWith("/feed/") || pathname.startsWith("/singbox/");
+		return pathname.startsWith("/notes/") || pathname.startsWith("/bundle/");
 	},
 	async handleWebSocket(request, env, ctx) {
 		try {
@@ -844,9 +847,8 @@ const Router = {
 		}
 	},
 	async handleSubscription(url, env) {
-		const isSingbox = url.pathname.startsWith("/singbox/");
-		const isSubPath = url.pathname.startsWith("/sub/");
-		const offset = isSingbox ? 9 : (isSubPath ? 5 : 6);
+		const isSingbox = url.pathname.startsWith("/bundle/");
+		const offset = isSingbox ? 8 : 7;
 		let subUser = safeDecodeURI(url.pathname.slice(offset));
 		const host = url.hostname;
 		try {
@@ -894,7 +896,7 @@ const Router = {
 		});
 	},
 	async handleUserStatus(url, env) {
-		const username = safeDecodeURI(url.pathname.slice(8));
+		const username = safeDecodeURI(url.pathname.slice(9));
 		if (!username) {
 			return new Response("Username is required", { status: 400 });
 		}
@@ -4811,8 +4813,8 @@ Commercial support is available at
 			100% { background-position: 400% 0%; }
 		}
 		@keyframes neonOrbitGlow {
-			0%, 100% { opacity: 0.35; }
-			50% { opacity: 0.7; }
+			0%, 100% { opacity: 0.25; }
+			50% { opacity: 0.5; }
 		}
 		.neon-orbit {
 			position: relative;
@@ -4832,7 +4834,7 @@ Commercial support is available at
 			border-radius: inherit;
 			pointer-events: none;
 			background-size: 400% 100%;
-			animation: neonOrbitTravel 6s linear infinite, neonOrbitGlow 3s ease-in-out infinite;
+			animation: neonOrbitTravel 18s linear infinite, neonOrbitGlow 6s ease-in-out infinite;
 		}
 		.neon-orbit::after {
 			content: '';
@@ -4852,16 +4854,16 @@ Commercial support is available at
 		}
 		.neon-orbit-1::before {
 			background-image: linear-gradient(90deg, transparent 0%, #fb923c 8%, transparent 20%, transparent 75%, #fb923c 87%, transparent 100%);
-			animation-duration: 5s, 3s;
+			animation-duration: 16s, 6s;
 		}
 		.neon-orbit-2::before {
 			background-image: linear-gradient(90deg, transparent 0%, #c084fc 8%, transparent 20%, transparent 75%, #c084fc 87%, transparent 100%);
-			animation-duration: 7.5s, 3.4s;
+			animation-duration: 21s, 6.6s;
 			animation-direction: reverse, normal;
 		}
 		.neon-orbit-3::before {
 			background-image: linear-gradient(90deg, transparent 0%, #60a5fa 8%, transparent 20%, transparent 75%, #60a5fa 87%, transparent 100%);
-			animation-duration: 6.2s, 3.8s;
+			animation-duration: 18.5s, 7.2s;
 		}
 	</style>
 </head>
@@ -6179,6 +6181,7 @@ Commercial support is available at
 						<button type="button" onclick="pinnedLocationAdd()" class="px-3 py-2 bg-gray-600 hover:bg-gray-700 dark:bg-zinc-600 dark:hover:bg-zinc-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">افزودن</button>
 						<button type="button" onclick="savePinnedLocations()" id="save-pinned-locations-btn" class="px-3 py-2 bg-emerald-700 hover:bg-emerald-800 dark:bg-emerald-600 dark:hover:bg-emerald-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
 					</div>
+					<span class="text-[10px] text-gray-400 dark:text-zinc-500 block font-normal mt-1">با زدن «ذخیره»، کشورهای جدید به همه‌ی کاربرها اضافه می‌شود؛ چیزی که از قبل دارند حذف نمی‌شود.</span>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
@@ -6345,9 +6348,6 @@ Commercial support is available at
 			</button>
 			<button onclick="bulkToggleStatus(0)" class="px-3 py-1.5 bg-amber-50 dark:bg-amber-950/20 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 rounded-md text-xs font-bold transition border border-amber-200 dark:border-amber-900/50 flex items-center gap-1">
 				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg> غیرفعال‌سازی
-			</button>
-			<button onclick="bulkReset('locations')" title="کشورهای پین‌شده‌ی فعلی (تنظیمات > لوکیشن‌ها) رو که کاربر هنوز نداره، از مخزن VIP براش می‌سازد و اضافه می‌کند - چیزی که از قبل داره حذف نمی‌شود" class="px-3 py-1.5 bg-teal-50 dark:bg-teal-950/20 text-teal-600 dark:text-teal-400 hover:bg-teal-100 dark:hover:bg-teal-900/30 rounded-md text-xs font-bold transition border border-teal-200 dark:border-teal-900/50 flex items-center gap-1">
-				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> بروزرسانی لوکیشن‌ها
 			</button>
 			<button onclick="bulkDelete()" class="px-3 py-1.5 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-450 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-md text-xs font-bold transition border border-red-200 dark:border-red-900/50 flex items-center gap-1">
 				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg> حذف گروهی
@@ -6653,14 +6653,12 @@ ${COMMON_TOAST_HTML}
 			if (actionType === 'volume') { actionName = 'حجم مصرفی'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
 			else if (actionType === 'req') { actionName = 'تعداد ریکوئست‌ها'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
 			else if (actionType === 'time') { actionName = 'زمان اشتراک'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
-			else if (actionType === 'locations') { actionName = 'بروزرسانی لوکیشن‌ها'; confirmText = 'کشورهای پین‌شده‌ی فعلی (تنظیمات > لوکیشن‌ها) که ' + usernames.length + ' کاربر انتخاب‌شده هنوز ندارن اضافه می‌شه؛ چیزی که از قبل دارن حذف نمی‌شه. ادامه بدم؟'; }
 			if (await customConfirm(confirmText)) {
 				const bar = document.getElementById('bulk-actions-bar');
 				const buttons = bar.querySelectorAll('button');
 				buttons.forEach(btn => btn.disabled = true);
 				try {
 					let successCount = 0;
-					const cappedUsernames = [];
 					await Promise.all(usernames.map(async (uname) => {
 						try {
 							const res = await fetch('/api/users/' + encodeURIComponent(uname), {
@@ -6668,22 +6666,10 @@ ${COMMON_TOAST_HTML}
 								headers: { 'Content-Type': 'application/json' },
 								body: JSON.stringify({ reset_action: actionType })
 							});
-							if (res.ok) {
-								successCount++;
-								if (actionType === 'locations') {
-									try {
-										const data = await res.json();
-										if (data && data.capped) cappedUsernames.push(uname);
-									} catch (e) {}
-								}
-							}
+							if (res.ok) successCount++;
 						} catch(e) {}
 					}));
-					let msg = '✅ عملیات ' + actionName + ' با موفقیت برای ' + successCount + ' کاربر اعمال شد.';
-					if (cappedUsernames.length > 0) {
-						msg += '\\n\\n⚠️ این کاربرا به سقف ' + MAX_LOCATIONS_PER_USER_CLIENT + ' لوکیشن رسیدن و بعضی کشورای جدید براشون اضافه نشد (برای جا باز کردن، یه کشور قدیمی رو دستی حذف کنید): ' + cappedUsernames.join('، ');
-					}
-					alert(msg);
+					alert('✅ عملیات ' + actionName + ' با موفقیت برای ' + successCount + ' کاربر اعمال شد.');
 				} finally {
 					buttons.forEach(btn => btn.disabled = false);
 					window.selectedUsernames.clear();
@@ -6700,7 +6686,7 @@ ${COMMON_TOAST_HTML}
 			const country = select && select.value;
 			if (!country) return;
 			const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(country) : '🌐';
-			if (await customConfirm(flag + ' ' + country + ' از لیست کانفیگ‌های ' + usernames.length + ' کاربر انتخاب‌شده حذف بشه؟ این کار غیرقابل بازگشت است (اگه دوباره لازمش داشتید باید از «بروزرسانی لوکیشن‌ها» یا افزودن دستی دوباره اضافه‌ش کنید).')) {
+			if (await customConfirm(flag + ' ' + country + ' از لیست کانفیگ‌های ' + usernames.length + ' کاربر انتخاب‌شده حذف بشه؟ این کار غیرقابل بازگشت است (اگه دوباره لازمش داشتید باید از تنظیمات > لوکیشن‌ها دوباره ذخیره کنید یا افزودن دستی دوباره اضافه‌ش کنید).')) {
 				const bar = document.getElementById('bulk-actions-bar');
 				const buttons = bar.querySelectorAll('button');
 				buttons.forEach(btn => btn.disabled = true);
@@ -7788,14 +7774,14 @@ async function executeRocketCreate() {
 								onlineBadge +
 							'</div>' +
 							'<div class="flex flex-wrap items-center justify-center gap-1 py-0.5 border-y border-gray-100 dark:border-zinc-800/70 w-full transition-all duration-300' + actionsColorlessClass + '">' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copyConfig(this.dataset.user)" title="کپی کـانفـیگ" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-blue-50 dark:bg-blue-950/40 border border-blue-300 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/60 text-blue-600 dark:text-blue-400 rounded-full transition shadow-sm"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="editUser(this.dataset.user)" title="ویرایش" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-green-50 dark:bg-green-950/40 border border-green-300 dark:border-green-800 hover:bg-green-100 dark:hover:bg-green-900/60 text-green-600 dark:text-green-400 rounded-full transition shadow-sm"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg></button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="deleteUser(this.dataset.user)" title="حذف" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 hover:bg-red-100 dark:hover:bg-red-900/60 text-red-600 dark:text-red-400 rounded-full transition shadow-sm"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="toggleUserStatus(this.dataset.user)" title="' + statusBtnTitle + '" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-800 hover:bg-amber-100 dark:hover:bg-amber-900/60 ' + statusBtnColor + ' rounded-full transition shadow-sm">' + statusBtnIcon + '</button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="cloneUser(this.dataset.user)" title="کپی کاربر (Clone)" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-purple-50 dark:bg-purple-950/40 border border-purple-300 dark:border-purple-800 hover:bg-purple-100 dark:hover:bg-purple-900/60 text-purple-600 dark:text-purple-400 rounded-full transition shadow-sm"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
 								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="openStatusLink(this.dataset.user)" title="وضعیت اتصال" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/50 rounded-full transition border border-green-200 dark:border-green-800"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg></button>' +
 								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copySubLink(this.dataset.user)" title="ساب متنی" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-full transition border border-indigo-200 dark:border-indigo-800"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg></button>' +
+								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copyConfig(this.dataset.user)" title="کپی کـانفـیگ" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-blue-50 dark:bg-blue-950/40 border border-blue-300 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/60 text-blue-600 dark:text-blue-400 rounded-full transition shadow-sm"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
 								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="showSubQr(this.dataset.user)" title="QR ساب متنی" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded-full transition border border-amber-200 dark:border-amber-800"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 19h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg></button>' +
+								'<span class="w-px h-4 bg-gray-300 dark:bg-zinc-700 mx-0.5 shrink-0 self-center" aria-hidden="true"></span>' +
+								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="editUser(this.dataset.user)" title="ویرایش" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-green-50 dark:bg-green-950/40 border border-green-300 dark:border-green-800 hover:bg-green-100 dark:hover:bg-green-900/60 text-green-600 dark:text-green-400 rounded-full transition shadow-sm"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg></button>' +
+								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="toggleUserStatus(this.dataset.user)" title="' + statusBtnTitle + '" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-800 hover:bg-amber-100 dark:hover:bg-amber-900/60 ' + statusBtnColor + ' rounded-full transition shadow-sm">' + statusBtnIcon + '</button>' +
+								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="deleteUser(this.dataset.user)" title="حذف" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 hover:bg-red-100 dark:hover:bg-red-900/60 text-red-600 dark:text-red-400 rounded-full transition shadow-sm"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
 								'<div class="!hidden">' +
 									'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copySingboxLink(this.dataset.user)" title="سینگ‌باکس" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50 rounded-full transition border border-purple-200 dark:border-purple-800"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path></svg></button>' +
 									'<button data-user="' + encodeURIComponent(user.username) + '" onclick="showSingboxQr(this.dataset.user)" title="QR سینگ‌باکس" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50 rounded-full transition border border-purple-200 dark:border-purple-800"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 19h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg></button>' +
@@ -8658,13 +8644,13 @@ function downloadZeusSource() {
 			return links.join('\\n');
 		}
 		function getSubLink(username) {
-			return window.location.origin + '/feed/' + encodeURIComponent(username);
+			return window.location.origin + '/notes/' + encodeURIComponent(username);
 		}
 		function getSingboxLink(username) {
-			return window.location.origin + '/singbox/' + encodeURIComponent(username);
+			return window.location.origin + '/bundle/' + encodeURIComponent(username);
 		}
 		function getStatusLink(username) {
-			return window.location.origin + '/status/' + encodeURIComponent(username);
+			return window.location.origin + '/profile/' + encodeURIComponent(username);
 		}
 		function copySubLink(encodedUsername) {
 			const username = decodeURIComponent(encodedUsername);
@@ -8866,31 +8852,6 @@ function editUser(encodedUsername) {
 	nameInput.disabled = false;
 	const uuidInputEdit = document.getElementById('input-uuid');
 	if (uuidInputEdit) uuidInputEdit.value = user.uuid || '';
-	populateUserFormFields(user);
-	toggleModal(true);
-}
-function generateRandomCloneUsername() {
-	const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-	let randStr = '';
-	for (let i = 0; i < 6; i++) randStr += chars.charAt(Math.floor(Math.random() * chars.length));
-	return 'u' + randStr;
-}
-function cloneUser(encodedUsername) {
-	const sourceUsername = decodeURIComponent(encodedUsername);
-	const user = window.allUsers.find(u => u.username === sourceUsername);
-	if (!user) {
-		alert('کاربر یافت نشد!');
-		return;
-	}
-	isEditMode = false;
-	editingUsername = '';
-	document.getElementById('modal-title').innerText = 'کپی کاربر (از ' + sourceUsername + ')';
-	updateSubmitBtnState('ایجاد کاربر');
-	const nameInput = document.getElementById('input-name');
-	nameInput.disabled = false;
-	nameInput.value = generateRandomCloneUsername();
-	const uuidInputClone = document.getElementById('input-uuid');
-	if (uuidInputClone) uuidInputClone.value = generateUuidV4();
 	populateUserFormFields(user);
 	toggleModal(true);
 }
@@ -9096,18 +9057,58 @@ window.pinnedLocationAdd = function() {
 };
 window.savePinnedLocations = async function() {
 	const btn = document.getElementById('save-pinned-locations-btn');
-	if (btn) btn.disabled = true;
+	if (btn) { btn.disabled = true; btn.innerText = 'در حال ذخیره...'; }
 	try {
 		await fetch('/api/settings/bulk', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ settings: { pinned_locations: JSON.stringify(window.PINNED_LOCATIONS_CACHE) } })
 		});
-		showToast('✅ لیست لوکیشن‌های پین‌شده ذخیره شد.');
+		showToast('✅ لیست ذخیره شد؛ در حال اعمال روی کاربرها...');
+		await window.applyPinnedLocationsToAllUsers(btn);
 	} catch (e) {
 		showToast('❌ ذخیره‌سازی لوکیشن‌ها ناموفق بود.');
 	} finally {
-		if (btn) btn.disabled = false;
+		if (btn) { btn.disabled = false; btn.innerText = 'ذخیره'; }
+	}
+};
+// این تابع، دقیقاً همون کاری که دکمه‌ی حذف‌شده‌ی "بروزرسانی لوکیشن‌ها" برای
+// کاربرهای انتخاب‌شده انجام می‌داد (reset_action: "locations" - افزایشی و
+// غیرمخرب، فقط کشورهای گم‌شده اضافه می‌شن) رو حالا خودکار، بعد از هر بار
+// «ذخیره»‌ی تنظیمات لوکیشن‌ها، روی همه‌ی کاربرهای موجود انجام می‌ده.
+window.applyPinnedLocationsToAllUsers = async function(btn) {
+	try {
+		const res = await fetch('/api/users?t=' + Date.now());
+		if (!res.ok) throw new Error('failed to load users');
+		const data = await res.json();
+		const usernames = (data.users || []).map(function(u) { return u.username; }).filter(Boolean);
+		if (usernames.length === 0) return;
+		if (btn) btn.innerText = 'در حال اعمال به ' + usernames.length + ' کاربر...';
+		let successCount = 0;
+		const cappedUsernames = [];
+		await Promise.all(usernames.map(async function(uname) {
+			try {
+				const r = await fetch('/api/users/' + encodeURIComponent(uname), {
+					method: 'PUT',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ reset_action: 'locations' })
+				});
+				if (r.ok) {
+					successCount++;
+					try {
+						const d = await r.json();
+						if (d && d.capped) cappedUsernames.push(uname);
+					} catch (e) {}
+				}
+			} catch (e) {}
+		}));
+		showToast('✅ لوکیشن‌های پین‌شده روی ' + successCount + ' کاربر اعمال شد.');
+		if (cappedUsernames.length > 0) {
+			alert('⚠️ این کاربرا به سقف ' + MAX_LOCATIONS_PER_USER_CLIENT + ' لوکیشن رسیدن و بعضی کشورای جدید براشون اضافه نشد (برای جا باز کردن، یه کشور قدیمی رو دستی حذف کنید): ' + cappedUsernames.join('، '));
+		}
+		if (typeof loadUsers === 'function') await loadUsers(true);
+	} catch (e) {
+		showToast('⚠️ ذخیره شد ولی اعمال خودکار لوکیشن‌ها روی کاربرها با خطا مواجه شد.');
 	}
 };
 window.populatePinnedLocationSelects = function() {
@@ -11119,11 +11120,11 @@ ${COMMON_TOAST_HTML}
 			navigator.clipboard.writeText(getvIeesLink()).then(() => alert('✅ کـانفـیگ با موفقیت کپی شد!'));
 		}
 		function copyTextSub() {
-			const link = window.location.protocol + '//' + getHost() + '/sub/' + encodeURIComponent(window.statusUser.username);
+			const link = window.location.protocol + '//' + getHost() + '/notes/' + encodeURIComponent(window.statusUser.username);
 			navigator.clipboard.writeText(link).then(() => alert('✅ لینک ساب متنی کپی شد!'));
 		}
 		function copySingboxSub() {
-			const link = window.location.protocol + '//' + getHost() + '/singbox/' + encodeURIComponent(window.statusUser.username);
+			const link = window.location.protocol + '//' + getHost() + '/bundle/' + encodeURIComponent(window.statusUser.username);
 			navigator.clipboard.writeText(link).then(() => alert('✅ لینک ساب Sing-box کپی شد!'));
 		}
 		function toggleQrModal(show, text) {
@@ -11190,11 +11191,11 @@ ${COMMON_TOAST_HTML}
 			downloadAnchor.remove();
 		}
 		function showSubQr() {
-			const link = window.location.protocol + '//' + getHost() + '/sub/' + encodeURIComponent(window.statusUser.username);
+			const link = window.location.protocol + '//' + getHost() + '/notes/' + encodeURIComponent(window.statusUser.username);
 			toggleQrModal(true, link);
 		}
 		function showSingboxQr() {
-			const link = window.location.protocol + '//' + getHost() + '/singbox/' + encodeURIComponent(window.statusUser.username);
+			const link = window.location.protocol + '//' + getHost() + '/bundle/' + encodeURIComponent(window.statusUser.username);
 			toggleQrModal(true, link);
 		}
 		function getFlagEmoji(countryCode) {
