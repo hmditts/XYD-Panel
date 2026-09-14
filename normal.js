@@ -72,13 +72,24 @@ async function checkAutoResets(env, ctx) {
 	} catch (e) { }
 }
 // ---- محدودیت کل ریکوئست روزانه‌ی اکانت (global_req_limit) --------------------------------------
-// همون عددی که کارت "Request" توی داشبورد نشون می‌ده (req_today ذخیره‌شده در D1 + GLOBAL_REQ_COUNT
-// هنوز-flush-نشده‌ی همین ایزوله) با سقفی که ادمین در تنظیمات ست کرده مقایسه می‌شه. نتیجه (فقط یک
-// بایت "0"/"1") با TTL کوتاه روی caches.default کش می‌شه تا این چک روی هر اتصال/هارتبیت، دیتابیس
-// رو صدا نزنه. چون req_today خودش دقیقاً همون لحظه‌ای که تاریخ UTC عوض می‌شه ریست می‌شه (تابع
-// trackRequest)، این قفل هم خودکار و بدون نیاز به هیچ کار اضافه‌ای سر ساعت 00:00 UTC آزاد می‌شه -
-// از عمد هیچ فیلدی روی جدول users نوشته نمی‌شه (بر خلاف قطعیِ per-user)، چون این یک محدودیتِ
-// موقتِ سراسریه، نه غیرفعال‌سازی دائمیِ یک کاربر خاص.
+// همون عددی که کارت "Request" توی داشبورد نشون می‌ده، با سقفی که ادمین در تنظیمات ست کرده مقایسه
+// می‌شه. این عدد از دو منبع ترکیب می‌شه، دقیقاً به همون شکلی که خود کارت داشبورد (GET /api/users)
+// انجامش می‌ده:
+//   ۱) شمارنده‌ی خودِ پنل (req_today در جدول settings + GLOBAL_REQ_COUNT هنوز-flush-نشده‌ی این
+//      ایزوله) - این روی هر ریکوئستی که وورکر واقعاً اجرا بشه (شامل اسکن/ترافیک مزاحم) افزایش پیدا
+//      می‌کنه، صرف‌نظر از اینکه پنل باز باشه یا نه.
+//   ۲) عدد واقعیِ Cloudflare (getCfUsage -> GraphQL Analytics، از حساب واقعی کلودفلر شما، نه فقط
+//      حدس پنل) - اگه CF_API_TOKEN/CF_ACCOUNT_ID تنظیم نشده باشه، این تابع فقط صفر برمی‌گردونه و
+//      محاسبه بی‌صدا فقط به شمارنده‌ی خودِ پنل تکیه می‌کنه.
+// هر کدوم بزرگ‌تر بود ملاک عمل قرار می‌گیره (Math.max) - دقیقاً برای همون نگرانی که اگه یه جایی
+// شمارنده‌ی خودِ پنل عقب بمونه یا با خطا مواجه بشه (کلد-استارت ایزوله، خطای نوشتن در D1، و...)، عدد
+// واقعیِ کلودفلر جایگزینش بشه. اگه عدد کلودفلر از عدد ذخیره‌شده بیشتر بود، همون‌جا هم در settings
+// بازنویسی می‌شه تا این «ترمیم» ماندگار بمونه، نه فقط برای همین یک چک.
+// نتیجه‌ی نهایی (فقط یک بایت "0"/"1") با TTL کوتاه روی caches.default کش می‌شه تا این چک روی هر
+// اتصال/هارتبیت، دیتابیس یا Cloudflare API رو صدا نزنه (خودِ getCfUsage هم کش ۱۵ثانیه‌ای جدا داره).
+// چون req_today و عدد کلودفلر هر دو دقیقاً سر تاریخ UTC جدید از نو شمارش می‌شن، این قفل هم خودکار
+// سر ساعت 00:00 UTC آزاد می‌شه - عمداً هیچ فیلدی روی جدول users نوشته نمی‌شه (بر خلاف قطعیِ
+// per-user)، چون این یک محدودیتِ موقتِ سراسریه، نه غیرفعال‌سازی دائمیِ یک کاربر خاص.
 const GLOBAL_REQ_LIMIT_DEFAULT = 75000;
 const GLOBAL_REQ_LIMIT_CACHE_TTL_SECONDS = 20;
 function globalReqLimitCacheRequest() {
@@ -91,16 +102,29 @@ async function isGlobalReqLimitReached(env, ctx) {
 	} catch (e) { }
 	let reached = false;
 	try {
-		const [limitRow, todayRow, dateRow] = await Promise.all([
+		const today = new Date().toISOString().split("T")[0];
+		const [limitRow, todayRow, dateRow, liveCf] = await Promise.all([
 			env.DB.prepare("SELECT value FROM settings WHERE key = 'global_req_limit'").first(),
 			env.DB.prepare("SELECT value FROM settings WHERE key = 'req_today'").first(),
 			env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first(),
+			getCfUsage(env),
 		]);
 		const limit = limitRow && limitRow.value !== undefined && limitRow.value !== null && limitRow.value !== "" ? parseInt(limitRow.value) || 0 : GLOBAL_REQ_LIMIT_DEFAULT;
-		const today = new Date().toISOString().split("T")[0];
 		// اگر آخرین flush مربوط به دیروز (یا قبل‌تر) باشه، یعنی هنوز هیچ ایزوله‌ای برای امروز چیزی
 		// commit نکرده - req_today فعلاً متعلق به دیروزه، پس نباید به‌عنوان مصرف امروز حساب بشه.
-		const dbTodayTotal = dateRow && dateRow.value === today && todayRow ? parseInt(todayRow.value) || 0 : 0;
+		let dbTodayTotal = dateRow && dateRow.value === today && todayRow ? parseInt(todayRow.value) || 0 : 0;
+		const cfTodayTotal = (liveCf && liveCf.today) || 0;
+		if (cfTodayTotal > dbTodayTotal) {
+			dbTodayTotal = cfTodayTotal;
+			const persistTask = (async () => {
+				try {
+					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTodayTotal), String(dbTodayTotal)).run();
+					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
+				} catch (e) { }
+			})();
+			if (ctx) ctx.waitUntil(persistTask);
+			else persistTask.catch(() => { });
+		}
 		const liveTotal = dbTodayTotal + GLOBAL_REQ_COUNT;
 		reached = limit > 0 && liveTotal >= limit;
 	} catch (e) {
