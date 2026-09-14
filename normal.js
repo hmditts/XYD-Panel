@@ -156,17 +156,30 @@ async function isGlobalReqLimitReached(env, ctx) {
 	} catch (e) { }
 	return reached;
 }
-// کلید روزانه به وقت UTC، به فرم YYYY-MM-DD - ریست ساعت 00:00 UTC
+// کلید روزانه به وقت UTC، به فرم YYYY-MM-DD - ریست ساعت 00:00 UTC. هنوز برای گروه‌بندی
+// نمودار 30 روزه (/api/stats-history) و برای cutoff پاکسازی استفاده می‌شود؛ خودِ ذخیره‌سازی
+// ردیف‌های daily_traffic/daily_requests دیگر روزانه نیست، ساعتی است (به utcHourKey زیر نگاه کنید).
 function utcDateKey(ts) {
 	return new Date(ts).toISOString().split("T")[0];
 }
-// ثبت/جمع‌زدن مقدار مصرف (بر حسب گیگابایت) روی ردیف امروز (UTC) در daily_traffic.
-// این تابع در همان لحظاتی صدا زده می‌شود که ترافیک کاربران از کش حافظه به D1 flush می‌شود،
-// تا آمار «روزانه / 7 روز گذشته / 30 روز گذشته» مستقل از used_gb هر کاربر (که ریست تناوبی دارد) ذخیره شود.
+// کلید ساعتی به وقت UTC، به فرم YYYY-MM-DDTHH (پیشوند دقیق ISO، پس مرتب‌سازی رشته‌ای = مرتب‌سازی
+// زمانی واقعی). این همون ستون TEXT PRIMARY KEY "date" قبلی رو استفاده می‌کنه، فقط دیگه یک روز کامل
+// رو نماینده نیست، یک ساعت رو نماینده‌ست - پس نیازی به ALTER TABLE / migration نیست. چون این پیشوند
+// همیشه با فرمت روزانه‌ی قدیمی (YYYY-MM-DD) هم‌خوانی داره (۱۰ کاراکتر اول یکسانه)، مقایسه‌های رشته‌ای
+// (>=, <, ORDER BY) و همچنین cutoff پاکسازی که هنوز بر مبنای روزه، بدون تغییر درست کار می‌کنن.
+function utcHourKey(ts) {
+	return new Date(ts).toISOString().slice(0, 13); // "YYYY-MM-DDTHH"
+}
+// ثبت/جمع‌زدن مقدار مصرف (بر حسب گیگابایت) روی ردیف ساعت جاری (UTC) در daily_traffic.
+// این تابع در همان لحظاتی صدا زده می‌شود که ترافیک کاربران از کش حافظه به D1 flush می‌شود.
+// قبلاً کلید هر ردیف یک روز کامل بود (خطای بازه‌ی «7/30 روز گذشته» تا ۲۴ ساعت)؛ حالا هر ردیف یک
+// ساعت است، پس بازه‌های رولینگ (روزانه/7روزه/30روزه) با دقت ~۱ ساعت محاسبه می‌شن، در حالی که تعداد
+// کل ردیف‌ها همچنان محدود و ارزان می‌مونه (حداکثر ۲۴×۳۰=۷۲۰ ردیف با همون نگه‌داری 30 روزه‌ی فعلی) -
+// نه یک ردیف مستقل به ازای هر رویداد flush (که رشد نامحدود و هزینه‌ی خواندن/نوشتن غیرقابل‌کنترلی داشت).
 function recordDailyTraffic(env, ctx, deltaGb) {
 	if (!deltaGb || deltaGb <= 0) return;
-	const todayKey = utcDateKey(Date.now());
-	const task = env.DB.prepare("INSERT INTO daily_traffic (date, gb) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET gb = gb + excluded.gb").bind(todayKey, deltaGb).run().catch(() => { });
+	const hourKey = utcHourKey(Date.now());
+	const task = env.DB.prepare("INSERT INTO daily_traffic (date, gb) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET gb = gb + excluded.gb").bind(hourKey, deltaGb).run().catch(() => { });
 	if (ctx) ctx.waitUntil(task);
 }
 // ---- Per-connection user-auth cache (D1 read reduction) --------------------------------------
@@ -1593,6 +1606,10 @@ const Router = {
 		// existing 7d/30d aggregate stats above. Today's entry additionally folds in
 		// the not-yet-flushed in-memory counters (GLOBAL_REQ_COUNT / GLOBAL_TRAFFIC_CACHE)
 		// so the last (today) point on the chart reflects live, not-yet-persisted usage.
+		// NOTE: storage rows are now hourly (utcHourKey), but this chart still wants one
+		// point per calendar day, so we let SQLite roll the hourly rows up with
+		// substr(date,1,10)+GROUP BY (works transparently on both old day-only rows and
+		// new hour-keyed rows, since both share the same 10-char YYYY-MM-DD prefix).
 		if (url.pathname === "/api/stats-history" && request.method === "GET") {
 			try {
 				const now = Date.now();
@@ -1601,8 +1618,8 @@ const Router = {
 				const startKey = days[0];
 				const todayKey = days[days.length - 1];
 				const [reqRows, trafficRows] = await Promise.all([
-					env.DB.prepare("SELECT date, count FROM daily_requests WHERE date >= ?").bind(startKey).all(),
-					env.DB.prepare("SELECT date, gb FROM daily_traffic WHERE date >= ?").bind(startKey).all(),
+					env.DB.prepare("SELECT substr(date,1,10) as date, SUM(count) as count FROM daily_requests WHERE date >= ? GROUP BY substr(date,1,10)").bind(startKey).all(),
+					env.DB.prepare("SELECT substr(date,1,10) as date, SUM(gb) as gb FROM daily_traffic WHERE date >= ? GROUP BY substr(date,1,10)").bind(startKey).all(),
 				]);
 				const reqMap = new Map((reqRows.results || []).map((r) => [r.date, r.count || 0]));
 				const trafficMap = new Map((trafficRows.results || []).map((r) => [r.date, r.gb || 0]));
@@ -1845,32 +1862,33 @@ const Router = {
 							const delRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'deleted_users_gb'").first();
 							if (delRow) deletedGb = parseFloat(delRow.value) || 0;
 						} catch (e) {}
-						// آمار ترافیک روزانه / 7 روز گذشته / 30 روز گذشته (ریست به وقت 00:00 UTC) از جدول daily_traffic
-						// + مقدار هنوز-flush-نشده‌ی حافظه (GLOBAL_TRAFFIC_CACHE) برای اینکه عدد «روزانه» لحظه‌ای باشد
+						// آمار ترافیک روزانه / 7 روز گذشته / 30 روز گذشته از جدول daily_traffic - حالا که ذخیره‌سازی
+						// ساعتی‌ست، این‌ها بازه‌ی رولینگ واقعی‌اند (دقیقاً 24/7×24/30×24 ساعت گذشته از همین لحظه،
+						// با دقت ~۱ ساعت)، نه از نیمه‌شب UTC. حداکثر 24/168/720 ردیف اسکن می‌شه، هنوز ارزان.
+						// + مقدار هنوز-flush-نشده‌ی حافظه (GLOBAL_TRAFFIC_CACHE) برای اینکه عدد لحظه‌ای باشد
 						let trafficDaily = 0, traffic7d = 0, traffic30d = 0;
 						try {
-							const todayKey = utcDateKey(now);
-							const sevenAgoKey = utcDateKey(now - 6 * 86400000);
-							const thirtyAgoKey = utcDateKey(now - 29 * 86400000);
+							const dailyCutoffKey = utcHourKey(now - 24 * 3600000);
+							const sevenAgoKey = utcHourKey(now - 7 * 86400000);
+							const thirtyAgoKey = utcHourKey(now - 30 * 86400000);
 							const [dailyRow, sevenRow, thirtyRow] = await Promise.all([
-								env.DB.prepare("SELECT gb FROM daily_traffic WHERE date = ?").bind(todayKey).first(),
+								env.DB.prepare("SELECT SUM(gb) as s FROM daily_traffic WHERE date >= ?").bind(dailyCutoffKey).first(),
 								env.DB.prepare("SELECT SUM(gb) as s FROM daily_traffic WHERE date >= ?").bind(sevenAgoKey).first(),
 								env.DB.prepare("SELECT SUM(gb) as s FROM daily_traffic WHERE date >= ?").bind(thirtyAgoKey).first(),
 							]);
 							let pendingGb = 0;
 							for (const v of GLOBAL_TRAFFIC_CACHE.values()) pendingGb += v || 0;
 							pendingGb = pendingGb / (1024 * 1024 * 1024);
-							trafficDaily = (dailyRow?.gb || 0) + pendingGb;
+							trafficDaily = (dailyRow?.s || 0) + pendingGb;
 							traffic7d = (sevenRow?.s || 0) + pendingGb;
 							traffic30d = (thirtyRow?.s || 0) + pendingGb;
 						} catch (e) { }
-						// آمار تعداد ریکوئست‌های 7 روز گذشته / 30 روز گذشته از جدول daily_requests
+						// آمار تعداد ریکوئست‌های 7 روز گذشته / 30 روز گذشته از جدول daily_requests - همون منطق رولینگ بالا
 						// + مقدار هنوز-flush-نشده‌ی حافظه (GLOBAL_REQ_COUNT) برای اینکه عدد لحظه‌ای باشد
 						let cfRequests7d = 0, cfRequests30d = 0;
 						try {
-							const todayKey = utcDateKey(now);
-							const sevenAgoKey = utcDateKey(now - 6 * 86400000);
-							const thirtyAgoKey = utcDateKey(now - 29 * 86400000);
+							const sevenAgoKey = utcHourKey(now - 7 * 86400000);
+							const thirtyAgoKey = utcHourKey(now - 30 * 86400000);
 							const [sevenReqRow, thirtyReqRow] = await Promise.all([
 								env.DB.prepare("SELECT SUM(count) as s FROM daily_requests WHERE date >= ?").bind(sevenAgoKey).first(),
 								env.DB.prepare("SELECT SUM(count) as s FROM daily_requests WHERE date >= ?").bind(thirtyAgoKey).first(),
@@ -2021,13 +2039,16 @@ const DbService = {
 				await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run();
 			} catch (e) { }
 			try {
-				// جدول ترافیک روزانه (به تفکیک روز، به وقت UTC) - برای نگه‌داری تاریخچه‌ی 30 روز اخیر
-				// و محاسبه‌ی آمار "روزانه"، "7 روز گذشته" و "30 روز گذشته". هر روز فقط یک ردیف دارد
-				// که با هر flush ترافیک به آن اضافه (UPSERT) می‌شود؛ قدیمی‌تر از 30 روز به‌صورت دوره‌ای پاک می‌شود.
+				// جدول ترافیک، به تفکیک ساعت UTC (ستون "date" همچنان TEXT PRIMARY KEY است، فقط از این پس
+				// مقداری به فرم YYYY-MM-DDTHH در آن ذخیره می‌شود - نه YYYY-MM-DD؛ به utcHourKey نگاه کنید).
+				// برای نگه‌داری تاریخچه‌ی 30 روز اخیر و محاسبه‌ی آمار رولینگ "روزانه"/"7 روز"/"30 روز گذشته"
+				// با دقت ~۱ ساعت. هر ساعت فقط یک ردیف دارد (UPSERT، حداکثر 24×30=720 ردیف کل)؛ قدیمی‌تر
+				// از 30 روز به‌صورت دوره‌ای پاک می‌شود (ردیف‌های قدیمیِ فرمت روزانه هم با همان cutoff رشته‌ای
+				// درست پاک می‌شوند، چون هر دو فرمت با همان 10 کاراکتر YYYY-MM-DD شروع می‌شوند).
 				await db.prepare("CREATE TABLE IF NOT EXISTS daily_traffic (date TEXT PRIMARY KEY, gb REAL DEFAULT 0)").run();
 			} catch (e) { }
 			try {
-				// جدول تعداد ریکوئست‌های روزانه (به تفکیک روز، به وقت UTC) - برای محاسبه‌ی آمار «7 روز گذشته» و «30 روز گذشته»
+				// جدول تعداد ریکوئست‌ها، به تفکیک ساعت UTC - همون توضیح جدول daily_traffic بالا صدق می‌کند.
 				await db.prepare("CREATE TABLE IF NOT EXISTS daily_requests (date TEXT PRIMARY KEY, count INTEGER DEFAULT 0)").run();
 			} catch (e) { }
 			try {
@@ -4314,7 +4335,11 @@ function trackRequest(env, ctx) {
 				} else {
 					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
 				}
-				await env.DB.prepare("INSERT INTO daily_requests (date, count) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET count = count + excluded.count").bind(today, countToSave).run();
+				// این یکی جدا از today/req_today بالاست: اون‌ها مخصوص ریست global_req_limit سر هر روز
+				// تقویمی UTC هستن (منطقشون عمداً دست نخورده)، این یکی جدول تاریخچه‌ی 7/30 روزه‌ست که حالا
+				// روی کلید ساعتی ذخیره می‌شه تا بازه‌های رولینگ دقیق‌تری قابل محاسبه باشن (به utcHourKey نگاه کنید).
+				const hourKey = utcHourKey(Date.now());
+				await env.DB.prepare("INSERT INTO daily_requests (date, count) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET count = count + excluded.count").bind(hourKey, countToSave).run();
 				try {
 					const cutoffDateStr = new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0];
 					await env.DB.prepare("DELETE FROM daily_requests WHERE date < ?").bind(cutoffDateStr).run();
@@ -7927,7 +7952,7 @@ async function executeRocketCreate() {
 					const isChecked = (window.selectedUsernames && window.selectedUsernames.has(user.username)) ? 'checked' : '';
 					const onlineBadgeColor = onlineCount >= 3 ? 'bg-red-600' : (onlineCount === 2 ? 'bg-yellow-500' : 'bg-green-600');
 					const onlineBadge = user.is_online === 1
-						? '<span class="min-w-[20px] h-5 px-1 relative inline-flex items-center justify-center text-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
+						? '<span class="min-w-[20px] h-5 px-1 relative inline-flex items-center justify-center text-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:40%;left:60%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
 						: '';
 					return '<div class="group transition-all drop-shadow-sm bg-white/60 dark:bg-zinc-900/40 rounded-md border border-gray-200 dark:border-zinc-800 p-1 flex flex-col items-center gap-1 text-center" data-username="' + user.username + '">' +
 							'<div class="flex items-center justify-center flex-wrap gap-1 w-full">' +
