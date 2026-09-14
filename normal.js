@@ -1514,6 +1514,41 @@ const Router = {
 				return new Response(JSON.stringify({ error: msg }), { status: 200, headers: { "Content-Type": "application/json" } });
 			}
 		}
+		// GET /api/stats-history: 30-day daily history for the Request and Traffic
+		// dashboard cards, used to draw the click-to-expand line charts. Reuses the
+		// same daily_requests / daily_traffic tables (and utcDateKey helper) as the
+		// existing 7d/30d aggregate stats above. Today's entry additionally folds in
+		// the not-yet-flushed in-memory counters (GLOBAL_REQ_COUNT / GLOBAL_TRAFFIC_CACHE)
+		// so the last (today) point on the chart reflects live, not-yet-persisted usage.
+		if (url.pathname === "/api/stats-history" && request.method === "GET") {
+			try {
+				const now = Date.now();
+				const days = [];
+				for (let i = 29; i >= 0; i--) days.push(utcDateKey(now - i * 86400000));
+				const startKey = days[0];
+				const todayKey = days[days.length - 1];
+				const [reqRows, trafficRows] = await Promise.all([
+					env.DB.prepare("SELECT date, count FROM daily_requests WHERE date >= ?").bind(startKey).all(),
+					env.DB.prepare("SELECT date, gb FROM daily_traffic WHERE date >= ?").bind(startKey).all(),
+				]);
+				const reqMap = new Map((reqRows.results || []).map((r) => [r.date, r.count || 0]));
+				const trafficMap = new Map((trafficRows.results || []).map((r) => [r.date, r.gb || 0]));
+				let pendingGb = 0;
+				for (const v of GLOBAL_TRAFFIC_CACHE.values()) pendingGb += v || 0;
+				pendingGb = pendingGb / (1024 * 1024 * 1024);
+				const pendingReq = GLOBAL_REQ_COUNT || 0;
+				const requests = days.map((d) => ({ date: d, value: (reqMap.get(d) || 0) + (d === todayKey ? pendingReq : 0) }));
+				const traffic = days.map((d) => ({ date: d, value: (trafficMap.get(d) || 0) + (d === todayKey ? pendingGb : 0) }));
+				return new Response(JSON.stringify({ requests, traffic }), {
+					headers: { "Content-Type": "application/json", "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0" },
+				});
+			} catch (e) {
+				return new Response(JSON.stringify({ requests: [], traffic: [], error: e.message }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+		}
 		if (url.pathname.startsWith("/api/users")) {
 			const pathParts = url.pathname.split("/");
 			const isUserAction = pathParts.length > 3;
@@ -4953,7 +4988,7 @@ Commercial support is available at
 	</header>
 	<main class="max-w-6xl mx-auto px-4 py-8 pb-56 md:pb-32 relative z-10">
 <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
-	<div id="card-cf-requests" class="neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
+	<div id="card-cf-requests" onclick="openUsageChart('requests')" class="neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
 		<div class="flex items-center justify-center gap-1.5 relative z-10">
 			<div class="p-1 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-md flex-shrink-0">
 				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
@@ -4966,7 +5001,7 @@ Commercial support is available at
 					<div class="flex items-baseline gap-1" dir="ltr">
 						<span class="text-xs font-black text-orange-600 dark:text-orange-400 transition-all leading-none whitespace-nowrap" id="stat-cf-requests">0</span>
 						<span class="text-[9px] font-bold text-gray-400 leading-none">/ 100k</span>
-						<button id="cf-warning-btn" onclick="openUsageWarning()" class="hidden items-center justify-center w-3 h-3 bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 rounded-full font-bold text-[9px] animate-bounce shadow-sm border border-red-300 dark:border-red-700 leading-none">!</button>
+						<button id="cf-warning-btn" onclick="event.stopPropagation(); openUsageWarning()" class="hidden items-center justify-center w-3 h-3 bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 rounded-full font-bold text-[9px] animate-bounce shadow-sm border border-red-300 dark:border-red-700 leading-none">!</button>
 					</div>
 					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap">روزانه</span>
 				</div>
@@ -4982,6 +5017,9 @@ Commercial support is available at
 			<div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1 mt-1">
 				<div id="stat-cf-progress" class="bg-orange-500 h-1 rounded-full transition-all duration-500" style="width: 0%"></div>
 			</div>
+		</div>
+		<div class="absolute bottom-1.5 left-1.5 z-10 text-orange-300 dark:text-orange-700/60 group-hover:text-orange-500 dark:group-hover:text-orange-400 transition-colors duration-300 pointer-events-none">
+			<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm6 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2M9 9a2 2 0 012-2h2a2 2 0 012 2v10a2 2 0 01-2 2h-2a2 2 0 01-2-2V9z"></path></svg>
 		</div>
 	</div>
 	<div id="card-d1-usage" class="neon-orbit neon-orbit-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-purple-400 dark:hover:border-purple-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
@@ -5013,7 +5051,7 @@ Commercial support is available at
 			</div>
 		</div>
 	</div>
-	<div class="neon-orbit neon-orbit-3 col-span-2 lg:col-span-1 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
+	<div id="card-traffic" onclick="openUsageChart('traffic')" class="neon-orbit neon-orbit-3 col-span-2 lg:col-span-1 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
 		<div class="flex items-center justify-center gap-1.5 relative z-10">
 			<div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0">
 				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
@@ -5035,6 +5073,9 @@ Commercial support is available at
 					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap">30 روز گذشته</span>
 				</div>
 			</div>
+		</div>
+		<div class="absolute bottom-1.5 left-1.5 z-10 text-blue-300 dark:text-blue-700/60 group-hover:text-blue-500 dark:group-hover:text-blue-400 transition-colors duration-300 pointer-events-none">
+			<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm6 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2M9 9a2 2 0 012-2h2a2 2 0 012 2v10a2 2 0 01-2 2h-2a2 2 0 01-2-2V9z"></path></svg>
 		</div>
 	</div>
 </div>
@@ -5184,6 +5225,28 @@ Commercial support is available at
 		<button onclick="closeUsageWarning()" class="w-full py-3.5 bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white font-black rounded-md text-sm transition duration-300 shadow-lg">
 			متوجه شدم
 		</button>
+	</div>
+</div>
+<div id="usage-chart-modal" class="fixed inset-0 z-[92] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300 ease-out">
+	<div class="w-full max-w-xl bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-2xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[92vh]">
+		<div class="flex items-center justify-between gap-2 p-3.5 sm:p-4 border-b border-gray-100 dark:border-zinc-800 shrink-0">
+			<div class="flex items-center gap-2.5 min-w-0">
+				<div id="usage-chart-icon-wrap" class="p-1.5 rounded-lg bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 shrink-0">
+					<svg id="usage-chart-icon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
+				</div>
+				<div class="flex flex-col min-w-0">
+					<h3 id="usage-chart-title" class="font-black text-gray-900 dark:text-zinc-100 text-sm truncate">روند مصرف</h3>
+					<span class="text-[10px] text-gray-400 dark:text-zinc-500 font-medium">۳۰ روز گذشته &middot; روزانه</span>
+				</div>
+			</div>
+			<button type="button" onclick="closeUsageChart()" class="p-2 rounded-lg bg-red-700 hover:bg-red-800 dark:bg-red-600 dark:hover:bg-red-700 text-white transition-all duration-200 shadow-sm shrink-0" title="بستن">
+				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12"></path></svg>
+			</button>
+		</div>
+		<div id="usage-chart-summary" class="grid grid-cols-3 gap-1.5 px-3.5 sm:px-4 pt-3.5 shrink-0"></div>
+		<div class="p-3.5 sm:p-4 pt-2 overflow-y-auto">
+			<div id="usage-chart-body" class="relative"></div>
+		</div>
 	</div>
 </div>
 <div id="online-counter-warning-modal" class="fixed inset-0 z-[87] flex items-center justify-center p-4 bg-black/60  opacity-0 pointer-events-none transition-all duration-300 ease-out">
@@ -7524,7 +7587,7 @@ async function executeRocketCreate() {
 				const warningBtn = document.getElementById('cf-warning-btn');
 				if (cfRequests >= 90000) {
 					if (reqCard) {
-						reqCard.className = "neon-orbit neon-orbit-1 col-span-2 bg-red-50 dark:bg-red-950/20 border border-red-500 rounded-md p-2.5 flex flex-col justify-center gap-1 hover:shadow-md transition duration-300 relative overflow-hidden group min-h-[64px] animate-pulse";
+						reqCard.className = "neon-orbit neon-orbit-1 col-span-2 bg-red-50 dark:bg-red-950/20 border border-red-500 rounded-md p-2.5 flex flex-col justify-center gap-1 hover:shadow-md transition duration-300 relative overflow-hidden group min-h-[64px] animate-pulse cursor-pointer";
 					}
 					if (warningBtn) {
 						warningBtn.classList.remove('hidden');
@@ -7535,7 +7598,7 @@ async function executeRocketCreate() {
 					}
 				} else {
 					if (reqCard) {
-						reqCard.className = "neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]";
+						reqCard.className = "neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer";
 					}
 					if (warningBtn) {
 						warningBtn.classList.add('hidden');
@@ -8447,6 +8510,215 @@ function downloadZeusSource() {
 }
 		function closeUsageWarning() { setModalState('usage-warning-modal', false); }
 		function openUsageWarning() { setModalState('usage-warning-modal', true); }
+		// ==================== نمودار روند 30 روزه (کلیک روی کارت Request / Traffic) ====================
+		const USAGE_CHART_ICONS = {
+			requests: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>',
+			traffic: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>',
+		};
+		const USAGE_CHART_COLORS = {
+			requests: { line: '#ea580c', lineDark: '#fb923c', fillFrom: 'rgba(234,88,12,0.32)', fillTo: 'rgba(234,88,12,0)', text: 'text-orange-600 dark:text-orange-400', iconWrap: 'p-1.5 rounded-lg bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 shrink-0' },
+			traffic: { line: '#2563eb', lineDark: '#60a5fa', fillFrom: 'rgba(37,99,235,0.32)', fillTo: 'rgba(37,99,235,0)', text: 'text-blue-600 dark:text-blue-400', iconWrap: 'p-1.5 rounded-lg bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 shrink-0' },
+		};
+		let usageChartState = { type: null, series: null };
+
+		function formatChartValue(type, v) {
+			v = v || 0;
+			if (type === 'traffic') {
+				if (v >= 1024) return (v / 1024).toFixed(2) + ' TB';
+				if (v < 1) return Math.round(v * 1024) + ' MB';
+				return v.toFixed(2) + ' GB';
+			}
+			if (v >= 1000000) return (v / 1000000).toFixed(2) + 'M';
+			if (v >= 1000) return (v / 1000).toFixed(1) + 'k';
+			return String(Math.round(v));
+		}
+
+		function formatChartDateShort(dateStr) {
+			const p = dateStr.split('-');
+			return p[2] + '/' + p[1];
+		}
+
+		function formatChartDateFull(dateStr) {
+			const p = dateStr.split('-');
+			return p[2] + '/' + p[1] + '/' + p[0].slice(2);
+		}
+
+		function niceChartCeil(v) {
+			if (!v || v <= 0) return 1;
+			const exp = Math.floor(Math.log10(v));
+			const base = Math.pow(10, exp);
+			const norm = v / base;
+			let niceNorm = 10;
+			if (norm <= 1) niceNorm = 1;
+			else if (norm <= 2) niceNorm = 2;
+			else if (norm <= 5) niceNorm = 5;
+			return niceNorm * base;
+		}
+
+		function smoothChartPath(points) {
+			if (points.length < 2) return points.length ? ('M ' + points[0][0].toFixed(2) + ' ' + points[0][1].toFixed(2)) : '';
+			let d = 'M ' + points[0][0].toFixed(2) + ' ' + points[0][1].toFixed(2);
+			for (let i = 0; i < points.length - 1; i++) {
+				const p0 = points[i === 0 ? i : i - 1];
+				const p1 = points[i];
+				const p2 = points[i + 1];
+				const p3 = points[i + 2 < points.length ? i + 2 : i + 1];
+				const c1x = p1[0] + (p2[0] - p0[0]) / 6;
+				const c1y = p1[1] + (p2[1] - p0[1]) / 6;
+				const c2x = p2[0] - (p3[0] - p1[0]) / 6;
+				const c2y = p2[1] - (p3[1] - p1[1]) / 6;
+				d += ' C ' + c1x.toFixed(2) + ' ' + c1y.toFixed(2) + ', ' + c2x.toFixed(2) + ' ' + c2y.toFixed(2) + ', ' + p2[0].toFixed(2) + ' ' + p2[1].toFixed(2);
+			}
+			return d;
+		}
+
+		async function openUsageChart(type) {
+			const modal = document.getElementById('usage-chart-modal');
+			if (!modal) return;
+			const titleEl = document.getElementById('usage-chart-title');
+			const iconWrap = document.getElementById('usage-chart-icon-wrap');
+			const body = document.getElementById('usage-chart-body');
+			const summary = document.getElementById('usage-chart-summary');
+			const colors = USAGE_CHART_COLORS[type] || USAGE_CHART_COLORS.requests;
+			titleEl.textContent = type === 'traffic' ? 'روند مصرف ترافیک' : 'روند تعداد ریکوئست';
+			iconWrap.className = colors.iconWrap;
+			iconWrap.innerHTML = USAGE_CHART_ICONS[type] || USAGE_CHART_ICONS.requests;
+			summary.innerHTML = '';
+			body.innerHTML = '<div class="flex items-center justify-center py-16 text-gray-400 dark:text-zinc-500 text-xs gap-2"><svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>در حال بارگذاری نمودار...</div>';
+			setModalState('usage-chart-modal', true);
+			try {
+				const res = await fetch('/api/stats-history?t=' + Date.now());
+				const json = await res.json();
+				const series = (type === 'traffic' ? json.traffic : json.requests) || [];
+				usageChartState = { type, series };
+				renderUsageChartSummary(type, series);
+				renderUsageChart(type, series);
+			} catch (e) {
+				body.innerHTML = '<div class="flex items-center justify-center py-16 text-red-500 dark:text-red-400 text-xs">خطا در بارگذاری اطلاعات نمودار</div>';
+			}
+		}
+
+		function closeUsageChart() { setModalState('usage-chart-modal', false); }
+
+		function renderUsageChartSummary(type, series) {
+			const wrap = document.getElementById('usage-chart-summary');
+			if (!wrap) return;
+			if (!series.length) { wrap.innerHTML = ''; return; }
+			const colors = USAGE_CHART_COLORS[type] || USAGE_CHART_COLORS.requests;
+			const total = series.reduce((s, d) => s + (d.value || 0), 0);
+			const avg = total / series.length;
+			let peak = series[0];
+			for (const d of series) if (d.value > peak.value) peak = d;
+			const box = (val, label) => '<div class="flex flex-col items-center justify-center bg-gray-50 dark:bg-amoled-input rounded-lg py-2 px-1"><span class="text-xs font-black ' + colors.text + '" dir="ltr">' + val + '</span><span class="text-[9px] font-medium text-gray-500 dark:text-zinc-400 mt-0.5 whitespace-nowrap">' + label + '</span></div>';
+			wrap.innerHTML =
+				box(formatChartValue(type, total), 'مجموع 30 روز') +
+				box(formatChartValue(type, avg), 'میانگین روزانه') +
+				box(formatChartValue(type, peak.value), 'اوج مصرف (' + formatChartDateShort(peak.date) + ')');
+		}
+
+		function renderUsageChart(type, series) {
+			const body = document.getElementById('usage-chart-body');
+			if (!body) return;
+			if (!series || !series.length) {
+				body.innerHTML = '<div class="flex items-center justify-center py-16 text-gray-400 dark:text-zinc-500 text-xs">داده‌ای برای نمایش موجود نیست</div>';
+				return;
+			}
+			const colors = USAGE_CHART_COLORS[type] || USAGE_CHART_COLORS.requests;
+			const isDark = document.documentElement.classList.contains('dark');
+			const lineColor = isDark ? colors.lineDark : colors.line;
+			const W = 640, H = 220, padL = 40, padR = 12, padT = 16, padB = 24;
+			const innerW = W - padL - padR, innerH = H - padT - padB;
+			const n = series.length;
+			const maxRaw = Math.max.apply(null, series.map((d) => d.value || 0));
+			const niceMax = niceChartCeil(maxRaw);
+			const xAt = (i) => padL + (n === 1 ? innerW / 2 : (i * innerW) / (n - 1));
+			const yAt = (v) => padT + innerH - (Math.min(v, niceMax) / niceMax) * innerH;
+			const points = series.map((d, i) => [xAt(i), yAt(d.value || 0)]);
+			const linePath = smoothChartPath(points);
+			const baseline = (padT + innerH).toFixed(2);
+			const areaPath = linePath + ' L ' + points[n - 1][0].toFixed(2) + ' ' + baseline + ' L ' + points[0][0].toFixed(2) + ' ' + baseline + ' Z';
+			const gridCount = 4;
+			let gridSvg = '';
+			for (let g = 0; g <= gridCount; g++) {
+				const v = (niceMax * g) / gridCount;
+				const y = yAt(v);
+				gridSvg += '<line x1="' + padL + '" y1="' + y.toFixed(2) + '" x2="' + (W - padR) + '" y2="' + y.toFixed(2) + '" class="stroke-gray-100 dark:stroke-zinc-800" stroke-width="1" />';
+				gridSvg += '<text x="' + (padL - 6) + '" y="' + (y + 3).toFixed(2) + '" text-anchor="end" class="fill-gray-400 dark:fill-zinc-500" style="font-size:9px;font-weight:600">' + formatChartValue(type, v) + '</text>';
+			}
+			let xLabelsSvg = '';
+			const step = Math.max(1, Math.ceil(n / 6));
+			for (let i = 0; i < n; i += step) {
+				xLabelsSvg += '<text x="' + xAt(i).toFixed(2) + '" y="' + (H - 6) + '" text-anchor="middle" class="fill-gray-400 dark:fill-zinc-500" style="font-size:9px;font-weight:600">' + formatChartDateShort(series[i].date) + '</text>';
+			}
+			if ((n - 1) % step !== 0) {
+				xLabelsSvg += '<text x="' + xAt(n - 1).toFixed(2) + '" y="' + (H - 6) + '" text-anchor="middle" class="fill-gray-400 dark:fill-zinc-500" style="font-size:9px;font-weight:600">' + formatChartDateShort(series[n - 1].date) + '</text>';
+			}
+			const lastPt = points[n - 1];
+			const gradId = 'usageChartGrad_' + type;
+			const svg =
+				'<svg viewBox="0 0 ' + W + ' ' + H + '" class="w-full h-auto select-none" id="usage-chart-svg" preserveAspectRatio="none" style="overflow:visible">' +
+				'<defs><linearGradient id="' + gradId + '" x1="0" y1="0" x2="0" y2="1">' +
+				'<stop offset="0%" stop-color="' + colors.fillFrom + '"/><stop offset="100%" stop-color="' + colors.fillTo + '"/></linearGradient></defs>' +
+				gridSvg +
+				'<path d="' + areaPath + '" fill="url(#' + gradId + ')" stroke="none"/>' +
+				'<path d="' + linePath + '" fill="none" stroke="' + lineColor + '" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>' +
+				xLabelsSvg +
+				'<line id="usage-chart-hover-line" x1="0" y1="' + padT + '" x2="0" y2="' + (padT + innerH) + '" class="stroke-gray-300 dark:stroke-zinc-600" stroke-width="1" stroke-dasharray="3,3" style="opacity:0"></line>' +
+				'<circle id="usage-chart-hover-dot" r="4.5" fill="' + lineColor + '" stroke="white" class="dark:stroke-amoled-card" stroke-width="1.5" style="opacity:0"></circle>' +
+				'<circle cx="' + lastPt[0].toFixed(2) + '" cy="' + lastPt[1].toFixed(2) + '" r="7" fill="' + lineColor + '" opacity="0.4" class="animate-ping" style="transform-origin:' + lastPt[0].toFixed(2) + 'px ' + lastPt[1].toFixed(2) + 'px"></circle>' +
+				'<circle cx="' + lastPt[0].toFixed(2) + '" cy="' + lastPt[1].toFixed(2) + '" r="4" fill="' + lineColor + '" stroke="white" class="dark:stroke-amoled-card" stroke-width="1.5"></circle>' +
+				'<rect x="' + padL + '" y="0" width="' + innerW + '" height="' + H + '" fill="transparent" id="usage-chart-hitzone" style="cursor:crosshair"></rect>' +
+				'</svg>' +
+				'<div id="usage-chart-tooltip" class="hidden absolute pointer-events-none px-2 py-1.5 rounded-md bg-gray-900/95 dark:bg-black/95 text-white text-[10px] font-bold shadow-lg whitespace-nowrap z-10" dir="ltr"></div>';
+			body.innerHTML = '<div class="relative">' + svg + '</div>';
+			attachUsageChartHover(type, series, points, { W: W, H: H, padL: padL, innerW: innerW });
+		}
+
+		function attachUsageChartHover(type, series, points, geo) {
+			const svg = document.getElementById('usage-chart-svg');
+			const hitzone = document.getElementById('usage-chart-hitzone');
+			const hoverLine = document.getElementById('usage-chart-hover-line');
+			const hoverDot = document.getElementById('usage-chart-hover-dot');
+			const tooltip = document.getElementById('usage-chart-tooltip');
+			if (!svg || !hitzone || !hoverLine || !hoverDot || !tooltip) return;
+			const n = points.length;
+			function handleMove(clientX) {
+				const rect = svg.getBoundingClientRect();
+				if (!rect.width) return;
+				const relX = ((clientX - rect.left) / rect.width) * geo.W;
+				let idx = Math.round(((relX - geo.padL) / geo.innerW) * (n - 1));
+				idx = Math.max(0, Math.min(n - 1, idx));
+				const px = points[idx][0], py = points[idx][1];
+				hoverLine.setAttribute('x1', px.toFixed(2));
+				hoverLine.setAttribute('x2', px.toFixed(2));
+				hoverLine.style.opacity = '1';
+				hoverDot.setAttribute('cx', px.toFixed(2));
+				hoverDot.setAttribute('cy', py.toFixed(2));
+				hoverDot.style.opacity = '1';
+				const d = series[idx];
+				const labelUnit = type === 'traffic' ? 'مصرف' : 'ریکوئست';
+				tooltip.innerHTML = '<span class="opacity-60">' + formatChartDateFull(d.date) + '</span> &middot; ' + labelUnit + ': ' + formatChartValue(type, d.value);
+				tooltip.classList.remove('hidden');
+				const leftPct = (px / geo.W) * 100;
+				const topPct = (py / (geo.H || 220)) * 100;
+				tooltip.style.left = leftPct + '%';
+				tooltip.style.top = Math.max(topPct - 4, 6) + '%';
+				let tx = '-50%';
+				if (leftPct < 12) tx = '0%';
+				else if (leftPct > 88) tx = '-100%';
+				tooltip.style.transform = 'translate(' + tx + ', -100%)';
+			}
+			function handleLeave() {
+				hoverLine.style.opacity = '0';
+				hoverDot.style.opacity = '0';
+				tooltip.classList.add('hidden');
+			}
+			hitzone.addEventListener('mousemove', function (e) { handleMove(e.clientX); });
+			hitzone.addEventListener('mouseleave', handleLeave);
+			hitzone.addEventListener('touchstart', function (e) { if (e.touches[0]) handleMove(e.touches[0].clientX); }, { passive: true });
+			hitzone.addEventListener('touchmove', function (e) { if (e.touches[0]) handleMove(e.touches[0].clientX); }, { passive: true });
+			hitzone.addEventListener('touchend', handleLeave);
+		}
 		function closeOnlineCounterWarning() { setModalState('online-counter-warning-modal', false); }
 		function openOnlineCounterWarning() { setModalState('online-counter-warning-modal', true); }
 		function closeConfigCountWarning() { setModalState('config-count-warning-modal', false); }
@@ -10126,6 +10398,7 @@ function applySelectedIps() {
 				if (e.target.id === 'token-modal') toggleTokenModal(false);
 				if (e.target.id === 'qr-modal') toggleQrModal(false);
 				if (e.target.id === 'usage-warning-modal') closeUsageWarning();
+				if (e.target.id === 'usage-chart-modal') closeUsageChart();
 				if (e.target.id === 'online-counter-warning-modal') closeOnlineCounterWarning();
 				if (e.target.id === 'config-count-warning-modal') closeConfigCountWarning();
 				if (e.target.id === 'pattng-info-modal') togglePattNgModal(false);
