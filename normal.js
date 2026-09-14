@@ -5009,7 +5009,7 @@ Commercial support is available at
 				</div>
 			</div>
 			<div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1 mt-1">
-				<div id="stat-d1-progress" class="bg-purple-500 h-1 rounded-full transition-all duration-500" style="width: 0%"></div>
+				<div id="stat-d1-progress" class="bg-purple-500 h-1 rounded-full transition-all duration-500 min-w-[6px]" style="width: 0%"></div>
 			</div>
 		</div>
 	</div>
