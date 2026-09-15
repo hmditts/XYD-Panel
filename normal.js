@@ -1492,8 +1492,20 @@ const Router = {
 			if (request.method === "POST") {
 				const body = await readJsonBody(request);
 				if (body.settings && typeof body.settings === "object") {
+					// «هشدار تعداد دستگاه» (device_warning_threshold): برخلاف بقیه‌ی تنظیمات
+					// global، این یکی روی ستون ip_limit/max_connections همه‌ی کاربرهای *موجود*
+					// هم override می‌شه (نه فقط پیش‌فرض کاربر تازه‌ساز - نگاه کنید به POST
+					// /api/users).
+					let overrideDeviceWarningThreshold = undefined;
+					if (Object.prototype.hasOwnProperty.call(body.settings, "device_warning_threshold")) {
+						const parsedThreshold = parseInt(body.settings.device_warning_threshold);
+						if (!isNaN(parsedThreshold) && parsedThreshold >= 0) overrideDeviceWarningThreshold = parsedThreshold;
+					}
 					for (const [k, v] of Object.entries(body.settings)) {
 						await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v)).run();
+					}
+					if (overrideDeviceWarningThreshold !== undefined) {
+						await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ?").bind(overrideDeviceWarningThreshold, overrideDeviceWarningThreshold).run();
 					}
 				}
 				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
@@ -2141,6 +2153,7 @@ const DbService = {
 					{ name: "enable_direct", def: "INTEGER DEFAULT 1" },
 					{ name: "proxy_rotate_cooldowns", def: "TEXT DEFAULT '{}'" },
 					{ name: "device_warning_at", def: "INTEGER DEFAULT NULL" },
+					{ name: "device_warning_peak_count", def: "INTEGER DEFAULT NULL" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
@@ -2231,10 +2244,14 @@ async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 	const run = async () => {
 		let freshIps = {};
 		let ipLimit = null;
+		let prevWarningAt = null;
+		let prevPeakCount = null;
 		try {
-			const row = await env.DB.prepare("SELECT active_ips, ip_limit FROM users WHERE uuid = ?").bind(uuid).first();
+			const row = await env.DB.prepare("SELECT active_ips, ip_limit, device_warning_at, device_warning_peak_count FROM users WHERE uuid = ?").bind(uuid).first();
 			freshIps = JSON.parse((row && row.active_ips) || "{}");
 			ipLimit = row ? row.ip_limit : null;
+			prevWarningAt = row ? row.device_warning_at : null;
+			prevPeakCount = row ? row.device_warning_peak_count : null;
 		} catch (e) { }
 		for (const [ip, data] of Object.entries(freshIps)) {
 			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
@@ -2254,9 +2271,16 @@ async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 		// نشون می‌ده (نگاه کنید به GET /api/users و رندر کارت کاربر در پنل).
 		const activeDeviceCount = Object.keys(freshIps).length;
 		const exceededLimit = ipLimit && ipLimit > 0 && activeDeviceCount > ipLimit;
+		// «بیشترین تعداد دستگاه» (device_warning_peak_count): اگه هشدار قبلی هنوز منقضی
+		// نشده (کمتر از ۲۴ ساعت از device_warning_at قبلی گذشته)، بیشینه‌ی activeDeviceCount
+		// نگه داشته می‌شه (همون چرخه‌ی هشدار ادامه داره). اگه هشدار قبلی منقضی شده بود یا
+		// اصلاً نبود، یه چرخه‌ی تازه شروع می‌شه و peak از همین عدد فعلی شروع می‌شه - دقیقاً
+		// هم‌زمان با device_warning_at (که پنل با همون ۲۴ ساعت محو می‌کنه)، بدون کوئری اضافه.
+		const warningStillFresh = !!(prevWarningAt && now - prevWarningAt < 24 * 60 * 60 * 1000);
+		const newPeakCount = warningStillFresh ? Math.max(prevPeakCount || 0, activeDeviceCount) : activeDeviceCount;
 		try {
 			if (exceededLimit) {
-				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, uuid).run();
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, uuid).run();
 			} else {
 				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, uuid).run();
 			}
@@ -8050,9 +8074,17 @@ async function executeRocketCreate() {
 					// بعد از آخرین باری که تعداد دستگاه فعال از ip_limit این کاربر بیشتر شده -
 					// نگاه کنید به persistActiveIp). فقط یک هشدار بصریه، هیچ اتصالی رو قطع نمی‌کنه.
 					const deviceWarningLimitText = (user.ip_limit !== undefined && user.ip_limit !== null) ? user.ip_limit : (user.max_connections || '?');
+					// «بیشترین تعداد دستگاه»: user.device_warning_peak_count از GET /api/users میاد
+					// (ستون خام، persistActiveIp پرش می‌کنه - نگاه کنید بالاتر). کنار خودِ آیکون
+					// هشدار نشون داده می‌شه، سمت چپش (آیکون اول توی سورس میاد، عدد بعدش - چون
+					// صفحه dir="rtl" هست، فرزند بعدی در فلکس row سمت چپِ فرزند قبلی می‌شینه).
+					const deviceWarningPeakCount = user.device_warning_peak_count || null;
 					const deviceWarningBadge = user.device_warning
-						? '<span title="تعداد دستگاه‌های متصل این کاربر بیش از حد مجازش (' + deviceWarningLimitText + ' دستگاه) بوده است" class="inline-flex items-center justify-center w-4 h-4 text-red-500 animate-pulse shrink-0">' +
-							'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>' +
+						? '<span class="inline-flex items-center gap-0.5 shrink-0">' +
+							'<span title="تعداد دستگاه‌های متصل این کاربر بیش از حد مجازش (' + deviceWarningLimitText + ' دستگاه) بوده است' + (deviceWarningPeakCount ? ' - بیشترین تعداد همزمان: ' + deviceWarningPeakCount + ' دستگاه' : '') + '" class="inline-flex items-center justify-center w-4 h-4 text-red-500 animate-pulse shrink-0">' +
+								'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>' +
+							  '</span>' +
+							(deviceWarningPeakCount ? '<span class="text-[10px] font-bold text-red-500 leading-none">' + deviceWarningPeakCount + '</span>' : '') +
 						  '</span>'
 						: '';
 					return '<div class="group transition-all drop-shadow-sm bg-white/60 dark:bg-zinc-900/40 rounded-md border border-gray-200 dark:border-zinc-800 p-1 flex flex-col items-center gap-1 text-center" data-username="' + user.username + '">' +
