@@ -4791,6 +4791,7 @@ const COMMON_HEAD = `
 	<meta name="apple-mobile-web-app-title" content="ZEUS Panel">
 	<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
 	<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/lipis/flag-icons@7.3.2/css/flag-icons.min.css">
+	<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700&display=swap" rel="stylesheet">
 <script>
 	tailwind.config = {
 		darkMode: 'class',
@@ -5059,6 +5060,24 @@ Commercial support is available at
 	${COMMON_HEAD}
 	<style>
 		body { font-family: 'Vazirmatn', sans-serif; }
+		/* درخشش ملایم و پیوسته‌ی جعبه‌ی آیکون لوگو (کنار متن Z Y X در هدر) */
+		@keyframes logoGlow {
+			0%, 100% { box-shadow: 0 0 5px 1px rgba(59,130,246,0.55), 0 0 0 0 rgba(96,165,250,0); }
+			50% { box-shadow: 0 0 13px 4px rgba(96,165,250,0.9), 0 0 20px 6px rgba(59,130,246,0.35); }
+		}
+		.logo-glow {
+			animation: logoGlow 2.6s ease-in-out infinite;
+		}
+		/* فونت و استایل شیک‌تر برای متن برند Z Y X کنار لوگو */
+		.brand-logo-text {
+			font-family: 'Orbitron', 'Vazirmatn', sans-serif;
+			font-weight: 700;
+			letter-spacing: 0.14em;
+			background: linear-gradient(90deg, #60a5fa 0%, #38bdf8 45%, #93c5fd 55%, #60a5fa 100%);
+			-webkit-background-clip: text;
+			background-clip: text;
+			color: transparent !important;
+		}
 		.zeus-flag {
 			display: inline-block;
 			width: 1.35em;
@@ -5226,10 +5245,10 @@ Commercial support is available at
 		<div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-2 md:gap-4">
 			<div class="flex flex-row flex-wrap justify-center items-center gap-3 w-full md:w-auto">
 				<h1 class="text-lg font-bold flex items-center gap-2.5" dir="ltr">
-					<span class="w-7 h-7 rounded-md bg-navy-700 dark:bg-navy-600 flex items-center justify-center flex-shrink-0">
-						<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+					<span class="w-7 h-7 rounded-md bg-navy-700 dark:bg-navy-600 flex items-center justify-center flex-shrink-0 logo-glow">
+						<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.456-2.456L14.25 6l1.035-.259a3.375 3.375 0 002.456-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z"></path></svg>
 					</span>
-					<span class="tracking-wide text-gray-900 dark:text-zinc-100">Z Y X</span>
+					<span class="tracking-wide brand-logo-text">Z Y X</span>
 					<span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-navy-100 text-navy-700 dark:bg-navy-900/40 dark:text-navy-400 rounded-full"></span>
 				</h1>
 			</div>
@@ -7015,7 +7034,7 @@ ${COMMON_TOAST_HTML}
 			}).join('');
 			
 			nonTlsContainer.innerHTML = nonTlsPorts.map(function(port, index) {
-				const isCheckedDefault = port === '80' ? 'checked' : '';
+				const isCheckedDefault = ''; // پیش‌فرض: هیچ پورت Non-TLS (از جمله 80) به‌صورت خودکار تیک نمی‌خورد
 				const colSpanClass = index < 3 ? 'col-span-4' : 'col-span-3';
 				return '<label class="relative cursor-pointer ' + colSpanClass + '">' +
 					'<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
@@ -7255,7 +7274,7 @@ let activeRocketBtn = null;
 			const nonTlsDefaultSet = { '80': true, '8080': true, '8880': true, '2052': true, '2082': true, '2086': true, '2095': true };
 			const createModalDefaultPort = window.DEFAULT_PORT_SETTING || '2083';
 			document.querySelectorAll('input[name="ports"]').forEach(function(cb) {
-				if (nonTlsDefaultSet[cb.value]) { cb.checked = (cb.value === '80'); return; }
+				if (nonTlsDefaultSet[cb.value]) { cb.checked = false; return; } // هیچ پورت Non-TLS (شامل 80) دیگه به‌صورت پیش‌فرض تیک نمی‌خوره
 				cb.checked = (cb.value === createModalDefaultPort);
 			});
 			const fpSelect = document.getElementById('fingerprint-select');
@@ -9747,7 +9766,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '2.2.0';
+const CURRENT_VERSION = '3.32.0';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
