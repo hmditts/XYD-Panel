@@ -5127,10 +5127,10 @@ Commercial support is available at
 <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
 	<div id="card-cf-requests" onclick="openUsageChart('requests')" class="neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
 		<div class="flex items-center justify-center gap-1.5 relative z-10">
+			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Request</span>
 			<div class="p-1 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-md flex-shrink-0">
 				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
 			</div>
-			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Request</span>
 		</div>
 		<div class="relative z-10 min-w-0 flex-1 w-full mt-1">
 			<div class="grid grid-cols-3 gap-1 w-full mb-1.5">
@@ -5140,15 +5140,15 @@ Commercial support is available at
 						<span class="text-[9px] font-bold text-gray-400 leading-none">/ 100k</span>
 						<button id="cf-warning-btn" onclick="event.stopPropagation(); openUsageWarning()" class="hidden items-center justify-center w-3 h-3 bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 rounded-full font-bold text-[9px] animate-bounce shadow-sm border border-red-300 dark:border-red-700 leading-none">!</button>
 					</div>
-					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap">روزانه</span>
+					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">24h</span>
 				</div>
 				<div class="flex flex-col items-center justify-center border-x border-gray-100 dark:border-zinc-800">
 					<span class="text-xs font-black text-orange-600 dark:text-orange-400 transition-all leading-none whitespace-nowrap" id="stat-cf-requests-7d">0</span>
-					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap">7 روز گذشته</span>
+					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">7d</span>
 				</div>
 				<div class="flex flex-col items-center justify-center">
 					<span class="text-xs font-black text-orange-600 dark:text-orange-400 transition-all leading-none whitespace-nowrap" id="stat-cf-requests-30d">0</span>
-					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap">30 روز گذشته</span>
+					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">30d</span>
 				</div>
 			</div>
 			<div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1 mt-1">
@@ -5158,10 +5158,10 @@ Commercial support is available at
 	</div>
 	<div id="card-d1-usage" class="neon-orbit neon-orbit-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-purple-400 dark:hover:border-purple-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
 		<div class="flex items-center justify-center gap-1.5 relative z-10">
+			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">D1</span>
 			<div class="p-1 bg-purple-50 dark:bg-purple-950/30 text-purple-600 dark:text-purple-400 rounded-md flex-shrink-0">
 				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"></path></svg>
 			</div>
-			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">D1</span>
 		</div>
 		<div class="relative z-10 min-w-0 flex-1 w-full mt-1">
 			<div class="grid grid-cols-2 gap-2 w-full mb-1.5">
@@ -5170,14 +5170,14 @@ Commercial support is available at
 						<span class="text-sm font-black text-purple-600 dark:text-purple-400 transition-all leading-none" id="stat-d1-writes">0</span>
 						<span class="text-[9px] font-bold text-gray-400 leading-none">/ 100k</span>
 					</div>
-					<span class="text-[9px] font-medium text-gray-500 dark:text-zinc-400 mt-1">نوشتن</span>
+					<span class="text-[9px] font-medium text-gray-500 dark:text-zinc-400 mt-1">Write</span>
 				</div>
 				<div class="flex flex-col items-end justify-center border-r border-gray-100 dark:border-zinc-800 pr-2">
 					<div class="flex items-baseline gap-1" dir="ltr">
 						<span class="text-sm font-black text-purple-600 dark:text-purple-400 transition-all leading-none" id="stat-d1-reads">0</span>
 						<span class="text-[9px] font-bold text-gray-400 leading-none">/ 5M</span>
 					</div>
-					<span class="text-[9px] font-medium text-gray-500 dark:text-zinc-400 mt-1">خواندن</span>
+					<span class="text-[9px] font-medium text-gray-500 dark:text-zinc-400 mt-1">Read</span>
 				</div>
 			</div>
 			<div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1 mt-1">
@@ -5187,24 +5187,24 @@ Commercial support is available at
 	</div>
 	<div id="card-traffic" onclick="openUsageChart('traffic')" class="neon-orbit neon-orbit-3 col-span-2 lg:col-span-1 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
 		<div class="flex items-center justify-center gap-1.5 relative z-10">
+			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Traffic</span>
 			<div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0">
 				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
 			</div>
-			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Traffic</span>
 		</div>
 		<div class="relative z-10 min-w-0 flex-1 w-full mt-1">
 			<div class="grid grid-cols-3 gap-1 w-full">
 				<div class="flex flex-col items-center justify-center">
 					<span class="text-xs font-black text-blue-600 dark:text-blue-400 transition-all leading-none whitespace-nowrap" dir="ltr" id="stat-usage-daily">0 GB</span>
-					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap">روزانه</span>
+					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">24h</span>
 				</div>
 				<div class="flex flex-col items-center justify-center border-x border-gray-100 dark:border-zinc-800">
 					<span class="text-xs font-black text-blue-600 dark:text-blue-400 transition-all leading-none whitespace-nowrap" dir="ltr" id="stat-usage-7d">0 GB</span>
-					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap">7 روز گذشته</span>
+					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">7d</span>
 				</div>
 				<div class="flex flex-col items-center justify-center">
 					<span class="text-xs font-black text-blue-600 dark:text-blue-400 transition-all leading-none whitespace-nowrap" dir="ltr" id="stat-usage-30d">0 GB</span>
-					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap">30 روز گذشته</span>
+					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">30d</span>
 				</div>
 			</div>
 		</div>
@@ -7952,7 +7952,7 @@ async function executeRocketCreate() {
 					const isChecked = (window.selectedUsernames && window.selectedUsernames.has(user.username)) ? 'checked' : '';
 					const onlineBadgeColor = onlineCount >= 3 ? 'bg-red-600' : (onlineCount === 2 ? 'bg-yellow-500' : 'bg-green-600');
 					const onlineBadge = user.is_online === 1
-						? '<span class="min-w-[20px] h-5 px-1 relative inline-flex items-center justify-center text-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:40%;left:60%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
+						? '<span class="min-w-[20px] h-5 px-1 relative inline-flex items-center justify-center text-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
 						: '';
 					return '<div class="group transition-all drop-shadow-sm bg-white/60 dark:bg-zinc-900/40 rounded-md border border-gray-200 dark:border-zinc-800 p-1 flex flex-col items-center gap-1 text-center" data-username="' + user.username + '">' +
 							'<div class="flex items-center justify-center flex-wrap gap-1 w-full">' +
