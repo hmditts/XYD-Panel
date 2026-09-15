@@ -311,6 +311,18 @@ async function checkAutoRotates(env, ctx) {
 // a broken proxy, so once a slot is tagged with a country it never drifts to
 // another country - regardless of whether that country is still "pinned".
 const PINNED_DEFAULT_LOCATIONS_FALLBACK = ["UZ", "KZ", "TR", "LY", "NL", "AL", "EE", "BG", "LV", "SE", "NO", "GB", "US", "ES", "BE"];
+// Built-in default/seed values for the three admin-editable settings-modal fields
+// "آیپی تمیز سراسری" (global_clean_ip), "آیپی های تمیز دیگر" (other_clean_ips) and
+// "Proxy IP" (inline_proxy_ip). Used in two places: (1) ensureSchema() seeds these
+// straight into the `settings` table on first run (INSERT OR IGNORE) so they exist
+// as real app defaults from the very first deploy - no manual "save" required in
+// the panel first - and (2) as the read-side fallback in the getters below, only
+// for the case where the row is missing entirely (never configured). If the admin
+// has explicitly saved an empty value (to turn a field off on purpose), that empty
+// value is respected and is NOT replaced by these defaults.
+const DEFAULT_GLOBAL_CLEAN_IP_FALLBACK = "104.20.25.138";
+const DEFAULT_OTHER_CLEAN_IPS_FALLBACK = ["104.26.1.116", "104.21.122.162", "185.162.228.105", "185.148.105.218", "104.18.39.219", "185.162.230.76"];
+const DEFAULT_INLINE_PROXY_IP_FALLBACK = "178.105.227.210";
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
 // runs automatically for every user right after the admin saves the pinned
@@ -2039,6 +2051,16 @@ const DbService = {
 				await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run();
 			} catch (e) { }
 			try {
+				// پیش‌فرض‌های آیپی تمیز سراسری/آیپی‌های تمیز دیگر/Proxy IP رو همین‌جا توی
+				// دیتابیس seed می‌کنیم (نه فقط توی فرم سمت کلاینت)، تا از همون دیپلوی اول
+				// این مقادیر واقعاً در تنظیمات وجود داشته باشن و نیازی به زدن دستی دکمه‌ی
+				// «ذخیره» بعد از دیپلوی نباشه. INSERT OR IGNORE یعنی اگه ادمین قبلاً این
+				// کلید رو (حتی با مقدار خالی) ذخیره کرده باشه، دست‌نخورده می‌مونه.
+				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_clean_ip', ?)").bind(DEFAULT_GLOBAL_CLEAN_IP_FALLBACK).run();
+				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('other_clean_ips', ?)").bind(DEFAULT_OTHER_CLEAN_IPS_FALLBACK.join("\n")).run();
+				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('inline_proxy_ip', ?)").bind(DEFAULT_INLINE_PROXY_IP_FALLBACK).run();
+			} catch (e) { }
+			try {
 				// جدول ترافیک، به تفکیک ساعت UTC (ستون "date" همچنان TEXT PRIMARY KEY است، فقط از این پس
 				// مقداری به فرم YYYY-MM-DDTHH در آن ذخیره می‌شود - نه YYYY-MM-DD؛ به utcHourKey نگاه کنید).
 				// برای نگه‌داری تاریخچه‌ی 30 روز اخیر و محاسبه‌ی آمار رولینگ "روزانه"/"7 روز"/"30 روز گذشته"
@@ -2248,12 +2270,13 @@ function buildInlineProxyIpSegment(ip) {
 	}
 }
 async function getInlineProxyIpSetting(env) {
-	if (!env || !env.DB) return "";
+	if (!env || !env.DB) return DEFAULT_INLINE_PROXY_IP_FALLBACK;
 	try {
 		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'inline_proxy_ip'").first();
-		return row && row.value ? String(row.value).trim() : "";
+		if (!row) return DEFAULT_INLINE_PROXY_IP_FALLBACK; // never configured (fresh install/DB) -> app default
+		return row.value ? String(row.value).trim() : ""; // explicitly saved empty -> respect it, feature stays off
 	} catch (e) {
-		return "";
+		return DEFAULT_INLINE_PROXY_IP_FALLBACK;
 	}
 }
 // Extra always-on clean-IP addresses ("آیپی های تمیز دیگر" panel setting).
@@ -2262,16 +2285,17 @@ async function getInlineProxyIpSetting(env) {
 // "Proxy IP" inline segment (see buildInlineProxyIpSegment above), and
 // named with a German flag + zero-padded index (see call sites).
 async function getOtherCleanIpsSetting(env) {
-	if (!env || !env.DB) return [];
+	if (!env || !env.DB) return DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice();
 	try {
 		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'other_clean_ips'").first();
-		if (!row || !row.value) return [];
+		if (!row) return DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice(); // never configured (fresh install/DB) -> app default
+		if (!row.value) return []; // explicitly saved empty -> respect it, no extra clean IPs
 		return String(row.value)
 			.split("\n")
 			.map((ip) => ip.trim())
 			.filter((ip) => ip.length > 0);
 	} catch (e) {
-		return [];
+		return DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice();
 	}
 }
 // Reads the admin-editable pinned-locations list from the settings table
@@ -6308,7 +6332,7 @@ Commercial support is available at
 		</div>
 	</div>
 	<div id="settings-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60  opacity-0 pointer-events-none transition-all duration-300 ease-out">
-		<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh]">
+		<div class="relative w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh]">
 			<div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
 				<h3 class="font-bold text-gray-900 dark:text-zinc-100">تنظیمات پـنـل</h3>
 				<button onclick="toggleSettingsModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
@@ -6368,7 +6392,6 @@ Commercial support is available at
 					</label>
 					<div class="flex items-center gap-2">
 						<input type="text" id="global-clean-ip-input" dir="ltr" placeholder="104.20.25.138" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
-						<button type="button" onclick="saveGlobalCleanIp()" id="save-global-clean-ip-btn" class="px-3 py-2 bg-sky-700 hover:bg-sky-800 dark:bg-sky-600 dark:hover:bg-sky-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
 					</div>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
@@ -6378,7 +6401,6 @@ Commercial support is available at
 					</label>
 					<div class="flex items-center gap-2">
 						<input type="number" id="global-req-limit-input" dir="ltr" min="0" step="1000" placeholder="75000" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
-						<button type="button" onclick="saveGlobalReqLimit()" id="save-global-req-limit-btn" class="px-3 py-2 bg-orange-700 hover:bg-orange-800 dark:bg-orange-600 dark:hover:bg-orange-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
 					</div>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
@@ -6388,7 +6410,6 @@ Commercial support is available at
 					</label>
 					<div class="flex items-center gap-2">
 						<textarea id="other-clean-ips-input" dir="ltr" rows="3" placeholder="104.18.39.219&#10;185.148.105.218" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 resize-none"></textarea>
-						<button type="button" onclick="saveOtherCleanIps()" id="save-other-clean-ips-btn" class="px-3 py-2 bg-teal-700 hover:bg-teal-800 dark:bg-teal-600 dark:hover:bg-teal-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap self-stretch">ذخیره</button>
 					</div>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
@@ -6398,7 +6419,6 @@ Commercial support is available at
 					</label>
 					<div class="flex items-center gap-2">
 						<input type="text" id="inline-proxy-ip-input" dir="ltr" placeholder="178.105.227.210" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
-						<button type="button" onclick="saveInlineProxyIp()" id="save-inline-proxy-ip-btn" class="px-3 py-2 bg-orange-700 hover:bg-orange-800 dark:bg-orange-600 dark:hover:bg-orange-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
 					</div>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
@@ -6445,6 +6465,9 @@ Commercial support is available at
 					<button type="button" onclick="saveSettings()" id="save-settings-btn" class="flex-1 py-2 bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white font-medium rounded-md text-sm transition">ذخیره تنظیمات</button>
 				</div>
 			</div>
+			<button type="button" onclick="saveSettings()" id="save-settings-fab-btn" title="ذخیره تنظیمات" class="absolute bottom-4 left-4 z-20 w-12 h-12 rounded-full bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white shadow-lg flex items-center justify-center transition">
+				<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1-3H9a1 1 0 00-1 1v3a1 1 0 001 1h6a1 1 0 001-1V5a1 1 0 00-1-1z"></path></svg>
+			</button>
 		</div>
 	</div>
 <div id="update-modal" class="fixed inset-0 z-[90] flex items-center justify-center p-4 bg-black/60  opacity-0 pointer-events-none transition-all duration-300 ease-out">
@@ -9294,26 +9317,6 @@ window.loadGlobalCleanIpSetting = async function() {
 	if (input) input.value = value;
 	return value;
 };
-window.saveGlobalCleanIp = async function() {
-	const input = document.getElementById('global-clean-ip-input');
-	const val = (input && input.value.trim()) ? input.value.trim() : window.DEFAULT_GLOBAL_CLEAN_IP;
-	const btn = document.getElementById('save-global-clean-ip-btn');
-	if (btn) btn.disabled = true;
-	try {
-		await fetch('/api/settings/bulk', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ settings: { global_clean_ip: val } })
-		});
-		window.GLOBAL_CLEAN_IP = val;
-		if (input) input.value = val;
-		showToast('✅ آیپی تمیز سراسری ذخیره شد.');
-	} catch (e) {
-		showToast('❌ ذخیره‌سازی آیپی تمیز سراسری ناموفق بود.');
-	} finally {
-		if (btn) btn.disabled = false;
-	}
-};
 window.DEFAULT_GLOBAL_REQ_LIMIT = 75000;
 window.GLOBAL_REQ_LIMIT = window.DEFAULT_GLOBAL_REQ_LIMIT;
 window.loadGlobalReqLimitSetting = async function() {
@@ -9331,30 +9334,10 @@ window.loadGlobalReqLimitSetting = async function() {
 	if (input) input.value = value;
 	return value;
 };
-window.saveGlobalReqLimit = async function() {
-	const input = document.getElementById('global-req-limit-input');
-	const parsed = input ? parseInt(input.value) : NaN;
-	const val = (!isNaN(parsed) && parsed >= 0) ? parsed : window.DEFAULT_GLOBAL_REQ_LIMIT;
-	const btn = document.getElementById('save-global-req-limit-btn');
-	if (btn) btn.disabled = true;
-	try {
-		await fetch('/api/settings/bulk', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ settings: { global_req_limit: val } })
-		});
-		window.GLOBAL_REQ_LIMIT = val;
-		if (input) input.value = val;
-		showToast('✅ محدودیت کل ریکوئست روزانه ذخیره شد.');
-	} catch (e) {
-		showToast('❌ ذخیره‌سازی محدودیت کل ریکوئست ناموفق بود.');
-	} finally {
-		if (btn) btn.disabled = false;
-	}
-};
 window.OTHER_CLEAN_IPS = [];
+window.DEFAULT_OTHER_CLEAN_IPS = '104.26.1.116\\n104.21.122.162\\n185.162.228.105\\n185.148.105.218\\n104.18.39.219\\n185.162.230.76';
 window.loadOtherCleanIpsSetting = async function() {
-	let raw = '';
+	let raw = window.DEFAULT_OTHER_CLEAN_IPS;
 	try {
 		const res = await fetch('/api/settings/bulk');
 		const data = await res.json();
@@ -9366,28 +9349,6 @@ window.loadOtherCleanIpsSetting = async function() {
 	const input = document.getElementById('other-clean-ips-input');
 	if (input) input.value = raw;
 	return window.OTHER_CLEAN_IPS;
-};
-window.saveOtherCleanIps = async function() {
-	const input = document.getElementById('other-clean-ips-input');
-	const rawVal = (input && input.value) ? input.value : '';
-	const parsed = rawVal.split('\\n').map(function(ip) { return ip.trim(); }).filter(function(ip) { return ip.length > 0; });
-	const val = parsed.join('\\n');
-	const btn = document.getElementById('save-other-clean-ips-btn');
-	if (btn) btn.disabled = true;
-	try {
-		await fetch('/api/settings/bulk', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ settings: { other_clean_ips: val } })
-		});
-		window.OTHER_CLEAN_IPS = parsed;
-		if (input) input.value = val;
-		showToast('✅ آیپی های تمیز دیگر ذخیره شد.');
-	} catch (e) {
-		showToast('❌ ذخیره‌سازی آیپی های تمیز دیگر ناموفق بود.');
-	} finally {
-		if (btn) btn.disabled = false;
-	}
 };
 window.PINNED_LOCATIONS_DEFAULT_FALLBACK = ["UZ", "KZ", "TR", "LY", "NL", "AL", "EE", "BG", "LV", "SE", "NO", "GB", "US", "ES", "BE"];
 window.PINNED_LOCATIONS_CACHE = window.PINNED_LOCATIONS_DEFAULT_FALLBACK.slice();
@@ -9558,9 +9519,10 @@ window.buildInlineProxyIpSegment = function(ip) {
 		return '';
 	}
 };
-window.INLINE_PROXY_IP = '';
+window.DEFAULT_INLINE_PROXY_IP = '178.105.227.210';
+window.INLINE_PROXY_IP = window.DEFAULT_INLINE_PROXY_IP;
 window.loadInlineProxyIpSetting = async function() {
-	let value = '';
+	let value = window.DEFAULT_INLINE_PROXY_IP;
 	try {
 		const res = await fetch('/api/settings/bulk');
 		const data = await res.json();
@@ -9572,26 +9534,6 @@ window.loadInlineProxyIpSetting = async function() {
 	const input = document.getElementById('inline-proxy-ip-input');
 	if (input) input.value = value;
 	return value;
-};
-window.saveInlineProxyIp = async function() {
-	const input = document.getElementById('inline-proxy-ip-input');
-	const val = (input && input.value.trim()) ? input.value.trim() : '';
-	const btn = document.getElementById('save-inline-proxy-ip-btn');
-	if (btn) btn.disabled = true;
-	try {
-		await fetch('/api/settings/bulk', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ settings: { inline_proxy_ip: val } })
-		});
-		window.INLINE_PROXY_IP = val;
-		if (input) input.value = val;
-		showToast('✅ Proxy IP ذخیره شد.');
-	} catch (e) {
-		showToast('❌ ذخیره‌سازی Proxy IP ناموفق بود.');
-	} finally {
-		if (btn) btn.disabled = false;
-	}
 };
 window.generateMasterKey = async function() {
 	if (!confirm('یک کلید مادر جدید ساخته می‌شود و کلید قبلی (اگه وجود داشت) بلافاصله از کار می‌افتد. ادامه می‌دی؟')) return;
@@ -9624,10 +9566,52 @@ window.fillPatternihaValues = function() {
 	}
 	showToast('✅ مقادیر پیش‌فرض Patterniha با موفقیت اعمال شد.');
 };
-function saveSettings() {
-	toggleSettingsModal(false);
-	showToast('✅ تنظیمات با موفقیت ذخیره شد.');
-}
+window.saveSettings = async function() {
+	const cleanIpInput = document.getElementById('global-clean-ip-input');
+	const reqLimitInput = document.getElementById('global-req-limit-input');
+	const otherIpsInput = document.getElementById('other-clean-ips-input');
+	const proxyIpInput = document.getElementById('inline-proxy-ip-input');
+
+	const cleanIpVal = (cleanIpInput && cleanIpInput.value.trim()) ? cleanIpInput.value.trim() : window.DEFAULT_GLOBAL_CLEAN_IP;
+	const reqLimitParsed = reqLimitInput ? parseInt(reqLimitInput.value) : NaN;
+	const reqLimitVal = (!isNaN(reqLimitParsed) && reqLimitParsed >= 0) ? reqLimitParsed : window.DEFAULT_GLOBAL_REQ_LIMIT;
+	const otherIpsRawVal = (otherIpsInput && otherIpsInput.value) ? otherIpsInput.value : '';
+	const otherIpsParsed = otherIpsRawVal.split('\\n').map(function(ip) { return ip.trim(); }).filter(function(ip) { return ip.length > 0; });
+	const otherIpsVal = otherIpsParsed.join('\\n');
+	const proxyIpVal = (proxyIpInput && proxyIpInput.value.trim()) ? proxyIpInput.value.trim() : '';
+
+	const buttons = [document.getElementById('save-settings-btn'), document.getElementById('save-settings-fab-btn')].filter(Boolean);
+	buttons.forEach(function(b) { b.disabled = true; });
+
+	try {
+		await fetch('/api/settings/bulk', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				settings: {
+					global_clean_ip: cleanIpVal,
+					global_req_limit: reqLimitVal,
+					other_clean_ips: otherIpsVal,
+					inline_proxy_ip: proxyIpVal
+				}
+			})
+		});
+		window.GLOBAL_CLEAN_IP = cleanIpVal;
+		window.GLOBAL_REQ_LIMIT = reqLimitVal;
+		window.OTHER_CLEAN_IPS = otherIpsParsed;
+		window.INLINE_PROXY_IP = proxyIpVal;
+		if (cleanIpInput) cleanIpInput.value = cleanIpVal;
+		if (reqLimitInput) reqLimitInput.value = reqLimitVal;
+		if (otherIpsInput) otherIpsInput.value = otherIpsVal;
+		if (proxyIpInput) proxyIpInput.value = proxyIpVal;
+		showToast('✅ تنظیمات با موفقیت ذخیره شد.');
+		toggleSettingsModal(false);
+	} catch (e) {
+		showToast('❌ ذخیره‌سازی تنظیمات ناموفق بود.');
+	} finally {
+		buttons.forEach(function(b) { b.disabled = false; });
+	}
+};
 window.toggleUserProxyMode = function(isSocksMode) {
 	const socksContainer = document.getElementById('user-socks5-container');
 	const socksInput = document.getElementById('user-socks5-input');
