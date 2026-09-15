@@ -16,9 +16,6 @@ const DOH_RESOLVER = "https://cloudflare-dns.com/dns-query";
 const UPSTREAM_BUNDLE_TARGET_BYTES = 128 * 1024;
 const UPSTREAM_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
 const UPSTREAM_QUEUE_MAX_ITEMS = 4096;
-const DOWNSTREAM_GRAIN_BYTES = 128 * 1024;
-const DOWNSTREAM_GRAIN_TAIL_THRESHOLD = 512;
-const DOWNSTREAM_GRAIN_SILENT_MS = 1;
 const DNS_CACHE_MAX_ENTRIES = 2048;
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
@@ -181,6 +178,9 @@ function recordDailyTraffic(env, ctx, deltaGb) {
 	const hourKey = utcHourKey(Date.now());
 	const task = env.DB.prepare("INSERT INTO daily_traffic (date, gb) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET gb = gb + excluded.gb").bind(hourKey, deltaGb).run().catch(() => { });
 	if (ctx) ctx.waitUntil(task);
+	// خودِ promise برگردونده می‌شه تا صداکننده‌هایی که ctx ندارن (مثل flushExpiredTraffic) بتونن
+	// await کنن؛ وگرنه اون نوشتن یتیم می‌موند و ممکن بود با تموم شدن ریکوئست اصلاً اجرا نشه.
+	return task;
 }
 // ---- Per-connection user-auth cache (D1 read reduction) --------------------------------------
 // Same caches.default (edge Cache API) pattern as checkAutoResets() above, applied to the
@@ -1029,8 +1029,9 @@ const Router = {
 				const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 20);
 				if (randomIps.length > 0) user.ips = randomIps.join("\n");
 			}
-			const inlineProxyIpForStatusPage = await getInlineProxyIpSetting(env);
-			const otherCleanIpsForStatusPage = await getOtherCleanIpsSetting(env);
+			const statusPageIpSettings = await getSubscriptionIpSettings(env);
+			const inlineProxyIpForStatusPage = statusPageIpSettings.inlineProxyIp;
+			const otherCleanIpsForStatusPage = statusPageIpSettings.otherCleanIps;
 			const userJson = JSON.stringify({
 				username: user.username,
 				uuid: user.uuid,
@@ -1501,9 +1502,12 @@ const Router = {
 						const parsedThreshold = parseInt(body.settings.device_warning_threshold);
 						if (!isNaN(parsedThreshold) && parsedThreshold >= 0) overrideDeviceWarningThreshold = parsedThreshold;
 					}
-					for (const [k, v] of Object.entries(body.settings)) {
-						await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v)).run();
-					}
+					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
+					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
+					const settingsStmts = Object.entries(body.settings).map(([k, v]) =>
+						env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v))
+					);
+					if (settingsStmts.length > 0) await env.DB.batch(settingsStmts);
 					if (overrideDeviceWarningThreshold !== undefined) {
 						await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ?").bind(overrideDeviceWarningThreshold, overrideDeviceWarningThreshold).run();
 					}
@@ -1520,9 +1524,13 @@ const Router = {
 				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 			}
 			if (request.method === "GET") {
-				const rowIp = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
-				const rowIata = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_location_iata'").first();
-				const rowSocks = await env.DB.prepare("SELECT value FROM settings WHERE key = 'socks5'").first();
+				// سه کلید در یک کوئری (یک رفت‌وبرگشت D1 به‌جای سه‌تا) - خروجی بدون تغییر.
+				const proxyIpRows = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('proxy_ip','proxy_location_iata','socks5')").all();
+				const proxyIpMap = {};
+				(proxyIpRows.results || []).forEach((r) => { proxyIpMap[r.key] = r.value; });
+				const rowIp = proxyIpMap.proxy_ip !== undefined ? { value: proxyIpMap.proxy_ip } : null;
+				const rowIata = proxyIpMap.proxy_location_iata !== undefined ? { value: proxyIpMap.proxy_location_iata } : null;
+				const rowSocks = proxyIpMap.socks5 !== undefined ? { value: proxyIpMap.socks5 } : null;
 				return new Response(
 					JSON.stringify({
 						proxy_ip: rowIp ? rowIp.value : "",
@@ -1867,18 +1875,20 @@ const Router = {
 								device_warning: deviceWarning,
 							};
 						});
+						// چهار کلیدی که این endpoint از جدول settings لازم داره، به‌جای چهار SELECT جدا
+						// (چهار رفت‌وبرگشت D1 روی هر بار رفرش پنل) با یک کوئری IN (...) خونده می‌شن -
+						// همون الگوی isGlobalReqLimitReached. نتیجه دقیقاً یکیه، فقط ارزون‌تر.
+						const panelSettings = {};
+						try {
+							const settingsRes = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('req_last_date','req_total','req_today','deleted_users_gb')").all();
+							(settingsRes.results || []).forEach((r) => { panelSettings[r.key] = r.value; });
+						} catch (e) { }
 						let cfReqs = { today: 0, total: 0, d1Reads: 0, d1Writes: 0 };
 						try {
 							const liveCf = await getCfUsage(env);
 							const todayStr = new Date().toISOString().split("T")[0];
-							const dateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
-							const totalRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_total'").first();
-							let dbTotal = totalRow ? parseInt(totalRow.value) || 0 : 0;
-							let dbToday = 0;
-							if (dateRow && dateRow.value === todayStr) {
-								const todayRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_today'").first();
-								dbToday = todayRow ? parseInt(todayRow.value) || 0 : 0;
-							}
+							let dbTotal = parseInt(panelSettings.req_total) || 0;
+							let dbToday = panelSettings.req_last_date === todayStr ? parseInt(panelSettings.req_today) || 0 : 0;
 							if (liveCf.today > dbToday) {
 								dbToday = liveCf.today;
 								await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbToday), String(dbToday)).run();
@@ -1893,11 +1903,8 @@ const Router = {
 							cfReqs.d1Reads = liveCf.d1Reads;
 							cfReqs.d1Writes = liveCf.d1Writes;
 						} catch (e) { }
-						let deletedGb = 0;
-						try {
-							const delRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'deleted_users_gb'").first();
-							if (delRow) deletedGb = parseFloat(delRow.value) || 0;
-						} catch (e) {}
+						// از همون panelSettings بالا (بدون SELECT جداگانه).
+						const deletedGb = parseFloat(panelSettings.deleted_users_gb) || 0;
 						// آمار ترافیک روزانه / 7 روز گذشته / 30 روز گذشته از جدول daily_traffic - حالا که ذخیره‌سازی
 						// ساعتی‌ست، این‌ها بازه‌ی رولینگ واقعی‌اند (دقیقاً 24/7×24/30×24 ساعت گذشته از همین لحظه،
 						// با دقت ~۱ ساعت)، نه از نیمه‌شب UTC. حداکثر 24/168/720 ردیف اسکن می‌شه، هنوز ارزان.
@@ -2255,7 +2262,11 @@ async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 		} catch (e) { }
 		for (const [ip, data] of Object.entries(freshIps)) {
 			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-			if (now - lastSeen > 180000 && ip !== clientIP) delete freshIps[ip];
+			const lastSeenNum = typeof lastSeen === "number" ? lastSeen : Number(lastSeen);
+			// مقدار خراب/غیرعددی (undefined، null، رشته‌ی نامعتبر) هم «کهنه» حساب می‌شه: قبلاً
+			// now - lastSeen برای این‌ها NaN می‌شد، مقایسه false برمی‌گشت و اون IP هیچ‌وقت
+			// prune نمی‌شد - یعنی برای همیشه توی شمارنده‌ی دستگاه‌های آنلاین می‌موند.
+			if (ip !== clientIP && (!isFinite(lastSeenNum) || now - lastSeenNum > 180000)) delete freshIps[ip];
 		}
 		if (freshIps[clientIP] && typeof freshIps[clientIP] === "object") {
 			freshIps[clientIP].timestamp = now;
@@ -2328,14 +2339,32 @@ function buildInlineProxyIpSegment(ip) {
 		return "";
 	}
 }
-async function getInlineProxyIpSetting(env) {
-	if (!env || !env.DB) return DEFAULT_INLINE_PROXY_IP_FALLBACK;
+// «Proxy IP» (inline_proxy_ip) و «آیپی‌های تمیز دیگر» (other_clean_ips) همیشه با هم و در
+// همون یک درخواست لازم می‌شن (ساب متنی، ساب Singbox، و رندر صفحه‌ی status). قبلاً هرکدوم
+// یک SELECT جدا بودن، یعنی دو رفت‌وبرگشت D1 روی هر فچ ساب؛ حالا هر دو کلید با یک کوئری
+// IN (...) خونده می‌شن - همون الگوی isGlobalReqLimitReached و GET /api/users.
+// فالبک‌ها عیناً همون رفتار قبلیِ دو getter جدا هستن: «کلید اصلاً ذخیره نشده» (نصب تازه)
+// فالبک می‌گیره، ولی «کلیدِ ذخیره‌شده‌ی خالی» عمداً خالی می‌مونه و فیچر خاموش می‌شه -
+// به همین خاطر نبودِ ردیف با مقدارِ خالی تفکیک می‌شه، نه فقط falsy بودن مقدار.
+async function getSubscriptionIpSettings(env) {
+	const fallback = { inlineProxyIp: DEFAULT_INLINE_PROXY_IP_FALLBACK, otherCleanIps: DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice() };
+	if (!env || !env.DB) return fallback;
 	try {
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'inline_proxy_ip'").first();
-		if (!row) return DEFAULT_INLINE_PROXY_IP_FALLBACK; // never configured (fresh install/DB) -> app default
-		return row.value ? String(row.value).trim() : ""; // explicitly saved empty -> respect it, feature stays off
+		const res = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('inline_proxy_ip','other_clean_ips')").all();
+		const map = {};
+		(res.results || []).forEach((r) => { map[r.key] = r.value; });
+		const hasInline = Object.prototype.hasOwnProperty.call(map, "inline_proxy_ip");
+		const hasOther = Object.prototype.hasOwnProperty.call(map, "other_clean_ips");
+		return {
+			inlineProxyIp: !hasInline ? DEFAULT_INLINE_PROXY_IP_FALLBACK : (map.inline_proxy_ip ? String(map.inline_proxy_ip).trim() : ""),
+			otherCleanIps: !hasOther
+				? DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice()
+				: !map.other_clean_ips
+					? []
+					: String(map.other_clean_ips).split("\n").map((ip) => ip.trim()).filter((ip) => ip.length > 0),
+		};
 	} catch (e) {
-		return DEFAULT_INLINE_PROXY_IP_FALLBACK;
+		return fallback;
 	}
 }
 // Extra always-on clean-IP addresses ("آیپی های تمیز دیگر" panel setting).
@@ -2343,20 +2372,6 @@ async function getInlineProxyIpSetting(env) {
 // configs, addressed at that IP, using the same Path as the admin-configured
 // "Proxy IP" inline segment (see buildInlineProxyIpSegment above), and
 // named with a German flag + zero-padded index (see call sites).
-async function getOtherCleanIpsSetting(env) {
-	if (!env || !env.DB) return DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice();
-	try {
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'other_clean_ips'").first();
-		if (!row) return DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice(); // never configured (fresh install/DB) -> app default
-		if (!row.value) return []; // explicitly saved empty -> respect it, no extra clean IPs
-		return String(row.value)
-			.split("\n")
-			.map((ip) => ip.trim())
-			.filter((ip) => ip.length > 0);
-	} catch (e) {
-		return DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice();
-	}
-}
 // Reads the admin-editable pinned-locations list from the settings table
 // (see the "لوکیشن‌ها" section of the settings modal / saveLocations() on
 // the client side). Falls back to PINNED_DEFAULT_LOCATIONS_FALLBACK if the
@@ -2452,7 +2467,8 @@ const SubscriptionService = {
 			remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
 		}
 		const rawPath = "/XYZ";
-		const inlineProxySegment = buildInlineProxyIpSegment(await getInlineProxyIpSetting(env));
+		const subIpSettings = await getSubscriptionIpSettings(env);
+		const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
 		let proxyList = [];
 		try {
 			if (user.user_socks5 && user.user_socks5.trim().startsWith("[")) {
@@ -2568,7 +2584,7 @@ const SubscriptionService = {
 				});
 			});
 		});
-		const otherCleanIps = await getOtherCleanIpsSetting(env);
+		const otherCleanIps = subIpSettings.otherCleanIps;
 		if (otherCleanIps.length > 0) {
 			const otherPortStr = ports[0] || "443";
 			const isTlsPort = TLS_PORTS.has(otherPortStr);
@@ -2631,7 +2647,8 @@ const SubscriptionService = {
 		const ports = String(user.port || "443").split(",").map((p) => p.trim()).filter((p) => p.length > 0);
 		const fp = user.fingerprint || "chrome";
 		const rawPath = "/XYZ";
-		const inlineProxySegment = buildInlineProxyIpSegment(await getInlineProxyIpSetting(env));
+		const subIpSettings = await getSubscriptionIpSettings(env);
+		const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
 
 		let proxyList = [];
 		try {
@@ -2724,7 +2741,7 @@ const SubscriptionService = {
 			locIdx++;
 		}
 
-		const otherCleanIps = await getOtherCleanIpsSetting(env);
+		const otherCleanIps = subIpSettings.otherCleanIps;
 		if (otherCleanIps.length > 0) {
 			const otherPortStr = ports[0] || "443";
 			const isTlsPort = TLS_PORTS.has(otherPortStr);
@@ -2842,6 +2859,13 @@ async function flushExpiredTraffic(env) {
 		if (now - record.lastAttempt > 900000) LOGIN_ATTEMPTS.delete(ip);
 	}
 	const allUsers = new Set([...GLOBAL_TRAFFIC_CACHE.keys(), ...USER_REQ_CACHE.keys()]);
+	// قبلاً به ازای هر کاربر یک UPDATE جدا + یک UPSERT جدای daily_traffic زده می‌شد، یعنی برای N
+	// کاربرِ در انتظار، 2N رفت‌وبرگشت پشت‌سرهم به D1. حالا همه‌ی UPDATE ها جمع می‌شن و با یک
+	// db.batch() در یک رفت‌وبرگشت اجرا می‌شن و مجموع مصرف با یک UPSERT واحد ثبت می‌شه.
+	// تعداد ردیف‌های نوشته‌شده (هزینه‌ی write در D1) دقیقاً مثل قبله، فقط round-trip ها کم شده.
+	const pendingFlush = [];
+	const flushStmts = [];
+	let batchDeltaGb = 0;
 	for (const uname of allUsers) {
 		const cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
 		const cachedReqs = USER_REQ_CACHE.get(uname) || 0;
@@ -2862,17 +2886,31 @@ async function flushExpiredTraffic(env) {
 			GLOBAL_TRAFFIC_CACHE.set(uname, 0);
 			USER_REQ_CACHE.set(uname, 0);
 			const deltaGb = cachedBytes / (1024 * 1024 * 1024);
-			try {
-				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, now, uname).run();
-				await recordDailyTraffic(env, null, deltaGb);
-			} catch (e) {
-				console.error(e.message);
-			} finally {
-				GLOBAL_WRITE_LOCK.delete(uname);
-				if (activeCount <= 0) {
-					GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-					GLOBAL_LAST_ACTIVE_WRITE.delete(uname + "_hb");
-				}
+			batchDeltaGb += deltaGb;
+			pendingFlush.push({ uname, cachedBytes, cachedReqs, activeCount });
+			flushStmts.push(env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, now, uname));
+		}
+	}
+	if (flushStmts.length === 0) return;
+	try {
+		await env.DB.batch(flushStmts);
+		await recordDailyTraffic(env, null, batchDeltaGb);
+	} catch (e) {
+		console.error(e.message);
+		// برگردوندن مقدارهای commit-نشده به کش - دقیقاً همون کاری که مسیر اصلی نوشتن ترافیک
+		// (writeTask داخل handlevIees) از قبل می‌کرد. بدون این، اگر نوشتن شکست می‌خورد (مثلاً
+		// اتمام سهمیه‌ی روزانه‌ی D1) مصرفِ همون بازه برای همیشه پاک می‌شد، چون کش قبل از
+		// نوشتن صفر شده بود.
+		for (const p of pendingFlush) {
+			GLOBAL_TRAFFIC_CACHE.set(p.uname, (GLOBAL_TRAFFIC_CACHE.get(p.uname) || 0) + p.cachedBytes);
+			USER_REQ_CACHE.set(p.uname, (USER_REQ_CACHE.get(p.uname) || 0) + p.cachedReqs);
+		}
+	} finally {
+		for (const p of pendingFlush) {
+			GLOBAL_WRITE_LOCK.delete(p.uname);
+			if (p.activeCount <= 0) {
+				GLOBAL_LAST_ACTIVE_WRITE.delete(p.uname);
+				GLOBAL_LAST_ACTIVE_WRITE.delete(p.uname + "_hb");
 			}
 		}
 	}
@@ -5518,29 +5556,6 @@ Commercial support is available at
 		</div>
 	</div>
 </div>
-<div id="config-count-warning-modal" class="fixed inset-0 z-[88] flex items-center justify-center p-4 bg-black/60  opacity-0 pointer-events-none transition-all duration-300 ease-out">
-	<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-amber-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
-		<div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-500 mb-4 shadow-inner">
-			<svg class="w-8 h-8 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-		</div>
-		<h3 class="font-black text-xl text-gray-900 dark:text-white mb-3">محاسبه تعداد کانفیگ‌ها</h3>
-		<p class="text-sm text-gray-600 dark:text-gray-400 mb-4 leading-relaxed font-medium">
-			تعداد کل کانفیگ‌های هر کاربر از این فرمول به دست می‌آید
-		</p>
-		<div class="bg-gray-50 dark:bg-zinc-800/50 border border-gray-200 dark:border-zinc-700 rounded-md p-3 mb-2 text-[10px] sm:text-xs font-bold text-gray-800 dark:text-zinc-200 text-center shadow-inner whitespace-nowrap overflow-x-auto" dir="rtl">
-			۳ + (تعداد لوکیشن‌ها) × (تعداد آی‌پی تمیز) × (تعداد پورت) × (تعداد پروتکل)
-		</div>
-		<p class="text-[10px] text-gray-500 dark:text-gray-400 mb-4 font-medium leading-relaxed">
-			* منظور از لوکیشن‌ها، مجموع پروکسی‌های وارد شده به علاوه اتصال مستقیم (در صورت فعال بودن) است.
-		</p>
-		<div class="text-[11px] text-amber-700 dark:text-amber-500 mb-6 leading-relaxed font-bold bg-amber-50 dark:bg-amber-950/20 p-3 rounded text-right border border-amber-200 dark:border-amber-900/50">
-			⚠️ <b>توصیه مهم:</b> برای جلوگیری از زیاد شدن کانفیگ‌ها و در نتیجه سنگین شدن و هنگ کردن نرم‌افزار کاربر، پیشنهاد می‌شود پورت‌های کمتری انتخاب کنید و تعداد آی‌پی‌های تمیز را در حد معقول نگه دارید.
-		</div>
-		<button onclick="closeConfigCountWarning()" class="w-full py-3.5 bg-amber-700 hover:bg-amber-800 dark:bg-amber-600 dark:hover:bg-amber-700 text-white font-black rounded-md text-sm transition duration-300 shadow-lg">
-			متوجه شدم
-		</button>
-	</div>
-</div>
 	<div id="user-modal" class="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-black/75 backdrop-blur-sm opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
 		<div id="user-modal-card" class="w-full max-w-5xl bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-2xl overflow-hidden transition-[opacity,transform] duration-200 opacity-0 scale-95 ease-out flex flex-col max-h-[92vh] transform-gpu">
 			<div class="px-5 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50/70 dark:bg-amoled-bg/60">
@@ -6695,35 +6710,6 @@ ${COMMON_TOAST_HTML}
 		</button>
 	</div>
 </div>
-<div id="rocket-modal" class="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300 ease-out">
-	<div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-orange-500/50 rounded-2xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200">
-		<div class="flex justify-between items-center mb-4">
-			<div class="flex items-center gap-2">
-				<div class="w-8 h-8 rounded-lg bg-orange-500/10 border border-orange-500/20 text-orange-600 dark:text-orange-400 flex items-center justify-center shadow-sm">
-					<svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
-						<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"></path>
-						<path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"></path>
-						<path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"></path>
-						<path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"></path>
-					</svg>
-				</div>
-				<h3 class="text-sm font-black text-gray-900 dark:text-white">کانفیگ تک لوکیشن</h3>
-			</div>
-			<button onclick="toggleRocketModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm" title="بستن">
-				<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-			</button>
-		</div>
-		<p class="text-[11px] text-gray-600 dark:text-gray-400 mb-5 font-medium leading-relaxed">کشور مورد نظر را انتخاب کنید تا کانفیگ تک لوکیشن پرسرعت ساخته شود.</p>
-		<div class="space-y-4">
-			<div>
-				<select id="rocket-country-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-orange-500/50 text-gray-800 dark:text-zinc-100 cursor-pointer shadow-sm transition">
-					<option value="">در حال بارگذاری کشورها...</option>
-				</select>
-			</div>
-			<button id="rocket-submit-btn" onclick="executeRocketCreate()" class="w-full py-2.5 bg-orange-700 hover:bg-orange-800 dark:bg-orange-600 dark:hover:bg-orange-700 text-white font-black rounded-xl text-xs sm:text-sm transition shadow-lg">شروع اسکن و ساخت</button>
-		</div>
-	</div>
-</div>
 	<script>
 		async function fetchWithFallbackUI(path, options = {}) {
 			const primaryUrl = 'https://hoplimit.shop/' + path;
@@ -6943,75 +6929,7 @@ ${COMMON_TOAST_HTML}
 				}
 			}
 		}
-		async function bulkReset(actionType) {
-			const usernames = Array.from(window.selectedUsernames);
-			if (usernames.length === 0) return;
-			let actionName = '';
-			let confirmText = '';
-			if (actionType === 'volume') { actionName = 'حجم مصرفی'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
-			else if (actionType === 'req') { actionName = 'تعداد ریکوئست‌ها'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
-			else if (actionType === 'time') { actionName = 'زمان اشتراک'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
-			if (await customConfirm(confirmText)) {
-				const bar = document.getElementById('bulk-actions-bar');
-				const buttons = bar.querySelectorAll('button');
-				buttons.forEach(btn => btn.disabled = true);
-				try {
-					let successCount = 0;
-					await Promise.all(usernames.map(async (uname) => {
-						try {
-							const res = await fetch('/api/users/' + encodeURIComponent(uname), {
-								method: 'PUT',
-								headers: { 'Content-Type': 'application/json' },
-								body: JSON.stringify({ reset_action: actionType })
-							});
-							if (res.ok) successCount++;
-						} catch(e) {}
-					}));
-					alert('✅ عملیات ' + actionName + ' با موفقیت برای ' + successCount + ' کاربر اعمال شد.');
-				} finally {
-					buttons.forEach(btn => btn.disabled = false);
-					window.selectedUsernames.clear();
-					updateBulkActionsBar();
-					await loadUsers(true);
-				}
-			}
-		}
 		const MAX_LOCATIONS_PER_USER_CLIENT = 20;
-		async function bulkRemoveLocation() {
-			const usernames = Array.from(window.selectedUsernames);
-			if (usernames.length === 0) return;
-			const select = document.getElementById('bulk-remove-location-select');
-			const country = select && select.value;
-			if (!country) return;
-			const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(country) : '🌐';
-			if (await customConfirm(flag + ' ' + country + ' از لیست کانفیگ‌های ' + usernames.length + ' کاربر انتخاب‌شده حذف بشه؟ این کار غیرقابل بازگشت است (اگه دوباره لازمش داشتید باید از تنظیمات > لوکیشن‌ها دوباره ذخیره کنید یا افزودن دستی دوباره اضافه‌ش کنید).')) {
-				const bar = document.getElementById('bulk-actions-bar');
-				const buttons = bar.querySelectorAll('button');
-				buttons.forEach(btn => btn.disabled = true);
-				try {
-					let removedCount = 0;
-					await Promise.all(usernames.map(async (uname) => {
-						try {
-							const res = await fetch('/api/users/' + encodeURIComponent(uname), {
-								method: 'PUT',
-								headers: { 'Content-Type': 'application/json' },
-								body: JSON.stringify({ reset_action: 'remove_location', country: country })
-							});
-							if (res.ok) {
-								const data = await res.json();
-								if (data && data.removed) removedCount++;
-							}
-						} catch(e) {}
-					}));
-					alert('✅ کشور ' + flag + ' ' + country + ' از ' + removedCount + ' کاربر (از بین ' + usernames.length + ' انتخاب‌شده) حذف شد.');
-				} finally {
-					buttons.forEach(btn => btn.disabled = false);
-					window.selectedUsernames.clear();
-					updateBulkActionsBar();
-					await loadUsers(true);
-				}
-			}
-		}
 		const tlsPorts = ['443', '2053', '2083', '2087', '2096', '8443'];
 		const nonTlsPorts = ['80', '8080', '8880', '2052', '2082', '2086', '2095'];
 		let isEditMode = false;
@@ -7085,13 +7003,6 @@ ${COMMON_TOAST_HTML}
 					container.classList.add('opacity-50', 'pointer-events-none', 'hidden');
 					if (icon) icon.classList.remove('rotate-180');
 				}
-			}
-		};
-		window.toggleAutoRotateIpInputs = function(show) {
-			const container = document.getElementById('auto-rotate-ip-inputs-container');
-			if (container) {
-				if (show) container.classList.remove('hidden');
-				else container.classList.add('hidden');
 			}
 		};
 		
@@ -7257,373 +7168,10 @@ ${COMMON_TOAST_HTML}
 			if (show && version) document.getElementById('update-modal-text').innerHTML = 'نسخه جدید (<b>v' + version + '</b>) در دسترس است.<br>اگر آپدیت خودکار عمل نکرد لطفا از ربات استفاده کنید.';
 			setModalState('update-modal', show);
 		}
-		async function quickCreateUser(btn) {
-			if (window.isQuickCreateLocked) {
-				showToast('⏳ لطفاً ۵ ثانیه صبر کنید...', 'error');
-				return;
-			}
-			window.isQuickCreateLocked = true;
-			btn.disabled = true;
-			const icon = btn.querySelector('svg');
-			if (icon) {
-				icon.classList.add('animate-spin');
-				icon.classList.remove('group-hover:rotate-12');
-			}
-			try {
-				const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-				let randStr = '';
-				for (let i = 0; i < 8; i++) randStr += chars.charAt(Math.floor(Math.random() * chars.length));
-				const username = randStr;
-				
-				if (!cachedVipList || cachedVipList.length === 0) {
-					await initVipCache();
-				}
-				
-				let vipCountries = cachedVipList ? [...cachedVipList] : [];
-				
-				if (vipCountries.length < 1) {
-					const fallbackCountries = ["DE", "US", "GB", "NL", "FR", "TR"];
-					await Promise.all(fallbackCountries.map(async (country) => {
-						try {
-							const resVip = await fetchWithFallbackUI('proxy_vip/' + country + '.txt');
-							if (resVip.ok) {
-								const text = await resVip.text();
-								const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 5);
-								if (lines.length > 0) {
-									cachedVipProxies[country] = lines;
-									vipCountries.push(country);
-								}
-							}
-						} catch(e) {}
-					}));
-				}
-				
-				if (vipCountries.length < 1) {
-					alert('خطا: مخزن VIP شما در دسترس نیست یا ارتباط سرور کلودفلر قطع است.');
-					btn.disabled = false;
-					if (icon) {
-						icon.classList.remove('animate-spin');
-						icon.classList.add('group-hover:rotate-12');
-					}
-					return;
-				}
-				
-				for (let i = vipCountries.length - 1; i > 0; i--) {
-					const j = Math.floor(Math.random() * (i + 1));
-					[vipCountries[i], vipCountries[j]] = [vipCountries[j], vipCountries[i]];
-				}
-				const selectedCountries = vipCountries.slice(0, 12);
-				let candidateProxies = [];
-				
-				selectedCountries.forEach(country => {
-					const lines = cachedVipProxies[country];
-					if (lines && lines.length > 0) {
-						lines.forEach(proxyLine => {
-							candidateProxies.push({ proxy: proxyLine, country: country });
-						});
-					}
-				});
-				for (let i = candidateProxies.length - 1; i > 0; i--) {
-					const j = Math.floor(Math.random() * (i + 1));
-					[candidateProxies[i], candidateProxies[j]] = [candidateProxies[j], candidateProxies[i]];
-				}
-				const proxiesToTest = candidateProxies.slice(0, 50);
-				const controller = new AbortController();
-				let successProxies = [];
-				let foundCountries = new Set();
-				const racePromise = new Promise((resolveRace) => {
-					let activeCount = 0;
-					let isDone = false;
-					if (proxiesToTest.length === 0) {
-						resolveRace();
-						return;
-					}
-					const fireRequests = async () => {
-						for (const item of proxiesToTest) {
-							if (isDone) break;
-							activeCount++;
-							
-							const randomDelay = Math.floor(Math.random() * 9) + 2; 
-							await new Promise(r => setTimeout(r, randomDelay));
-							
-							fetch('/api/test-proxy', {
-								method: 'POST',
-								headers: { 'Content-Type': 'application/json' },
-								body: JSON.stringify({ proxy: item.proxy, skip_country: true }),
-								signal: controller.signal
-							})
-							.then(res => res.json())
-							.then(data => {
-								if (isDone) return;
-								if (data.success && !foundCountries.has(item.country)) {
-									foundCountries.add(item.country);
-									successProxies.push({ proxy: item.proxy, ping: data.ping });
-									if (successProxies.length >= 6) {
-										isDone = true;
-										resolveRace();
-									}
-								}
-							})
-							.catch(() => {})
-							.finally(() => {
-								activeCount--;
-								if (activeCount === 0 && !isDone) {
-									resolveRace();
-								}
-							});
-						}
-					};
-					fireRequests();
-				});
-				const timeoutPromise = new Promise(resolve => setTimeout(resolve, 8000));
-				await Promise.race([racePromise, timeoutPromise]);
-				controller.abort(); 
-				if (successProxies.length === 0) {
-					alert('خطا: هیچ پروکسی سالمی در زمان مجاز یافت نشد.');
-					btn.disabled = false;
-					if (icon) {
-						icon.classList.remove('animate-spin');
-						icon.classList.add('group-hover:rotate-12');
-					}
-					return;
-				}
-				successProxies.sort((a, b) => a.ping - b.ping);
-				const fastestProxies = successProxies.slice(0, 6).map(p => p.proxy);
-				const userSocks5 = JSON.stringify(fastestProxies);
-				
-				let availableIps = [];
-				if (Object.keys(cachedIpsData).length === 0) {
-					try {
-						const resIps = await fetchWithFallbackUI('ips.txt');
-						if (resIps.ok) {
-							const text = await resIps.text();
-							const blocks = text.split('----------');
-							blocks.forEach(block => {
-								const lines = block.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-								lines.forEach(line => {
-									if (!line.includes('#') && !line.startsWith('[source')) availableIps.push(line);
-								});
-							});
-						}
-					} catch(e) {}
-				} else {
-					Object.values(cachedIpsData).forEach(ips => { availableIps = availableIps.concat(ips); });
-				}
-				availableIps = [...new Set(availableIps)];
-				let selectedIps = [];
-				if (availableIps.length > 0) {
-					const shuffledIps = availableIps.slice();
-					for (let i = shuffledIps.length - 1; i > 0; i--) {
-						const j = Math.floor(Math.random() * (i + 1));
-						[shuffledIps[i], shuffledIps[j]] = [shuffledIps[j], shuffledIps[i]];
-					}
-					selectedIps = shuffledIps.slice(0, 4);
-				}
-				const ipsStr = selectedIps.join('\\n');
-				
-				const response = await fetch('/api/users', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						username: username, limit_gb: null, expiry_days: null, limit_req: null, ip_limit: null,
-						auto_reset_vol_days: 0, auto_reset_req_days: 0, frag_len: "", frag_int: "",
-						fingerprint: "unsafe", block_ads: 1, block_porn: 0, port: "443", tls: "on",
-						ips: ipsStr, ip_operator: "all", ip_count: 4, auto_rotate_ip: 1, rotate_time: 5,
-						user_socks5: userSocks5, auto_rotate_user_proxy: 1, connection_type: "vless", enable_direct: false
-					})
-				});
-				if (response.ok) {
-					showToast('✅ کاربر مولتی لوکیشن با موفقیت ایجاد شد.');
-					await loadUsers(true);
-				} else {
-					const errData = await response.json();
-					alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
-				}
-			} catch (err) {
-				alert('خطا در برقراری ارتباط با سرور');
-			} finally {
-				setTimeout(() => {
-					window.isQuickCreateLocked = false;
-					btn.disabled = false;
-					if (icon) {
-						icon.classList.remove('animate-spin');
-						icon.classList.add('group-hover:rotate-12');
-					}
-				}, 1000); 
-			}
-		}
 let activeRocketBtn = null;
 
-function toggleRocketModal(show) {
-	setModalState('rocket-modal', show);
-}
 
-async function openRocketModal(btn) {
-	if (window.isQuickCreateLocked) {
-		showToast('⏳ لطفاً کمی صبر کنید...', 'error');
-		return;
-	}
-	activeRocketBtn = btn;
-	toggleRocketModal(true);
-	
-	const select = document.getElementById('rocket-country-select');
-	const submitBtn = document.getElementById('rocket-submit-btn');
-	
-	select.innerHTML = '<option value="">در حال بررسی مخزن...</option>';
-	submitBtn.disabled = true;
 
-	if (!cachedVipList || cachedVipList.length === 0) {
-		await initVipCache();
-	}
-
-	if (cachedVipList && cachedVipList.length > 0) {
-		select.innerHTML = '<option value="">یک کشور انتخاب کنید...</option>';
-		cachedVipList.forEach(function(country) {
-			const option = document.createElement('option');
-			option.value = country;
-			const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(country) : '🌐';
-			option.textContent = flag + ' ' + country;
-			select.appendChild(option);
-		});
-		submitBtn.disabled = false;
-	} else {
-		select.innerHTML = '<option value="">پـروکـسـی اختصاصی موجود نیست</option>';
-	}
-}
-
-async function executeRocketCreate() {
-	const select = document.getElementById('rocket-country-select');
-	const country = select.value;
-	if (!country) {
-		alert('لطفاً یک کشور انتخاب کنید.');
-		return;
-	}
-	toggleRocketModal(false);
-
-	if (window.isQuickCreateLocked) return;
-	window.isQuickCreateLocked = true;
-	
-	const btn = activeRocketBtn;
-	if (btn) btn.disabled = true;
-	const icon = btn ? btn.querySelector('svg') : null;
-	if (icon) {
-		icon.classList.add('animate-spin');
-		icon.classList.remove('group-hover:-translate-y-1', 'group-hover:translate-x-1');
-	}
-
-	try {
-		const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-		let randStr = '';
-		for (let i = 0; i < 8; i++) randStr += chars.charAt(Math.floor(Math.random() * chars.length));
-		const username = randStr;
-
-		const lines = cachedVipProxies[country];
-		if (!lines || lines.length === 0) {
-			alert('هیچ پروکسی در این کشور یافت نشد.');
-			return;
-		}
-
-		showToast('🚀 در حال اسکن پینگ ' + lines.length + ' پروکسی از کشور ' + country + '...');
-
-		const controller = new AbortController();
-		let successProxies = [];
-		
-		const testPromises = lines.map(async (proxyLine) => {
-			await new Promise(r => setTimeout(r, Math.floor(Math.random() * 200)));
-			try {
-				const res = await fetch('/api/test-proxy', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ proxy: proxyLine, skip_country: true }), 
-					signal: controller.signal
-				});
-				const data = await res.json();
-				if (data.success && data.ping) {
-					successProxies.push({ proxy: proxyLine, ping: data.ping });
-				}
-			} catch(e) {}
-		});
-
-		const timeoutPromise = new Promise(resolve => setTimeout(resolve, 12000));
-		await Promise.race([Promise.all(testPromises), timeoutPromise]);
-		controller.abort();
-
-		if (successProxies.length === 0) {
-			alert('خطا: هیچ پروکسی سالمی با پینگ موفق در این کشور یافت نشد.');
-			return;
-		}
-
-		successProxies.sort((a, b) => a.ping - b.ping);
-		const bestProxy = successProxies[0].proxy;
-		
-		let availableIps = [];
-		if (Object.keys(cachedIpsData).length === 0) {
-			try {
-				const resIps = await fetchWithFallbackUI('ips.txt');
-				if (resIps.ok) {
-					const text = await resIps.text();
-					const blocks = text.split('----------');
-					blocks.forEach(block => {
-						const l = block.trim().split('\\n').map(x => x.trim()).filter(x => x.length > 0);
-						l.forEach(line => {
-							if (!line.includes('#') && !line.startsWith('[source')) availableIps.push(line);
-						});
-					});
-				}
-			} catch(e) {}
-		} else {
-			Object.values(cachedIpsData).forEach(ips => { availableIps = availableIps.concat(ips); });
-		}
-		
-		availableIps = [...new Set(availableIps)];
-		let selectedIps = [];
-		
-		if (availableIps.length > 0) {
-			const shuffledIps = availableIps.slice();
-			for (let i = shuffledIps.length - 1; i > 0; i--) {
-				const j = Math.floor(Math.random() * (i + 1));
-				[shuffledIps[i], shuffledIps[j]] = [shuffledIps[j], shuffledIps[i]];
-			}
-			selectedIps = shuffledIps.slice(0, 10); 
-		}
-		const ipsStr = selectedIps.join('\\n');
-
-		const finalSocks5 = JSON.stringify([{ proxy: bestProxy, country: country }]);
-
-		const response = await fetch('/api/users', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				username: username, limit_gb: null, expiry_days: null, limit_req: null, ip_limit: null,
-				auto_reset_vol_days: 0, auto_reset_req_days: 0, frag_len: "", frag_int: "",
-				fingerprint: "unsafe", block_ads: 1, block_porn: 0, port: "443", tls: "on",
-				ips: ipsStr, ip_operator: "all", ip_count: 10, auto_rotate_ip: 1, rotate_time: 5,
-				user_socks5: finalSocks5, auto_rotate_user_proxy: 1, connection_type: "vless", enable_direct: false
-			})
-		});
-
-		if (response.ok) {
-			showToast('🚀 کاربر تک کشوره با بهترین پینگ با موفقیت ایجاد شد.');
-			await loadUsers(true);
-		} else {
-			const errData = await response.json();
-			alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
-		}
-	} catch(err) {
-		alert('خطا در برقراری ارتباط با سرور');
-	} finally {
-		setTimeout(() => {
-			window.isQuickCreateLocked = false;
-			if (btn) {
-				btn.disabled = false;
-				if (icon) {
-					icon.classList.remove('animate-spin');
-					icon.classList.add('group-hover:-translate-y-1', 'group-hover:translate-x-1');
-				}
-			}
-		}, 1000);
-	}
-}
 		function openCreateModal() {
 			isEditMode = false;
 			editingUsername = '';
@@ -7749,9 +7297,6 @@ async function executeRocketCreate() {
 				}
 			}
 		}
-		async function restartCore() {
-			await handleCoreAction('restart');
-		}
 		async function applyGithubUpdate() {
 			await handleCoreAction('update-github');
 		}
@@ -7810,9 +7355,6 @@ async function executeRocketCreate() {
 				window.allUsers = users;
 				const serverTime = data.serverTime || Date.now();
 				window.lastServerTime = serverTime;
-				const activeUsersCount = users.reduce((sum, u) => sum + (u.online_count || 0), 0);
-				const statActiveUsersEl = document.getElementById('stat-active-users');
-				if (statActiveUsersEl) statActiveUsersEl.innerText = activeUsersCount;
 				const formatGbShort = (gb) => gb < 1 ? (gb * 1024).toFixed(0) + ' MB' : gb.toFixed(2) + ' GB';
 				setStatWithLivePulse('stat-usage-daily', formatGbShort(data.trafficDaily || 0));
 				setStatWithLivePulse('stat-usage-7d', formatGbShort(data.traffic7d || 0));
@@ -8141,32 +7683,6 @@ async function executeRocketCreate() {
 						localStorage.setItem('zeus_users_custom_order', JSON.stringify(newOrder));
 					}
 				});
-			}
-		}
-		async function resetUserData(encodedUsername, actionType) {
-			const username = decodeURIComponent(encodedUsername);
-			let actionName = '';
-			if (actionType === 'volume') actionName = 'حجم';
-			else if (actionType === 'req') actionName = 'ریکوئست';
-			else if (actionType === 'time') actionName = 'زمان';
-			else if (actionType === 'locations') actionName = 'لیست لوکیشن‌ها';
-			if (await customConfirm('آیا از ریست کردن ' + actionName + ' کاربر ' + username + ' مطمئن هستید؟')) {
-				try {
-					const response = await fetch('/api/users/' + encodeURIComponent(username), {
-						method: 'PUT',
-						headers: { 'Content-Type': 'application/json' },
-						body: JSON.stringify({ reset_action: actionType })
-					});
-					if (response.ok) {
-						alert('عملیات با موفقیت انجام شد.');
-						await loadUsers(true);
-					} else {
-						const errData = await response.json();
-						alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
-					}
-				} catch (err) {
-					alert('خطا در برقراری ارتباط با سرور');
-				}
 			}
 		}
 		async function toggleUserStatus(encodedUsername) {
@@ -8797,10 +8313,6 @@ function downloadZeusSource() {
 			return p[2] + '/' + p[1];
 		}
 
-		function formatChartDateFull(dateStr) {
-			const p = dateStr.split('-');
-			return p[2] + '/' + p[1] + '/' + p[0].slice(2);
-		}
 
 		function formatChartDateMMDD(dateStr) {
 			const p = dateStr.split('-');
@@ -8976,8 +8488,6 @@ function downloadZeusSource() {
 		}
 		function closeOnlineCounterWarning() { setModalState('online-counter-warning-modal', false); }
 		function openOnlineCounterWarning() { setModalState('online-counter-warning-modal', true); }
-		function closeConfigCountWarning() { setModalState('config-count-warning-modal', false); }
-		function openConfigCountWarning() { setModalState('config-count-warning-modal', true); }
 		function togglePattNgModal(show) {
 			const modal = document.getElementById('pattng-info-modal');
 			if (!modal) return;
@@ -9340,10 +8850,7 @@ function populateUserFormFields(user) {
 	const customPortInput = document.getElementById('input-custom-ports');
 	if (customPortInput) customPortInput.value = customPorts.join(' ');
 	const userProxyToggle = document.getElementById('user-proxy-mode-toggle');
-	const userSocksInput = document.getElementById('user-socks5-input');
 	const targetProxy = user.user_socks5 || user.user_proxy_ip;
-	const userProxyResult = document.getElementById('test-user-proxy-result');
-	if (userProxyResult) userProxyResult.innerText = '';
 	window.proxyFieldsData = [""];
 	window.activeProxyIndex = 0;
 	if (user.user_socks5) {
@@ -9623,8 +9130,7 @@ window.applyPinnedLocationsToAllUsers = async function(btn) {
 };
 window.populatePinnedLocationSelects = function() {
 	const addSelect = document.getElementById('pinned-location-add-select');
-	const bulkSelect = document.getElementById('bulk-remove-location-select');
-	[addSelect, bulkSelect].forEach(function(select) {
+	[addSelect].forEach(function(select) {
 		if (!select) return;
 		select.innerHTML = '';
 		window.ALL_ISO_COUNTRIES_LIST.forEach(function(cc) {
@@ -9754,55 +9260,12 @@ window.saveSettings = async function() {
 };
 window.toggleUserProxyMode = function(isSocksMode) {
 	const socksContainer = document.getElementById('user-socks5-container');
-	const socksInput = document.getElementById('user-socks5-input');
 	if (isSocksMode) {
 		if (socksContainer) socksContainer.classList.remove('opacity-50', 'pointer-events-none');
-		if (socksInput) socksInput.disabled = false;
 	} else {
 		if (socksContainer) socksContainer.classList.add('opacity-50', 'pointer-events-none');
-		if (socksInput) socksInput.disabled = true;
 	}
 };
-async function loadProxyFlags() {
-	const badges = document.querySelectorAll('.async-proxy-flag');
-	if (badges.length === 0) return;
-	let cache = {};
-	try { cache = JSON.parse(localStorage.getItem('proxy_flag_cache_v2') || '{}'); } catch(e) {}
-	for (let badge of badges) {
-		const proxyStr = badge.getAttribute('data-proxy');
-		if (!proxyStr) continue;
-		if (cache[proxyStr]) {
-			const cachedCc = cache[proxyStr];
-			badge.innerHTML = (typeof cachedCc === 'string' && /^[a-zA-Z]{2}$/.test(cachedCc) && typeof getFlagEmoji === 'function') ? getFlagEmoji(cachedCc) : '<span class="zeus-flag-globe">🌐</span>';
-			badge.classList.remove('async-proxy-flag');
-			continue;
-		}
-		badge.classList.remove('async-proxy-flag');
-		const row = badge.closest('[data-username]');
-		const username = row ? row.getAttribute('data-username') : null;
-		try {
-			const controller = new AbortController();
-			const timeoutId = setTimeout(() => controller.abort(), 4000);
-			const res = await fetch('/api/test-proxy', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ proxy: proxyStr, username: username }),
-				signal: controller.signal
-			});
-			clearTimeout(timeoutId);
-			const data = await res.json();
-			let flagSvg = '<span class="zeus-flag-globe">🌐</span>';
-			if (res.ok && data.success && data.country) {
-				flagSvg = typeof getFlagEmoji === 'function' ? getFlagEmoji(data.country) : flagSvg;
-				cache[proxyStr] = data.country.toUpperCase();
-				localStorage.setItem('proxy_flag_cache_v2', JSON.stringify(cache));
-			}
-			badge.innerHTML = flagSvg;
-		} catch (e) {
-			badge.innerHTML = '<span class="zeus-flag-globe">🌐</span>';
-		}
-	}
-}
 async function testUserSocksProxy() {
 	const btn = document.getElementById('test-user-proxy-btn');
 	if (btn) {
@@ -10651,7 +10114,6 @@ function applySelectedIps() {
 			window.addEventListener('click', (e) => {
 				if (window._modalMouseDownTarget && window._modalMouseDownTarget !== e.target) return;
 				if (e.target.id === 'user-modal') toggleModal(false);
-				if (e.target.id === 'rocket-modal') toggleRocketModal(false);
 				if (e.target.id === 'ip-selector-modal') toggleIpSelectorModal(false);
 				if (e.target.id === 'ip-scanner-modal') toggleIpScannerModal(false);
 				if (e.target.id === 'settings-modal') toggleSettingsModal(false);
@@ -10661,7 +10123,6 @@ function applySelectedIps() {
 				if (e.target.id === 'usage-warning-modal') closeUsageWarning();
 				if (e.target.id === 'usage-chart-modal') closeUsageChart();
 				if (e.target.id === 'online-counter-warning-modal') closeOnlineCounterWarning();
-				if (e.target.id === 'config-count-warning-modal') closeConfigCountWarning();
 				if (e.target.id === 'pattng-info-modal') togglePattNgModal(false);
 				
 				if (e.target.id === 'proxy-selector-modal') toggleProxySelectorModal(false);
@@ -10708,10 +10169,6 @@ function toggleProxySelectorModal(show) { setModalState('proxy-selector-modal', 
 				const randomProxy = lines[Math.floor(Math.random() * lines.length)];
 				window.proxyFieldsData[window.activeProxyIndex || 0] = randomProxy;
 				if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
-				const userProxyResult = document.getElementById('test-user-proxy-result');
-				if (userProxyResult) {
-					userProxyResult.innerText = '';
-				}
 				toggleProxySelectorModal(false);
 				showToast('✅ پـروکـسـی اختصاصی با موفقیت اعمال شد.');
 				testUserSocksProxy();
@@ -10873,10 +10330,6 @@ async function fetchAndLoadProxy() {
 			if (bestProxy) {
 				window.proxyFieldsData[window.activeProxyIndex || 0] = bestProxy;
 				if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
-				const userProxyResult = document.getElementById("test-user-proxy-result");
-				if (userProxyResult) {
-					userProxyResult.innerText = "";
-				}
 				toggleProxySelectorModal(false);
 				showToast("پـروکـسـی با بهترین امتیاز لود شد.");
 				testUserSocksProxy();
