@@ -323,6 +323,13 @@ const PINNED_DEFAULT_LOCATIONS_FALLBACK = ["UZ", "KZ", "TR", "LY", "NL", "AL", "
 const DEFAULT_GLOBAL_CLEAN_IP_FALLBACK = "104.20.25.138";
 const DEFAULT_OTHER_CLEAN_IPS_FALLBACK = ["104.26.1.116", "104.21.122.162", "185.162.228.105", "185.148.105.218", "104.18.39.219", "185.162.230.76"];
 const DEFAULT_INLINE_PROXY_IP_FALLBACK = "178.105.227.210";
+// «هشدار تعداد دستگاه» - آستانه‌ی پیش‌فرض سراسری که موقع ساخت کاربر جدید (اگه ادمین
+// دستی چیزی توی فیلد «محدودیت کاربر» وارد نکرده باشه) روی ستون ip_limit همون کاربر
+// ست می‌شه. توجه: این فقط برای هشداردهی در پنل ادمینه (device_warning_at / device_warning
+// - نزدیک persistActiveIp پایین‌تر)، هیچ enforcement/قطع اتصالی روش انجام نمی‌شه
+// (enforcement جدا و از قبل /* Bypassed */ شده). فقط وقتی استفاده می‌شه که تنظیم
+// 'device_warning_threshold' هیچ‌وقت توی settings ذخیره نشده باشه (نصب تازه).
+const DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK = 4;
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
 // runs automatically for every user right after the admin saves the pinned
@@ -1834,6 +1841,10 @@ const Router = {
 								if (randomIps.length > 0) finalIps = randomIps.join("\n");
 							}
 							const currentOnlineCount = Math.max((ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0), getActiveIpCount(user.active_ips));
+							// «هشدار تعداد دستگاه»: تا ۲۴ ساعت بعد از آخرین باری که تعداد دستگاه فعال
+							// این کاربر از ip_limit‌ش بیشتر شده (device_warning_at - ست‌شده توسط
+							// persistActiveIp)، این پرچم true می‌مونه تا پنل روی کارت کاربر نشونش بده.
+							const deviceWarning = !!(user.device_warning_at && now - user.device_warning_at < 24 * 60 * 60 * 1000);
 							return {
 								...user,
 								ips: finalIps,
@@ -1841,6 +1852,7 @@ const Router = {
 								used_req: (user.used_req || 0) + (USER_REQ_CACHE.get(user.username) || 0),
 								is_online: currentOnlineCount > 0 ? 1 : 0,
 								online_count: currentOnlineCount,
+								device_warning: deviceWarning,
 							};
 						});
 						let cfReqs = { today: 0, total: 0, d1Reads: 0, d1Writes: 0 };
@@ -1995,6 +2007,14 @@ const Router = {
 							finalConnType = connection_type;
 						}
 						const trojanHash = sha224Pure(finalUuid);
+						// «هشدار تعداد دستگاه»: اگه ادمین دستی چیزی توی فیلد «محدودیت کاربر» وارد
+						// نکرده باشه (ip_limit خالی/نال)، به‌جای نال، آستانه‌ی سراسری تنظیم‌شده
+						// (device_warning_threshold - پیش‌فرض ۴) روی ip_limit این کاربر جدید ست
+						// می‌شه. این فقط مبنای هشدار پنل ادمینه (persistActiveIp/device_warning_at
+						// پایین‌تر)، enforcement/قطع اتصال جدا و از قبل Bypass شده و دست‌نخورده
+						// می‌مونه. اگه ادمین عدد دیگه‌ای (حتی ۰) وارد کرده باشه، همون عدد ادمین
+						// برنده‌ست، نه پیش‌فرض سراسری.
+						const finalIpLimit = ip_limit !== undefined && ip_limit !== null && String(ip_limit).trim() !== "" ? parseInt(ip_limit) : await getDeviceWarningThresholdSetting(env);
 						// Every new user is always pinned to whatever the current
 						// pinned_locations setting holds (see getPinnedLocationsSetting();
 						// falls back to the built-in 15-country default if that setting
@@ -2004,7 +2024,7 @@ const Router = {
 						// this request doesn't have to wait on a full round of live
 						// proxy testing.
 						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, 1, start_on_first_connect ? 1 : 0, null, trojanHash, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1)
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, port, fingerprint || "chrome", finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, 1, start_on_first_connect ? 1 : 0, null, trojanHash, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1)
 							.run();
 						// Clears any stale negative-cache ("no such user") entry that might exist for
 						// this uuid/hash from an earlier probe or connection attempt with this UUID.
@@ -2120,6 +2140,7 @@ const DbService = {
 					{ name: "trojan_hash", def: "TEXT DEFAULT NULL" },
 					{ name: "enable_direct", def: "INTEGER DEFAULT 1" },
 					{ name: "proxy_rotate_cooldowns", def: "TEXT DEFAULT '{}'" },
+					{ name: "device_warning_at", def: "INTEGER DEFAULT NULL" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
@@ -2209,9 +2230,11 @@ const DbService = {
 async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 	const run = async () => {
 		let freshIps = {};
+		let ipLimit = null;
 		try {
-			const row = await env.DB.prepare("SELECT active_ips FROM users WHERE uuid = ?").bind(uuid).first();
+			const row = await env.DB.prepare("SELECT active_ips, ip_limit FROM users WHERE uuid = ?").bind(uuid).first();
 			freshIps = JSON.parse((row && row.active_ips) || "{}");
+			ipLimit = row ? row.ip_limit : null;
 		} catch (e) { }
 		for (const [ip, data] of Object.entries(freshIps)) {
 			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
@@ -2223,8 +2246,20 @@ async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 		} else {
 			freshIps[clientIP] = { timestamp: now, count: 1 };
 		}
+		// «هشدار تعداد دستگاه» (admin-facing only - NOT enforcement, enforcement stays
+		// /* Bypassed */ elsewhere): همین‌جا، دقیقاً روی همون snapshot تازه‌ای که بالا
+		// merge شد (نه یک کپی جدا)، اگه تعداد دستگاه‌های فعال از ip_limit این کاربر
+		// بیشتر شده باشه، device_warning_at با زمان الان ست می‌شه. پنل/API با
+		// `(now - device_warning_at) < 24h` این رو به‌صورت یک هشدار روی کارت کاربر
+		// نشون می‌ده (نگاه کنید به GET /api/users و رندر کارت کاربر در پنل).
+		const activeDeviceCount = Object.keys(freshIps).length;
+		const exceededLimit = ipLimit && ipLimit > 0 && activeDeviceCount > ipLimit;
 		try {
-			await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, uuid).run();
+			if (exceededLimit) {
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, uuid).run();
+			} else {
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, uuid).run();
+			}
 		} catch (e) { }
 	};
 	const prior = GLOBAL_ACTIVE_IPS_WRITE_LOCK.get(username) || Promise.resolve();
@@ -2321,6 +2356,25 @@ async function getPinnedLocationsSetting(env) {
 		return cleaned.length > 0 ? cleaned : PINNED_DEFAULT_LOCATIONS_FALLBACK;
 	} catch (e) {
 		return PINNED_DEFAULT_LOCATIONS_FALLBACK;
+	}
+}
+// Reads the admin-editable "هشدار تعداد دستگاه" (device-count warning) global
+// threshold from settings (key 'device_warning_threshold'). Used only as the
+// value auto-filled into a brand-new user's `ip_limit` column at creation time
+// (see the POST /api/users handler) - never for enforcement. Falls back to
+// DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK if never configured (fresh install)
+// or malformed; an explicitly-saved value of 0 is respected as-is (no warning
+// ever auto-set for new users, since 0/() falsy ip_limit skips the exceeded-check
+// in persistActiveIp too).
+async function getDeviceWarningThresholdSetting(env) {
+	if (!env || !env.DB) return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+	try {
+		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'device_warning_threshold'").first();
+		if (!row || row.value === null || row.value === undefined || String(row.value).trim() === "") return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		const parsed = parseInt(row.value);
+		return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+	} catch (e) {
+		return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
 	}
 }
 const SubscriptionService = {
@@ -6405,6 +6459,16 @@ Commercial support is available at
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
+						<svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+						هشدار تعداد دستگاه
+					</label>
+					<div class="flex items-center gap-2">
+						<input type="number" id="device-warning-threshold-input" dir="ltr" min="0" step="1" placeholder="4" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-red-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+					</div>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">این عدد فقط پیش‌فرضِ فیلد «محدودیت کاربر» برای کاربرهای جدیده (اگه دستی چیزی وارد نشه)؛ برای هر کاربر جدا هم قابل تغییره و صرفاً هشدار روی کارتشه، اتصالی قطع نمی‌کنه.</p>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-teal-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 10-5.656-5.656l-1.1 1.1"></path></svg>
 						آیپی های تمیز دیگر
 					</label>
@@ -7543,6 +7607,11 @@ async function executeRocketCreate() {
 			updateSubmitBtnState('ایجاد کاربر');
 			document.getElementById('input-name').disabled = false;
 			document.getElementById('create-user-form').reset();
+			const ipLimitInputEl = document.getElementById('input-ip-limit');
+			if (ipLimitInputEl) {
+				const dwThreshold = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
+				ipLimitInputEl.placeholder = 'پیش‌فرض: ' + dwThreshold;
+			}
 			const vlessCb2 = document.getElementById('input-proto-vless');
 			const trojanCb2 = document.getElementById('input-proto-trojan');
 			if (vlessCb2) vlessCb2.checked = true;
@@ -7977,12 +8046,22 @@ async function executeRocketCreate() {
 					const onlineBadge = user.is_online === 1
 						? '<span class="min-w-[20px] h-5 px-1 relative inline-flex items-center justify-center text-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
 						: '';
+					// «هشدار تعداد دستگاه»: user.device_warning از GET /api/users میاد (تا ۲۴ ساعت
+					// بعد از آخرین باری که تعداد دستگاه فعال از ip_limit این کاربر بیشتر شده -
+					// نگاه کنید به persistActiveIp). فقط یک هشدار بصریه، هیچ اتصالی رو قطع نمی‌کنه.
+					const deviceWarningLimitText = (user.ip_limit !== undefined && user.ip_limit !== null) ? user.ip_limit : (user.max_connections || '?');
+					const deviceWarningBadge = user.device_warning
+						? '<span title="تعداد دستگاه‌های متصل این کاربر بیش از حد مجازش (' + deviceWarningLimitText + ' دستگاه) بوده است" class="inline-flex items-center justify-center w-4 h-4 text-red-500 animate-pulse shrink-0">' +
+							'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>' +
+						  '</span>'
+						: '';
 					return '<div class="group transition-all drop-shadow-sm bg-white/60 dark:bg-zinc-900/40 rounded-md border border-gray-200 dark:border-zinc-800 p-1 flex flex-col items-center gap-1 text-center" data-username="' + user.username + '">' +
 							'<div class="flex items-center justify-center flex-wrap gap-1 w-full">' +
 								'<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="w-3.5 h-3.5 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-green-600 bg-white dark:bg-zinc-900 checked:bg-green-600 checked:border-green-600 focus:ring-green-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95" style="filter: none !important; accent-color: #16a34a !important;">' +
 								'<span class="drag-handle text-gray-400 hover:text-gray-600 dark:hover:text-zinc-200 cursor-grab active:cursor-grabbing font-bold text-[10px] select-none px-0.5" title="جابجایی">☰</span>' +
 								'<span class="font-bold text-gray-900 dark:text-zinc-100 text-[11px] truncate max-w-[70px]">' + user.username + '</span>' +
 								onlineBadge +
+								deviceWarningBadge +
 							'</div>' +
 							'<div class="flex flex-wrap items-center justify-center gap-1 py-0.5 border-y border-gray-100 dark:border-zinc-800/70 w-full transition-all duration-300' + actionsColorlessClass + '">' +
 								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="openStatusLink(this.dataset.user)" title="وضعیت اتصال" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/50 rounded-full transition border border-green-200 dark:border-green-800"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg></button>' +
@@ -9169,6 +9248,8 @@ function populateUserFormFields(user) {
 	const startOnFirstConnectCheck = document.getElementById('input-start-on-first-connect');
 	if (startOnFirstConnectCheck) startOnFirstConnectCheck.checked = (user.start_on_first_connect === 1);
 	document.getElementById('input-req-limit').value = user.limit_req || '';
+	const ipLimitInputEdit = document.getElementById('input-ip-limit');
+	if (ipLimitInputEdit) ipLimitInputEdit.placeholder = 'نامحدود';
 	document.getElementById('input-ip-limit').value = (user.ip_limit !== undefined && user.ip_limit !== null) ? user.ip_limit : (user.max_connections || '');
 	document.getElementById('input-ips').value = user.ips || '';
 	document.getElementById('fingerprint-select').value = user.fingerprint || 'chrome';
@@ -9331,6 +9412,23 @@ window.loadGlobalReqLimitSetting = async function() {
 	} catch (e) {}
 	window.GLOBAL_REQ_LIMIT = value;
 	const input = document.getElementById('global-req-limit-input');
+	if (input) input.value = value;
+	return value;
+};
+window.DEFAULT_DEVICE_WARNING_THRESHOLD = 4;
+window.DEVICE_WARNING_THRESHOLD = window.DEFAULT_DEVICE_WARNING_THRESHOLD;
+window.loadDeviceWarningThresholdSetting = async function() {
+	let value = window.DEFAULT_DEVICE_WARNING_THRESHOLD;
+	try {
+		const res = await fetch('/api/settings/bulk');
+		const data = await res.json();
+		if (data && data.device_warning_threshold !== undefined && data.device_warning_threshold !== null && String(data.device_warning_threshold).trim() !== '') {
+			const parsed = parseInt(data.device_warning_threshold);
+			if (!isNaN(parsed) && parsed >= 0) value = parsed;
+		}
+	} catch (e) {}
+	window.DEVICE_WARNING_THRESHOLD = value;
+	const input = document.getElementById('device-warning-threshold-input');
 	if (input) input.value = value;
 	return value;
 };
@@ -9569,12 +9667,15 @@ window.fillPatternihaValues = function() {
 window.saveSettings = async function() {
 	const cleanIpInput = document.getElementById('global-clean-ip-input');
 	const reqLimitInput = document.getElementById('global-req-limit-input');
+	const deviceWarningThresholdInput = document.getElementById('device-warning-threshold-input');
 	const otherIpsInput = document.getElementById('other-clean-ips-input');
 	const proxyIpInput = document.getElementById('inline-proxy-ip-input');
 
 	const cleanIpVal = (cleanIpInput && cleanIpInput.value.trim()) ? cleanIpInput.value.trim() : window.DEFAULT_GLOBAL_CLEAN_IP;
 	const reqLimitParsed = reqLimitInput ? parseInt(reqLimitInput.value) : NaN;
 	const reqLimitVal = (!isNaN(reqLimitParsed) && reqLimitParsed >= 0) ? reqLimitParsed : window.DEFAULT_GLOBAL_REQ_LIMIT;
+	const deviceWarningThresholdParsed = deviceWarningThresholdInput ? parseInt(deviceWarningThresholdInput.value) : NaN;
+	const deviceWarningThresholdVal = (!isNaN(deviceWarningThresholdParsed) && deviceWarningThresholdParsed >= 0) ? deviceWarningThresholdParsed : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
 	const otherIpsRawVal = (otherIpsInput && otherIpsInput.value) ? otherIpsInput.value : '';
 	const otherIpsParsed = otherIpsRawVal.split('\\n').map(function(ip) { return ip.trim(); }).filter(function(ip) { return ip.length > 0; });
 	const otherIpsVal = otherIpsParsed.join('\\n');
@@ -9591,6 +9692,7 @@ window.saveSettings = async function() {
 				settings: {
 					global_clean_ip: cleanIpVal,
 					global_req_limit: reqLimitVal,
+					device_warning_threshold: deviceWarningThresholdVal,
 					other_clean_ips: otherIpsVal,
 					inline_proxy_ip: proxyIpVal
 				}
@@ -9598,10 +9700,12 @@ window.saveSettings = async function() {
 		});
 		window.GLOBAL_CLEAN_IP = cleanIpVal;
 		window.GLOBAL_REQ_LIMIT = reqLimitVal;
+		window.DEVICE_WARNING_THRESHOLD = deviceWarningThresholdVal;
 		window.OTHER_CLEAN_IPS = otherIpsParsed;
 		window.INLINE_PROXY_IP = proxyIpVal;
 		if (cleanIpInput) cleanIpInput.value = cleanIpVal;
 		if (reqLimitInput) reqLimitInput.value = reqLimitVal;
+		if (deviceWarningThresholdInput) deviceWarningThresholdInput.value = deviceWarningThresholdVal;
 		if (otherIpsInput) otherIpsInput.value = otherIpsVal;
 		if (proxyIpInput) proxyIpInput.value = proxyIpVal;
 		showToast('✅ تنظیمات با موفقیت ذخیره شد.');
@@ -10424,6 +10528,7 @@ function applySelectedIps() {
 			loadUsers();
 			window.loadGlobalCleanIpSetting();
 			window.loadGlobalReqLimitSetting();
+			window.loadDeviceWarningThresholdSetting();
 			window.loadOtherCleanIpsSetting();
 			window.loadInlineProxyIpSetting();
 			window.populatePinnedLocationSelects();
