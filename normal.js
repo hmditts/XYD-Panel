@@ -330,6 +330,14 @@ const DEFAULT_INLINE_PROXY_IP_FALLBACK = "178.105.227.210";
 // (enforcement جدا و از قبل /* Bypassed */ شده). فقط وقتی استفاده می‌شه که تنظیم
 // 'device_warning_threshold' هیچ‌وقت توی settings ذخیره نشده باشه (نصب تازه).
 const DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK = 4;
+// «پورت» - پورتی که هم به‌عنوان مقدار پیش‌فرض چک‌باکس پورت توی فرم افزودن
+// کاربر جدید انتخاب می‌شه (renderPortCheckboxes سمت کلاینت)، و هم موقع «ذخیره
+// تنظیمات» به‌صورت override کامل روی ستون port همه‌ی کاربرهای *موجود* هم
+// اعمال می‌شه (پورت‌های قبلی‌شون پاک و با همین یکی جایگزین می‌شه - نگاه کنید
+// به POST /api/settings/bulk). این مقدار فقط به‌عنوان پیش‌فرضِ اولیه استفاده
+// می‌شه، برای وقتی تنظیم 'default_port' هیچ‌وقت توی settings ذخیره نشده باشه
+// (نصب تازه).
+const DEFAULT_PORT_FALLBACK = "2083";
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
 // runs automatically for every user right after the admin saves the pinned
@@ -1502,6 +1510,15 @@ const Router = {
 						const parsedThreshold = parseInt(body.settings.device_warning_threshold);
 						if (!isNaN(parsedThreshold) && parsedThreshold >= 0) overrideDeviceWarningThreshold = parsedThreshold;
 					}
+					// «پورت»: مثل بالا، این یکی هم - برخلاف بقیه‌ی تنظیمات global - روی ستون
+					// port همه‌ی کاربرهای *موجود* بازنویسی کامل می‌شه (نه فقط پیش‌فرض کاربر
+					// تازه‌ساز؛ نگاه کنید به getDefaultPortSetting() برای اون بخش). پورت(های)
+					// قبلی هر کاربر پاک و با همین یکی جایگزین می‌شه.
+					let overrideDefaultPort = undefined;
+					if (Object.prototype.hasOwnProperty.call(body.settings, "default_port")) {
+						const parsedPort = parseInt(body.settings.default_port);
+						if (!isNaN(parsedPort) && parsedPort > 0 && parsedPort <= 65535) overrideDefaultPort = String(parsedPort);
+					}
 					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
 					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
 					const settingsStmts = Object.entries(body.settings).map(([k, v]) =>
@@ -1510,6 +1527,9 @@ const Router = {
 					if (settingsStmts.length > 0) await env.DB.batch(settingsStmts);
 					if (overrideDeviceWarningThreshold !== undefined) {
 						await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ?").bind(overrideDeviceWarningThreshold, overrideDeviceWarningThreshold).run();
+					}
+					if (overrideDefaultPort !== undefined) {
+						await env.DB.prepare("UPDATE users SET port = ?").bind(overrideDefaultPort).run();
 					}
 				}
 				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
@@ -2034,6 +2054,11 @@ const Router = {
 						// می‌مونه. اگه ادمین عدد دیگه‌ای (حتی ۰) وارد کرده باشه، همون عدد ادمین
 						// برنده‌ست، نه پیش‌فرض سراسری.
 						const finalIpLimit = ip_limit !== undefined && ip_limit !== null && String(ip_limit).trim() !== "" ? parseInt(ip_limit) : await getDeviceWarningThresholdSetting(env);
+						// «پورت»: اگه ادمین/فرم چیزی برای port نفرستاده باشه (خالی/نال)، به‌جای
+						// نال، پورت پیش‌فرض سراسری تنظیم‌شده (default_port - پیش‌فرض ۲۰۸۳) روی
+						// این کاربر تازه ست می‌شه. اگه مقداری فرستاده شده باشه (مثلاً از چک‌باکس‌های
+						// فرم افزودن کاربر)، همون مقدار برنده‌ست.
+						const finalPort = port !== undefined && port !== null && String(port).trim() !== "" ? port : await getDefaultPortSetting(env);
 						// Every new user is always pinned to whatever the current
 						// pinned_locations setting holds (see getPinnedLocationsSetting();
 						// falls back to the built-in 15-country default if that setting
@@ -2043,7 +2068,7 @@ const Router = {
 						// this request doesn't have to wait on a full round of live
 						// proxy testing.
 						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, port, fingerprint || "chrome", finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, 1, start_on_first_connect ? 1 : 0, null, trojanHash, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1)
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, finalPort, fingerprint || "chrome", finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, 1, start_on_first_connect ? 1 : 0, null, trojanHash, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1)
 							.run();
 						// Clears any stale negative-cache ("no such user") entry that might exist for
 						// this uuid/hash from an earlier probe or connection attempt with this UUID.
@@ -2098,6 +2123,7 @@ const DbService = {
 				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_clean_ip', ?)").bind(DEFAULT_GLOBAL_CLEAN_IP_FALLBACK).run();
 				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('other_clean_ips', ?)").bind(DEFAULT_OTHER_CLEAN_IPS_FALLBACK.join("\n")).run();
 				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('inline_proxy_ip', ?)").bind(DEFAULT_INLINE_PROXY_IP_FALLBACK).run();
+				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_port', ?)").bind(DEFAULT_PORT_FALLBACK).run();
 			} catch (e) { }
 			try {
 				// جدول ترافیک، به تفکیک ساعت UTC (ستون "date" همچنان TEXT PRIMARY KEY است، فقط از این پس
@@ -2414,6 +2440,22 @@ async function getDeviceWarningThresholdSetting(env) {
 		return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
 	} catch (e) {
 		return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+	}
+}
+// Reads the admin-editable «پورت» global default from settings (key
+// 'default_port'). Used only to pre-fill a brand-new user's `port` column at
+// creation time when the request didn't explicitly include one (see POST
+// /api/users) - the *existing*-user override on save is handled separately
+// in POST /api/settings/bulk. Falls back to DEFAULT_PORT_FALLBACK if never
+// configured or malformed/empty.
+async function getDefaultPortSetting(env) {
+	if (!env || !env.DB) return DEFAULT_PORT_FALLBACK;
+	try {
+		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'default_port'").first();
+		if (!row || row.value === null || row.value === undefined || String(row.value).trim() === "") return DEFAULT_PORT_FALLBACK;
+		return String(row.value).trim();
+	} catch (e) {
+		return DEFAULT_PORT_FALLBACK;
 	}
 }
 const SubscriptionService = {
@@ -6439,6 +6481,7 @@ Commercial support is available at
 			</div>
 			<div class="p-6 space-y-4 overflow-y-auto flex-1 overscroll-contain">
 				<div class="pt-2">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">⚙️ رفتار پـنـل</h5>
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">نرخ رفرش خودکار پـنـل</label>
 					<div class="relative">
 						<select id="refresh-rate-select" onchange="changeRefreshRate(this.value)" class="w-full pl-8 pr-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-200 cursor-pointer appearance-none">
@@ -6469,6 +6512,7 @@ Commercial support is available at
 					</label>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🌐 شبکه و اتصال کاربران</h5>
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5 justify-between">
 						<span class="flex items-center gap-1.5">
 							<svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
@@ -6485,31 +6529,22 @@ Commercial support is available at
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
+						<svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+						پورت
+					</label>
+					<div class="flex items-center gap-2">
+						<input type="number" id="default-port-input" dir="ltr" min="1" max="65535" step="1" placeholder="2083" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+					</div>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">با ذخیره‌ی تنظیمات، این پورت جایگزین کامل پورت(های) فعلیِ همه‌ی کاربرهای موجود می‌شه و برای کاربرهای جدید هم به‌عنوان پیش‌فرض اعمال می‌شه.</p>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.636 5.636a9 9 0 1012.728 0M12 3v9"></path></svg>
 						آیپی تمیز سراسری
 					</label>
 					<div class="flex items-center gap-2">
 						<input type="text" id="global-clean-ip-input" dir="ltr" placeholder="104.20.25.138" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 					</div>
-				</div>
-				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
-					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
-						<svg class="w-4 h-4 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
-						محدودیت کل ریکوئست روزانه
-					</label>
-					<div class="flex items-center gap-2">
-						<input type="number" id="global-req-limit-input" dir="ltr" min="0" step="1000" placeholder="75000" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
-					</div>
-				</div>
-				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
-					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
-						<svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-						هشدار تعداد دستگاه
-					</label>
-					<div class="flex items-center gap-2">
-						<input type="number" id="device-warning-threshold-input" dir="ltr" min="0" step="1" placeholder="4" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-red-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
-					</div>
-					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">این عدد فقط پیش‌فرضِ فیلد «محدودیت کاربر» برای کاربرهای جدیده (اگه دستی چیزی وارد نشه)؛ برای هر کاربر جدا هم قابل تغییره و صرفاً هشدار روی کارتشه، اتصالی قطع نمی‌کنه.</p>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
@@ -6530,6 +6565,27 @@ Commercial support is available at
 					</div>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🚦 محدودیت‌ها</h5>
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
+						<svg class="w-4 h-4 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
+						محدودیت کل ریکوئست روزانه
+					</label>
+					<div class="flex items-center gap-2">
+						<input type="number" id="global-req-limit-input" dir="ltr" min="0" step="1000" placeholder="75000" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+					</div>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
+						<svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+						هشدار تعداد دستگاه
+					</label>
+					<div class="flex items-center gap-2">
+						<input type="number" id="device-warning-threshold-input" dir="ltr" min="0" step="1" placeholder="4" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-red-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+					</div>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">این عدد فقط پیش‌فرضِ فیلد «محدودیت کاربر» برای کاربرهای جدیده (اگه دستی چیزی وارد نشه)؛ برای هر کاربر جدا هم قابل تغییره و صرفاً هشدار روی کارتشه، اتصالی قطع نمی‌کنه.</p>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🔐 امنیت و یکپارچه‌سازی</h5>
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path></svg>
 						کلید API پنل مادر
@@ -6948,7 +7004,7 @@ ${COMMON_TOAST_HTML}
 			}
 			
 			tlsContainer.innerHTML = tlsPorts.map(function(port) {
-				const isCheckedDefault = port === '2083' ? 'checked' : '';
+				const isCheckedDefault = port === (window.DEFAULT_PORT_SETTING || '2083') ? 'checked' : '';
 				return '<label class="relative cursor-pointer">' +
 					'<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
 					'<div class="flex items-center justify-center gap-1 px-1.5 py-1 border border-gray-200 dark:border-amoled-border rounded-md text-[11px] font-semibold select-none transition-all duration-200 hover:bg-gray-50 dark:hover:bg-amoled-input/50 text-gray-700 dark:text-zinc-200 peer-checked:bg-blue-50 dark:peer-checked:bg-blue-950/25 peer-checked:border-blue-500 dark:peer-checked:border-blue-500 peer-checked:text-blue-600 dark:peer-checked:text-blue-400 shadow-sm">' +
@@ -6971,8 +7027,11 @@ ${COMMON_TOAST_HTML}
 			}).join('');
 		}
 		setTimeout(function() {
+			const nonTlsSet = { '80': true, '8080': true, '8880': true, '2052': true, '2082': true, '2086': true, '2095': true };
+			const defaultPort = window.DEFAULT_PORT_SETTING || '2083';
 			document.querySelectorAll('input[name="ports"]').forEach(function(cb) {
-				cb.checked = (cb.value === '2083');
+				if (nonTlsSet[cb.value]) return; // نگاه‌داشتن پیش‌فرض جداگانه‌ی Non-TLS ('80') دست‌نخورده
+				cb.checked = (cb.value === defaultPort);
 			});
 		}, 100);
 		function toggleSettingsModal(show) { setModalState('settings-modal', show); }
@@ -7193,8 +7252,11 @@ let activeRocketBtn = null;
 			const trojanCb2 = document.getElementById('input-proto-trojan');
 			if (vlessCb2) vlessCb2.checked = true;
 			if (trojanCb2) trojanCb2.checked = false;
+			const nonTlsDefaultSet = { '80': true, '8080': true, '8880': true, '2052': true, '2082': true, '2086': true, '2095': true };
+			const createModalDefaultPort = window.DEFAULT_PORT_SETTING || '2083';
 			document.querySelectorAll('input[name="ports"]').forEach(function(cb) {
-				cb.checked = (cb.value === '2083');
+				if (nonTlsDefaultSet[cb.value]) { cb.checked = (cb.value === '80'); return; }
+				cb.checked = (cb.value === createModalDefaultPort);
 			});
 			const fpSelect = document.getElementById('fingerprint-select');
 			if (fpSelect) fpSelect.value = 'ios';
@@ -9212,6 +9274,27 @@ window.loadInlineProxyIpSetting = async function() {
 	if (input) input.value = value;
 	return value;
 };
+window.DEFAULT_PORT_SETTING_FALLBACK = '2083';
+window.DEFAULT_PORT_SETTING = window.DEFAULT_PORT_SETTING_FALLBACK;
+window.loadDefaultPortSetting = async function() {
+	let value = window.DEFAULT_PORT_SETTING_FALLBACK;
+	try {
+		const res = await fetch('/api/settings/bulk');
+		const data = await res.json();
+		if (data && data.default_port !== undefined && data.default_port !== null && String(data.default_port).trim() !== '') {
+			const parsed = parseInt(data.default_port);
+			if (!isNaN(parsed) && parsed > 0 && parsed <= 65535) value = String(parsed);
+		}
+	} catch (e) {}
+	window.DEFAULT_PORT_SETTING = value;
+	const input = document.getElementById('default-port-input');
+	if (input) input.value = value;
+	// چک‌باکس‌های فرم افزودن کاربر رو با مقدار واقعیِ لود شده دوباره رندر می‌کنیم
+	// (renderPortCheckboxes موقع DOMContentLoaded قبل از رسیدن این fetch صدا زده
+	// می‌شه و تا اون موقع فقط از پیش‌فرضِ fallback استفاده می‌کنه).
+	if (typeof renderPortCheckboxes === 'function') renderPortCheckboxes();
+	return value;
+};
 window.generateMasterKey = async function() {
 	if (!confirm('یک کلید مادر جدید ساخته می‌شود و کلید قبلی (اگه وجود داشت) بلافاصله از کار می‌افتد. ادامه می‌دی؟')) return;
 	const btn = document.getElementById('generate-master-key-btn');
@@ -9249,6 +9332,7 @@ window.saveSettings = async function() {
 	const deviceWarningThresholdInput = document.getElementById('device-warning-threshold-input');
 	const otherIpsInput = document.getElementById('other-clean-ips-input');
 	const proxyIpInput = document.getElementById('inline-proxy-ip-input');
+	const defaultPortInput = document.getElementById('default-port-input');
 
 	const cleanIpVal = (cleanIpInput && cleanIpInput.value.trim()) ? cleanIpInput.value.trim() : window.DEFAULT_GLOBAL_CLEAN_IP;
 	const reqLimitParsed = reqLimitInput ? parseInt(reqLimitInput.value) : NaN;
@@ -9259,6 +9343,8 @@ window.saveSettings = async function() {
 	const otherIpsParsed = otherIpsRawVal.split('\\n').map(function(ip) { return ip.trim(); }).filter(function(ip) { return ip.length > 0; });
 	const otherIpsVal = otherIpsParsed.join('\\n');
 	const proxyIpVal = (proxyIpInput && proxyIpInput.value.trim()) ? proxyIpInput.value.trim() : '';
+	const defaultPortParsed = defaultPortInput ? parseInt(defaultPortInput.value) : NaN;
+	const defaultPortVal = (!isNaN(defaultPortParsed) && defaultPortParsed > 0 && defaultPortParsed <= 65535) ? String(defaultPortParsed) : window.DEFAULT_PORT_SETTING_FALLBACK;
 
 	const buttons = [document.getElementById('save-settings-btn'), document.getElementById('save-settings-fab-btn')].filter(Boolean);
 	buttons.forEach(function(b) { b.disabled = true; });
@@ -9273,7 +9359,8 @@ window.saveSettings = async function() {
 					global_req_limit: reqLimitVal,
 					device_warning_threshold: deviceWarningThresholdVal,
 					other_clean_ips: otherIpsVal,
-					inline_proxy_ip: proxyIpVal
+					inline_proxy_ip: proxyIpVal,
+					default_port: defaultPortVal
 				}
 			})
 		});
@@ -9282,13 +9369,17 @@ window.saveSettings = async function() {
 		window.DEVICE_WARNING_THRESHOLD = deviceWarningThresholdVal;
 		window.OTHER_CLEAN_IPS = otherIpsParsed;
 		window.INLINE_PROXY_IP = proxyIpVal;
+		window.DEFAULT_PORT_SETTING = defaultPortVal;
 		if (cleanIpInput) cleanIpInput.value = cleanIpVal;
 		if (reqLimitInput) reqLimitInput.value = reqLimitVal;
 		if (deviceWarningThresholdInput) deviceWarningThresholdInput.value = deviceWarningThresholdVal;
 		if (otherIpsInput) otherIpsInput.value = otherIpsVal;
 		if (proxyIpInput) proxyIpInput.value = proxyIpVal;
-		showToast('✅ تنظیمات با موفقیت ذخیره شد.');
+		if (defaultPortInput) defaultPortInput.value = defaultPortVal;
+		if (typeof renderPortCheckboxes === 'function') renderPortCheckboxes();
+		showToast('✅ تنظیمات ذخیره شد؛ پورت همه‌ی کاربرها روی ' + defaultPortVal + ' ست شد.');
 		toggleSettingsModal(false);
+		if (typeof loadUsers === 'function') await loadUsers(true);
 	} catch (e) {
 		showToast('❌ ذخیره‌سازی تنظیمات ناموفق بود.');
 	} finally {
@@ -10067,6 +10158,7 @@ function applySelectedIps() {
 			window.loadDeviceWarningThresholdSetting();
 			window.loadOtherCleanIpsSetting();
 			window.loadInlineProxyIpSetting();
+			window.loadDefaultPortSetting();
 			window.populatePinnedLocationSelects();
 			window.loadPinnedLocationsSetting();
 			window.usersRefreshIntervalId = null;
@@ -10510,9 +10602,10 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 		// and creates one panel user per client. Only client.email (-> username)
 		// and client.id (-> uuid) are used; every other field is created with
 		// the exact same defaults openCreateModal() applies for a manual
-		// "add user" (fingerprint ios, port 2083, auto-reset on, pinned
-		// 5-country proxy list via the backend, etc.) so this stays in sync
-		// with whatever those defaults happen to be.
+		// "add user" (fingerprint ios, port = default_port setting (2083
+		// fallback), auto-reset on, pinned 5-country proxy list via the
+		// backend, etc.) so this stays in sync with whatever those defaults
+		// happen to be.
 		async function startImportUsers() {
 			const raw = document.getElementById('import-json-input').value.trim();
 			if (!raw) { alert('⚠️ لطفا کد JSON را پیست کنید!'); return; }
@@ -10579,7 +10672,7 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 							expiry_days: null,
 							limit_req: null,
 							tls: 'on',
-							port: '2083',
+							port: window.DEFAULT_PORT_SETTING || '2083',
 							ips: window.GLOBAL_CLEAN_IP || window.DEFAULT_GLOBAL_CLEAN_IP || '104.20.25.138',
 							fingerprint: 'ios',
 							ip_limit: null,
