@@ -5353,7 +5353,12 @@ Commercial support is available at
 		<div id="loading-state" class="text-center py-12">
 			<span class="text-gray-500 dark:text-gray-400">در حال بارگذاری کاربران...</span>
 		</div>
-		<div class="mb-4 flex flex-col md:flex-row gap-2 justify-between items-center bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2 shadow-sm">
+		<div id="add-user-only-bar" class="hidden mb-4">
+			<button onclick="openCreateModal()" title="افزودن کاربر" class="p-2 rounded-full bg-green-50 dark:bg-green-950/30 border-2 border-green-600 dark:border-green-700/60 hover:bg-green-100 dark:hover:bg-green-900/50 transition-all duration-300 text-green-700 dark:text-green-400 shadow-sm hover:shadow hover:scale-105 cursor-pointer inline-flex items-center justify-center">
+				<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
+			</button>
+		</div>
+		<div id="users-toolbar" class="mb-4 flex flex-col md:flex-row gap-2 justify-between items-center bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2 shadow-sm">
 			<div class="flex items-center gap-2 shrink-0">
 				<button onclick="openCreateModal()" title="افزودن کاربر" class="scale-[0.7] p-2 rounded-full bg-green-50 dark:bg-green-950/30 border-2 border-green-600 dark:border-green-700/60 hover:bg-green-100 dark:hover:bg-green-900/50 transition-all duration-300 text-green-700 dark:text-green-400 shadow-sm hover:shadow hover:scale-[0.77] cursor-pointer inline-flex items-center justify-center shrink-0">
 					<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
@@ -7353,6 +7358,17 @@ let activeRocketBtn = null;
 				}
 				const users = data.users || [];
 				window.allUsers = users;
+				// وقتی تعداد کل کاربران کمتر از ۴ باشه، نوار ابزار (انتخاب همه/انتخاب/جابجایی/جستجو/فیلتر/sort)
+				// اصلاً نمایش داده نمی‌شه تا کارت‌ها بالاتر بیان؛ فقط دکمه‌ی + به‌تنهایی و جمع‌وجور نشون داده می‌شه.
+				const usersToolbar = document.getElementById('users-toolbar');
+				const addUserOnlyBar = document.getElementById('add-user-only-bar');
+				if (users.length < 4) {
+					if (usersToolbar) usersToolbar.classList.add('hidden');
+					if (addUserOnlyBar) addUserOnlyBar.classList.remove('hidden');
+				} else {
+					if (usersToolbar) usersToolbar.classList.remove('hidden');
+					if (addUserOnlyBar) addUserOnlyBar.classList.add('hidden');
+				}
 				const serverTime = data.serverTime || Date.now();
 				window.lastServerTime = serverTime;
 				const formatGbShort = (gb) => gb < 1 ? (gb * 1024).toFixed(0) + ' MB' : gb.toFixed(2) + ' GB';
@@ -7650,7 +7666,7 @@ let activeRocketBtn = null;
 							(deviceWarningPeakCount ? '<span class="text-[14px] font-bold text-red-500 leading-none">' + deviceWarningPeakCount + '</span>' : '') +
 						  '</span>'
 						: '';
-					return '<div class="group transition-all drop-shadow-sm bg-white/60 dark:bg-zinc-900/40 rounded-md border border-gray-200 dark:border-zinc-800 p-[5.6px] flex flex-col items-center gap-[5.6px] text-center w-full max-w-[224px]" data-username="' + user.username + '">' +
+					return '<div class="group transition-all drop-shadow-sm bg-white/60 dark:bg-zinc-900/40 rounded-md border border-gray-200 dark:border-zinc-800 p-[5.6px] flex flex-col items-center gap-[5.6px] text-center w-full max-w-[268.8px]" data-username="' + user.username + '">' +
 							'<div class="flex items-center justify-center flex-wrap gap-[5.6px] w-full">' +
 								'<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="w-[19.6px] h-[19.6px] rounded-md border-[1.4px] border-gray-300 dark:border-zinc-700 text-green-600 bg-white dark:bg-zinc-900 checked:bg-green-600 checked:border-green-600 focus:ring-green-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95" style="filter: none !important; accent-color: #16a34a !important;">' +
 								'<span class="drag-handle text-gray-400 hover:text-gray-600 dark:hover:text-zinc-200 cursor-grab active:cursor-grabbing font-bold text-[14px] select-none px-[2.8px]" title="جابجایی">☰</span>' +
