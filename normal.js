@@ -7844,7 +7844,8 @@ let activeRocketBtn = null;
 						reqHtml = '<div class="flex flex-col gap-[5.6px] w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
 							'<div class="flex items-baseline justify-center gap-1' + reqInvisibleClass + '" dir="ltr">' +
 								'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none">' + usedReq.toLocaleString() + '</span>' +
-								'<span class="text-[8.5px] text-gray-400 dark:text-zinc-500 font-semibold leading-none">/' + user.limit_req.toLocaleString() + ' Req</span>' +
+								'<span class="text-[8.5px] text-gray-400 dark:text-zinc-500 font-semibold leading-none">/' + user.limit_req.toLocaleString() + '</span>' +
+								'<span class="text-[7.5px] text-gray-400 dark:text-zinc-500 font-semibold leading-none opacity-60">Req</span>' +
 							'</div>' +
 							'<div class="w-full h-[8.4px] bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + reqInvisibleClass + '">' +
 								'<div class="h-full rounded-full transition-all duration-500" style="width: ' + reqPercent + '%; background-color: hsl(' + reqHue + ', 80%, 45%)"></div>' +
@@ -7854,7 +7855,10 @@ let activeRocketBtn = null;
 						// بدون محدودیت: به‌جای نوار پیشرفتِ ساکن و بی‌معنی (که نه پر می‌شد نه خالی)،
 						// فقط عدد مصرف به‌همراه یک نشانه‌ی کوچیک «∞ بدون محدودیت» نشون داده می‌شه.
 						reqHtml = '<div class="flex flex-col items-center gap-1 w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
-							'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none' + reqInvisibleClass + '" dir="ltr">' + usedReq.toLocaleString() + ' Req</span>' +
+							'<div class="flex items-baseline justify-center gap-1' + reqInvisibleClass + '" dir="ltr">' +
+								'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none">' + usedReq.toLocaleString() + '</span>' +
+								'<span class="text-[10px] text-gray-800 dark:text-zinc-200 font-bold leading-none opacity-60">Req</span>' +
+							'</div>' +
 							'<span class="text-[8.5px] font-bold text-blue-500/80 dark:text-blue-400/80 tracking-wide leading-none' + reqInvisibleClass + '">∞ بدون محدودیت</span>' +
 						'</div>';
 					}
@@ -7862,10 +7866,12 @@ let activeRocketBtn = null;
 					if (user.limit_gb) {
 						const limitPercent = Math.min((usedGb / user.limit_gb) * 100, 100);
 						const limitHue = 120 - (limitPercent * 1.2);
-						const formattedUsedClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) + 'MB' : usedGb.toFixed(2) + 'GB';
+						const usedValueClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) : usedGb.toFixed(2);
+						const usedUnitClean = usedGb < 1 ? 'MB' : 'GB';
 						volumeHtml = '<div class="flex flex-col gap-[5.6px] w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
 							'<div class="flex items-baseline justify-center gap-1' + volInvisibleClass + '" dir="ltr">' +
-								'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none">' + formattedUsedClean + '</span>' +
+								'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none">' + usedValueClean + '</span>' +
+								'<span class="text-[10px] text-gray-800 dark:text-zinc-200 font-bold leading-none opacity-60">' + usedUnitClean + '</span>' +
 								'<span class="text-[8.5px] text-gray-400 dark:text-zinc-500 font-semibold leading-none">/' + user.limit_gb + 'GB</span>' +
 							'</div>' +
 							'<div class="w-full h-[8.4px] bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + volInvisibleClass + '">' +
@@ -7873,10 +7879,14 @@ let activeRocketBtn = null;
 							'</div>' +
 						'</div>';
 					} else {
-						const formattedUsedClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) + 'MB' : usedGb.toFixed(2) + 'GB';
+						const usedValueClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) : usedGb.toFixed(2);
+						const usedUnitClean = usedGb < 1 ? 'MB' : 'GB';
 						// همون منطق «بدون محدودیت» که برای ریکوئست پیاده شد، اینجا هم برای حجم اعمال می‌شه.
 						volumeHtml = '<div class="flex flex-col items-center gap-1 w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
-							'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none' + volInvisibleClass + '" dir="ltr">' + formattedUsedClean + '</span>' +
+							'<div class="flex items-baseline justify-center gap-1' + volInvisibleClass + '" dir="ltr">' +
+								'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none">' + usedValueClean + '</span>' +
+								'<span class="text-[10px] text-gray-800 dark:text-zinc-200 font-bold leading-none opacity-60">' + usedUnitClean + '</span>' +
+							'</div>' +
 							'<span class="text-[8.5px] font-bold text-blue-500/80 dark:text-blue-400/80 tracking-wide leading-none' + volInvisibleClass + '">∞ بدون محدودیت</span>' +
 						'</div>';
 					}
@@ -11135,8 +11145,8 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 		<div id="status-card" class="mb-6 rounded-md p-4 text-center border font-bold relative z-10 transition duration-300">
 			<span id="status-text" class="text-sm">در حال بارگذاری وضعیت...</span>
 		</div>
-		<div class="grid grid-cols-2 gap-3 mb-8 relative z-10">
-			<div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+		<div class="grid grid-cols-2 gap-3 mb-8 relative z-10" style="direction:ltr;">
+			<div dir="rtl" class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
 				<div class="flex justify-between items-center mb-2">
 					<span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
 						<svg class="w-3.5 h-3.5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
@@ -11152,7 +11162,7 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 					<span id="limit-vol" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
 				</div>
 			</div>
-			<div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+			<div dir="rtl" class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
 				<div class="flex justify-between items-center mb-2">
 					<span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
 						<svg class="w-3.5 h-3.5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
@@ -11168,28 +11178,28 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 					<span id="total-days" class="font-bold text-gray-800 dark:text-zinc-200" dir="rtl">-</span>
 				</div>
 			</div>
-			<div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+			<div dir="rtl" class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
 				<div class="flex justify-between items-center mb-2">
 					<span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
 						<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
 						ریکوئست‌ها
 					</span>
 				</div>
-				<div id="req-progress-wrap" class="flex items-center gap-2.5 mb-1">
-					<div class="relative w-11 h-11 shrink-0">
-						<svg class="req-ring-svg w-11 h-11" viewBox="0 0 40 40">
+				<div id="req-progress-wrap" class="flex items-center justify-center mb-1">
+					<div class="relative w-[48.4px] h-[48.4px] shrink-0">
+						<svg class="req-ring-svg w-[48.4px] h-[48.4px]" viewBox="0 0 40 40">
 							<circle class="req-ring-track text-gray-200 dark:text-zinc-800" cx="20" cy="20" r="16" fill="none" stroke-width="3.5"></circle>
 							<circle id="req-progress" class="req-ring-bar" cx="20" cy="20" r="16" fill="none" stroke-width="3.5" stroke-dasharray="100.53" style="--req-offset:100.53; --req-offset-reach:100.53; stroke-dashoffset:100.53;"></circle>
 						</svg>
 						<span id="req-pct" class="absolute inset-0 flex items-center justify-center text-[9px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
 					</div>
-					<div id="req-amounts-row" class="flex flex-col justify-center gap-1 text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
+					<div id="req-amounts-row" class="hidden flex-col justify-center gap-1 text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
 						<span dir="ltr">مصرف: <span id="used-req" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
 						<span dir="ltr">سقف: <span id="limit-req" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
 					</div>
 				</div>
 			</div>
-			<div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+			<div dir="rtl" class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
 				<div class="flex justify-between items-center mb-2">
 					<span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
 						<svg class="w-3.5 h-3.5 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
