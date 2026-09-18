@@ -5452,14 +5452,15 @@ Commercial support is available at
 			</div>
 		</div>
 	</div>
-	<div id="card-traffic" onclick="openUsageChart('traffic')" class="neon-orbit neon-orbit-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
-		<div class="flex items-center justify-center gap-1.5 relative z-10">
-			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Traffic</span>
-			<div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0">
-				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+	<div id="card-traffic" onclick="openUsageChart('traffic')" class="neon-orbit neon-orbit-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-sm hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[128px] cursor-pointer">
+		<div id="traffic-card-chart" class="absolute inset-[2px] rounded-[6px] overflow-hidden pointer-events-none"></div>
+		<div class="absolute inset-[2px] rounded-[6px] flex flex-col justify-between p-2.5 bg-gradient-to-b from-white/90 via-white/60 to-white/10 dark:from-amoled-card/90 dark:via-amoled-card/60 dark:to-amoled-card/10">
+			<div class="flex items-center justify-center gap-1.5">
+				<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Traffic</span>
+				<div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0">
+					<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+				</div>
 			</div>
-		</div>
-		<div class="relative z-10 min-w-0 flex-1 w-full mt-1">
 			<div class="grid grid-cols-3 gap-1 w-full">
 				<div class="flex flex-col items-center justify-center">
 					<span class="text-xs font-black text-blue-600 dark:text-blue-400 transition-all leading-none whitespace-nowrap" dir="ltr" id="stat-usage-daily">0 GB</span>
@@ -7418,6 +7419,7 @@ let activeRocketBtn = null;
 				document.documentElement.classList.add('dark');
 				localStorage.setItem('color-theme', 'dark');
 			}
+			if (typeof renderTrafficCardChart === 'function') renderTrafficCardChart();
 		});
 		
 		async function handleCoreAction(actionType, token = null) {
@@ -8599,6 +8601,60 @@ function downloadZeusSource() {
 			return d;
 		}
 
+		// نمودار کوچک زمینه‌ی کارت "Traffic" (روش برگرفته از buildSparklineSvg در
+		// الگو): یک ناحیه‌ی نرم گرادیانی که کل کارت را پر می‌کند، با یک نقطه روی
+		// آخرین روز. از همان رنگ‌های USAGE_CHART_COLORS.traffic و همان داده‌ی
+		// /api/stats-history که مودال جزئیات (openUsageChart) استفاده می‌کند بهره می‌برد.
+		var trafficCardChartPoints = null;
+		var trafficCardGradSeq = 0;
+		function buildTrafficCardChartSvg(points) {
+			if (!points || !points.length) return '';
+			const isDark = document.documentElement.classList.contains('dark');
+			const colors = USAGE_CHART_COLORS.traffic;
+			const lineColor = isDark ? colors.lineDark : colors.line;
+			const w = 300, h = 128, padX = 3, padTop = 14, padBottom = 0;
+			const values = points.map(function (p) { return p.value || 0; });
+			let max = Math.max.apply(null, values), min = Math.min.apply(null, values);
+			if (max === min) max = min + 1;
+			const innerW = w - padX * 2, innerH = h - padTop - padBottom;
+			const stepX = points.length > 1 ? innerW / (points.length - 1) : 0;
+			const coords = points.map(function (p, i) {
+				const x = padX + i * stepX;
+				const y = padTop + innerH - ((p.value - min) / (max - min)) * innerH;
+				return { x: x, y: y };
+			});
+			let line = 'M ' + coords[0].x.toFixed(1) + ',' + coords[0].y.toFixed(1);
+			for (let i = 1; i < coords.length - 1; i++) {
+				const xm = (coords[i].x + coords[i + 1].x) / 2, ym = (coords[i].y + coords[i + 1].y) / 2;
+				line += ' Q ' + coords[i].x.toFixed(1) + ',' + coords[i].y.toFixed(1) + ' ' + xm.toFixed(1) + ',' + ym.toFixed(1);
+			}
+			const lastC = coords[coords.length - 1];
+			line += ' Q ' + lastC.x.toFixed(1) + ',' + lastC.y.toFixed(1) + ' ' + lastC.x.toFixed(1) + ',' + lastC.y.toFixed(1);
+			const area = line + ' L ' + lastC.x.toFixed(1) + ',' + h + ' L ' + coords[0].x.toFixed(1) + ',' + h + ' Z';
+			const gid = 'trafficCardGrad' + (trafficCardGradSeq++);
+			return '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" width="100%" height="100%">' +
+				'<defs><linearGradient id="' + gid + '" x1="0" y1="0" x2="0" y2="1">' +
+					'<stop offset="0%" stop-color="' + lineColor + '" stop-opacity="0.35"/>' +
+					'<stop offset="100%" stop-color="' + lineColor + '" stop-opacity="0"/>' +
+				'</linearGradient></defs>' +
+				'<path d="' + area + '" fill="url(#' + gid + ')" stroke="none"/>' +
+				'<path d="' + line + '" fill="none" stroke="' + lineColor + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>' +
+				'<circle cx="' + lastC.x.toFixed(1) + '" cy="' + lastC.y.toFixed(1) + '" r="3" fill="' + lineColor + '"/>' +
+			'</svg>';
+		}
+		function renderTrafficCardChart() {
+			const el = document.getElementById('traffic-card-chart');
+			if (!el || !trafficCardChartPoints) return;
+			el.innerHTML = buildTrafficCardChartSvg(trafficCardChartPoints);
+		}
+		async function loadTrafficCardChart() {
+			try {
+				const res = await fetch('/api/stats-history?t=' + Date.now());
+				const json = await res.json();
+				trafficCardChartPoints = json.traffic || [];
+				renderTrafficCardChart();
+			} catch (e) { }
+		}
 		async function openUsageChart(type) {
 			const modal = document.getElementById('usage-chart-modal');
 			if (!modal) return;
@@ -10313,6 +10369,7 @@ function applySelectedIps() {
 			renderPortCheckboxes();
 			initVipCache();
 			loadUsers();
+			loadTrafficCardChart();
 			window.loadGlobalCleanIpSetting();
 			window.loadGlobalReqLimitSetting();
 			window.loadDeviceWarningThresholdSetting();
