@@ -5562,7 +5562,7 @@ Commercial support is available at
 				</div>
 			</div>
 			<div class="flex items-center gap-2 w-full md:w-auto flex-wrap">
-				<select id="filter-status" onchange="filterAndRenderUsers()" class="w-full md:w-28 shrink-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
+				<select id="filter-status" onchange="filterAndRenderUsers()" class="w-full md:w-auto shrink-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
 					<option value="all">🔍 همه</option>
 					<option value="active">✅ فعال</option>
 					<option value="inactive">❌ غیرفعال</option>
@@ -7888,10 +7888,6 @@ let activeRocketBtn = null;
 						: '<svg class="w-[16.8px] h-[16.8px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
 					const isChecked = (window.selectedUsernames && window.selectedUsernames.has(user.username)) ? 'checked' : '';
 					const onlineBadgeColor = onlineCount >= 3 ? 'bg-red-600' : (onlineCount === 2 ? 'bg-yellow-500' : 'bg-green-600');
-					// دایره‌ی کوچک وضعیت (uc-online-dot) کاملاً مستقل از رنگ آواتار و تعداد دستگاه‌هاست:
-					// فقط برای کاربران فعال (نه غیرفعال و نه منقضی) نمایش داده می‌شه - سبز اگه آنلاین، خاکستری اگه آفلاین.
-					const ucStatusDotVisible = !(user.is_active === 0 || isUserExpired);
-					const ucStatusDotColor = user.is_online === 1 ? 'bg-green-600' : 'bg-gray-400';
 					const onlineBadge = user.is_online === 1
 						? '<span class="min-w-[28px] h-[28px] px-[5.6px] relative inline-flex items-center justify-center text-center leading-none text-[21px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
 						: '';
@@ -7933,7 +7929,7 @@ let activeRocketBtn = null;
 							'<div class="uc-top">' +
 								'<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="uc-checkbox" style="filter: none !important; accent-color: #16a34a !important;">' +
 								'<span class="drag-handle uc-drag" title="جابجایی">☰</span>' +
-								'<div class="uc-avatar' + ucAvatarAlarmClass + '" style="background:' + ucAvatarBg + '">' + ucAvatarLetter + (ucStatusDotVisible ? '<span class="uc-online-dot ' + ucStatusDotColor + '"></span>' : '') + '</div>' +
+								'<div class="uc-avatar' + ucAvatarAlarmClass + '" style="background:' + ucAvatarBg + '">' + ucAvatarLetter + (user.is_online === 1 ? '<span class="uc-online-dot ' + onlineBadgeColor + '"></span>' : '') + '</div>' +
 								'<div class="uc-identity">' +
 									'<span class="uc-username" title="' + user.username + '">' + user.username + '</span>' +
 									'<div class="uc-subline">' + ucDaysChip + ucOnlineChip + deviceWarningBadge + '</div>' +
@@ -10037,7 +10033,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '3.35.0';
+const CURRENT_VERSION = '3.32.0';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
