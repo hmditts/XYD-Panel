@@ -5337,6 +5337,16 @@ Commercial support is available at
 			transition: transform 0.15s ease;
 		}
 		.uc-action-btn:active { transform: scale(0.88); }
+		.cf-ring-svg { transform: rotate(-90deg); }
+		.cf-ring-track { stroke: currentColor; }
+		.cf-ring-bar {
+			stroke-linecap: round;
+			animation: cfRingReach 2.2s ease-in-out infinite;
+		}
+		@keyframes cfRingReach {
+			0%, 100% { stroke-dashoffset: var(--cf-offset); filter: drop-shadow(0 0 0 transparent); }
+			50% { stroke-dashoffset: var(--cf-offset-reach); filter: drop-shadow(0 0 3px currentColor); }
+		}
 	</style>
 </head>
 <body class="bg-gray-100 dark:bg-amoled-bg text-gray-900 dark:text-zinc-100 min-h-screen transition-colors duration-200">
@@ -5448,8 +5458,18 @@ Commercial support is available at
 					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">30d</span>
 				</div>
 			</div>
-			<div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1 mt-1">
-				<div id="stat-cf-progress" class="bg-orange-500 h-1 rounded-full transition-all duration-500" style="width: 0%"></div>
+			<div class="flex items-center justify-center gap-2 mt-1.5">
+				<div class="relative w-11 h-11 shrink-0">
+					<svg class="cf-ring-svg w-11 h-11" viewBox="0 0 40 40">
+						<circle class="cf-ring-track text-gray-200 dark:text-zinc-800" cx="20" cy="20" r="16" fill="none" stroke-width="3.5"></circle>
+						<circle id="stat-cf-progress" class="cf-ring-bar" cx="20" cy="20" r="16" fill="none" stroke-width="3.5" stroke-dasharray="100.53" style="--cf-offset:100.53; --cf-offset-reach:100.53; stroke-dashoffset:100.53;"></circle>
+					</svg>
+					<span id="stat-cf-progress-pct" class="absolute inset-0 flex items-center justify-center text-[9px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
+				</div>
+				<div class="flex flex-col justify-center gap-1 text-[8px] text-gray-500 dark:text-zinc-400 font-medium">
+					<span dir="ltr">مصرف: <span id="stat-cf-progress-used" class="font-bold text-gray-800 dark:text-zinc-200">0</span></span>
+					<span dir="ltr">سقف: <span class="font-bold text-gray-800 dark:text-zinc-200">100k</span></span>
+				</div>
 			</div>
 		</div>
 	</div>
@@ -7590,7 +7610,19 @@ let activeRocketBtn = null;
 				setStatWithLivePulse('stat-cf-requests-7d', formatReqShort(data.cfRequests7d || 0));
 				setStatWithLivePulse('stat-cf-requests-30d', formatReqShort(data.cfRequests30d || 0));
 				const progressPercent = Math.min((cfRequests / 100000) * 100, 100);
-				document.getElementById('stat-cf-progress').style.width = progressPercent + '%';
+				const cfRing = document.getElementById('stat-cf-progress');
+				if (cfRing) {
+					const cfCirc = 2 * Math.PI * 16;
+					const progressPercentReach = Math.min(progressPercent + 4, 100);
+					const cfHue = 120 - (progressPercent * 1.2);
+					const cfColor = 'hsl(' + cfHue + ', 80%, 45%)';
+					cfRing.style.stroke = cfColor;
+					cfRing.style.color = cfColor;
+					cfRing.style.setProperty('--cf-offset', cfCirc - (cfCirc * progressPercent / 100));
+					cfRing.style.setProperty('--cf-offset-reach', cfCirc - (cfCirc * progressPercentReach / 100));
+				}
+				document.getElementById('stat-cf-progress-pct').innerText = progressPercent.toFixed(0) + '٪';
+				document.getElementById('stat-cf-progress-used').innerText = formatReqShort(cfRequests);
 				filterAndRenderUsers();
 			} catch (err) {
 				document.getElementById('loading-state').innerHTML = '<span class="text-red-500">خطا در پردازش اطلاعات کاربران</span>';
