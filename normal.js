@@ -9196,7 +9196,7 @@ window.renderPinnedLocationsList = function() {
 			: window.PINNED_LOCATIONS_CACHE.map(function(cc) {
 				const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
 				return '<span class="inline-flex items-center gap-1 pl-1 pr-2 py-1 border-2 border-black dark:border-brand rounded-md bg-white dark:bg-amoled-card text-[11px] font-bold text-gray-800 dark:text-zinc-200">' +
-					'<button type="button" onclick="pinnedLocationToggle(\'' + cc + '\')" class="text-red-500 hover:text-red-700 font-black leading-none">✕</button>' +
+					'<button type="button" onclick="pinnedLocationToggle(\\'' + cc + '\\')" class="text-red-500 hover:text-red-700 font-black leading-none">✕</button>' +
 					'<span>' + flag + ' ' + cc + '</span>' +
 					'</span>';
 			}).join('');
@@ -9220,7 +9220,7 @@ window.renderPinnedLocationsGrid = function() {
 	}
 	grid.innerHTML = list.map(function(cc) {
 		const pinned = window.PINNED_LOCATIONS_CACHE.indexOf(cc) !== -1;
-		return '<button type="button" onclick="pinnedLocationToggle(\'' + cc + '\')" title="' + cc + '" class="relative flex flex-col items-center justify-center gap-0.5 p-1 rounded-md transition hover:scale-105">' +
+		return '<button type="button" onclick="pinnedLocationToggle(\\'' + cc + '\\')" title="' + cc + '" class="relative flex flex-col items-center justify-center gap-0.5 p-1 rounded-md transition hover:scale-105">' +
 			'<span class="w-9 h-9 rounded-full overflow-hidden border-[3px] ' + (pinned ? 'border-black dark:border-brand' : 'border-gray-200 dark:border-amoled-border opacity-50 hover:opacity-100') + '">' +
 				'<span class="fi fi-' + cc.toLowerCase() + ' zeus-flag-circle"></span>' +
 			'</span>' +
