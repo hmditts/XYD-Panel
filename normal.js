@@ -5058,6 +5058,7 @@ Commercial support is available at
 		};
 	</script>
 	${COMMON_HEAD}
+	<link href="https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,500;0,600;0,700;1,500;1,600&display=swap" rel="stylesheet">
 	<style>
 		body { font-family: 'Vazirmatn', sans-serif; }
 		/* درخشش ملایم و پیوسته‌ی جعبه‌ی آیکون لوگو (کنار متن Z Y X در هدر) */
@@ -5080,11 +5081,11 @@ Commercial support is available at
 		}
 		/* فونت کوچیک‌تر و شیک‌تر برای بج ورژن کنار Z Y X */
 		.panel-version-badge {
-			font-family: 'Orbitron', 'Vazirmatn', sans-serif;
-			font-weight: 500;
+			font-family: 'Poppins', 'Vazirmatn', sans-serif;
+			font-weight: 600;
 			font-style: italic;
-			letter-spacing: 0.06em;
-			opacity: 0.85;
+			letter-spacing: 0.03em;
+			opacity: 0.9;
 		}
 		.zeus-flag {
 			display: inline-block;
@@ -5246,6 +5247,94 @@ Commercial support is available at
 			background-image: linear-gradient(90deg, transparent 0%, #60a5fa 8%, transparent 20%, transparent 75%, #60a5fa 87%, transparent 100%);
 			animation-duration: 18.5s, 7.2s;
 		}
+
+		/* ============================================================
+		   بازطراحی کامل کارت کاربران (کلاس‌های uc- = user-card)
+		   ============================================================ */
+		.uc-card {
+			position: relative;
+			overflow: hidden;
+			border-radius: 16px;
+			padding: 9px;
+			display: flex;
+			flex-direction: column;
+			gap: 8px;
+			background: linear-gradient(160deg, #ffffff, #f4f6fb);
+			border: 1px solid rgba(148,163,184,0.28);
+			box-shadow: 0 1px 2px rgba(15,23,42,0.05), 0 10px 22px -16px rgba(15,23,42,0.35);
+			transition: transform 0.22s ease, box-shadow 0.22s ease;
+		}
+		.dark .uc-card {
+			background: linear-gradient(160deg, #121b30, #0b1120);
+			border-color: rgba(51,65,85,0.55);
+			box-shadow: 0 1px 2px rgba(0,0,0,0.35), 0 12px 26px -16px rgba(0,0,0,0.65);
+		}
+		.uc-card:hover { transform: translateY(-2px); }
+		.uc-top { display: flex; align-items: center; gap: 6px; width: 100%; }
+		.uc-checkbox { width: 17px; height: 17px; border-radius: 6px; border: 1.5px solid #cbd5e1; flex-shrink: 0; cursor: pointer; }
+		.uc-drag { cursor: grab; color: #94a3b8; font-size: 15px; flex-shrink: 0; user-select: none; line-height: 1; }
+		.uc-drag:active { cursor: grabbing; }
+		.uc-avatar {
+			position: relative;
+			width: 33px; height: 33px; border-radius: 11px; flex-shrink: 0;
+			display: flex; align-items: center; justify-content: center;
+			color: #fff; font-weight: 700; font-size: 13.5px;
+			font-family: 'Poppins', 'Vazirmatn', sans-serif;
+			box-shadow: inset 0 0 0 1px rgba(255,255,255,0.3);
+		}
+		.uc-online-dot {
+			position: absolute; bottom: -2px; right: -2px;
+			width: 10px; height: 10px; border-radius: 50%;
+			border: 2px solid #ffffff;
+		}
+		.dark .uc-online-dot { border-color: #0f1729; }
+		.uc-identity { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+		.uc-username {
+			font-family: 'Poppins', 'Vazirmatn', sans-serif;
+			font-weight: 600; font-size: 13.5px; color: #0f172a;
+			white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+		}
+		.dark .uc-username { color: #f1f5f9; }
+		.uc-subline { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+		.uc-chip {
+			display: inline-flex; align-items: center; gap: 2px;
+			padding: 1px 6px; border-radius: 999px;
+			font-weight: 700; font-size: 9px; white-space: nowrap;
+		}
+		.uc-more-btn {
+			width: 27px; height: 27px; border-radius: 9px; flex-shrink: 0; padding: 0; border: 1px solid rgba(100,116,139,0.18);
+			display: flex; align-items: center; justify-content: center;
+			background: rgba(100,116,139,0.1); color: #475569;
+			transition: background 0.2s ease, transform 0.15s ease;
+		}
+		.uc-more-btn:hover { background: rgba(100,116,139,0.2); }
+		.uc-more-btn:active { transform: scale(0.9); }
+		.dark .uc-more-btn { color: #cbd5e1; background: rgba(148,163,184,0.12); border-color: rgba(148,163,184,0.22); }
+		.uc-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 100%; }
+		.uc-actions-overlay {
+			position: absolute; inset: 0; z-index: 30;
+			display: flex; align-items: center; justify-content: center;
+			background: rgba(255,255,255,0.98);
+			border-radius: 16px; padding: 8px;
+			opacity: 0; pointer-events: none; transform: scale(0.95);
+			transition: opacity 0.16s ease, transform 0.16s ease;
+		}
+		.dark .uc-actions-overlay { background: rgba(9,14,27,0.98); }
+		.uc-actions-overlay.uc-actions-open { opacity: 1; pointer-events: auto; transform: scale(1); }
+		.uc-actions-inner { width: 100%; max-height: 100%; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+		.uc-actions-header { display: flex; justify-content: flex-start; }
+		.uc-action-close {
+			width: 20px; height: 20px; border-radius: 7px; padding: 0; border: none;
+			display: flex; align-items: center; justify-content: center;
+			font-size: 11px; color: #94a3b8; background: rgba(100,116,139,0.12);
+		}
+		.uc-actions-grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 7px; padding: 2px 0; }
+		.uc-action-btn {
+			width: 34px; height: 34px; border-radius: 10px; padding: 0; border: none;
+			display: flex; align-items: center; justify-content: center;
+			transition: transform 0.15s ease;
+		}
+		.uc-action-btn:active { transform: scale(0.88); }
 	</style>
 </head>
 <body class="bg-gray-100 dark:bg-amoled-bg text-gray-900 dark:text-zinc-100 min-h-screen transition-colors duration-200">
@@ -5422,7 +5511,7 @@ Commercial support is available at
 			<span class="text-gray-500 dark:text-gray-400">در حال بارگذاری کاربران...</span>
 		</div>
 		<div id="add-user-only-bar" class="hidden mb-4">
-			<button onclick="openCreateModal()" title="افزودن کاربر" class="p-2 rounded-full bg-green-50 dark:bg-green-950/30 border-2 border-green-600 dark:border-green-700/60 hover:bg-green-100 dark:hover:bg-green-900/50 transition-all duration-300 text-green-700 dark:text-green-400 shadow-sm hover:shadow hover:scale-105 cursor-pointer inline-flex items-center justify-center">
+			<button onclick="openCreateModal()" title="افزودن کاربر" class="scale-[0.4] p-2 rounded-full bg-green-50 dark:bg-green-950/30 border-2 border-green-600 dark:border-green-700/60 hover:bg-green-100 dark:hover:bg-green-900/50 transition-all duration-300 text-green-700 dark:text-green-400 shadow-sm hover:shadow hover:scale-[0.44] cursor-pointer inline-flex items-center justify-center shrink-0">
 				<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
 			</button>
 		</div>
@@ -7756,29 +7845,49 @@ let activeRocketBtn = null;
 							(deviceWarningPeakCount ? '<span class="text-[14px] font-bold text-red-500 leading-none">' + deviceWarningPeakCount + '</span>' : '') +
 						  '</span>'
 						: '';
-					return '<div class="group transition-all drop-shadow-sm bg-white/60 dark:bg-zinc-900/40 rounded-md border border-gray-200 dark:border-zinc-800 p-[5.6px] flex flex-col items-center gap-[5.6px] text-center w-full" data-username="' + user.username + '">' +
-							'<div class="flex items-center justify-center flex-wrap gap-[5.6px] w-full">' +
-								'<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="w-[19.6px] h-[19.6px] rounded-md border-[1.4px] border-gray-300 dark:border-zinc-700 text-green-600 bg-white dark:bg-zinc-900 checked:bg-green-600 checked:border-green-600 focus:ring-green-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95" style="filter: none !important; accent-color: #16a34a !important;">' +
-								'<span class="drag-handle text-gray-400 hover:text-gray-600 dark:hover:text-zinc-200 cursor-grab active:cursor-grabbing font-bold text-[14px] select-none px-[2.8px]" title="جابجایی">☰</span>' +
-								'<span class="font-bold text-gray-900 dark:text-zinc-100 text-[15.4px] truncate max-w-[98px]">' + user.username + '</span>' +
-								onlineBadge +
-								deviceWarningBadge +
+					const ucAvatarLetter = (user.username || '?').charAt(0).toUpperCase();
+					const ucAvatarBg = ucHashColor(user.username || '');
+					let ucDaysChip = '';
+					if (daysRemaining === 'نامحدود') {
+						ucDaysChip = '<span class="uc-chip" style="color:#2563eb;background:rgba(37,99,235,0.12)">∞ نامحدود</span>';
+					} else if (isTimerPending) {
+						ucDaysChip = '<span class="uc-chip" style="color:#2563eb;background:rgba(37,99,235,0.12)">⏳ شروع نشده</span>';
+					} else {
+						const ucDaysHue = daysPercent * 1.2;
+						ucDaysChip = '<span class="uc-chip" style="color:hsl(' + ucDaysHue + ',75%,40%);background:hsla(' + ucDaysHue + ',75%,50%,0.15)">' + daysRemaining + ' روز</span>';
+					}
+					const ucOnlineChip = user.is_online === 1
+						? '<span class="uc-chip" style="color:' + (onlineCount >= 3 ? '#dc2626' : onlineCount === 2 ? '#ca8a04' : '#16a34a') + ';background:' + (onlineCount >= 3 ? 'rgba(220,38,38,0.12)' : onlineCount === 2 ? 'rgba(202,138,4,0.14)' : 'rgba(22,163,74,0.12)') + '">' + onlineCount + ' دستگاه</span>'
+						: '';
+					const ucStatusStyle = user.is_active === 0 ? 'color:#16a34a;background:rgba(22,163,74,0.12)' : 'color:#d97706;background:rgba(217,119,6,0.12)';
+					return '<div class="uc-card" data-username="' + user.username + '">' +
+							'<div class="uc-top">' +
+								'<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="uc-checkbox" style="filter: none !important; accent-color: #16a34a !important;">' +
+								'<span class="drag-handle uc-drag" title="جابجایی">☰</span>' +
+								'<div class="uc-avatar" style="background:' + ucAvatarBg + '">' + ucAvatarLetter + (user.is_online === 1 ? '<span class="uc-online-dot ' + onlineBadgeColor + '"></span>' : '') + '</div>' +
+								'<div class="uc-identity">' +
+									'<span class="uc-username" title="' + user.username + '">' + user.username + '</span>' +
+									'<div class="uc-subline">' + ucDaysChip + ucOnlineChip + deviceWarningBadge + '</div>' +
+								'</div>' +
+								'<button type="button" data-user="' + encodeURIComponent(user.username) + '" onclick="toggleCardActions(this)" title="عملیات کاربر" class="uc-more-btn' + actionsColorlessClass + '">' +
+									'<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"></circle><circle cx="12" cy="12" r="2"></circle><circle cx="12" cy="19" r="2"></circle></svg>' +
+								'</button>' +
 							'</div>' +
-							'<div class="flex flex-wrap items-center justify-center gap-[5.6px] py-[2.8px] border-y border-gray-100 dark:border-zinc-800/70 w-full transition-all duration-300' + actionsColorlessClass + '">' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="openStatusLink(this.dataset.user)" title="وضعیت اتصال" class="w-[26.6px] h-[26.6px] p-0 flex items-center justify-center bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/50 rounded-full transition border border-green-200 dark:border-green-800"><svg class="w-[14px] h-[14px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg></button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copySubLink(this.dataset.user)" title="ساب متنی" class="w-[26.6px] h-[26.6px] p-0 flex items-center justify-center bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-full transition border border-indigo-200 dark:border-indigo-800"><svg class="w-[14px] h-[14px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg></button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copyConfig(this.dataset.user)" title="کپی کـانفـیگ" class="w-[26.6px] h-[26.6px] p-0 flex items-center justify-center bg-blue-50 dark:bg-blue-950/40 border border-blue-300 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/60 text-blue-600 dark:text-blue-400 rounded-full transition shadow-sm"><svg class="w-[14px] h-[14px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="showSubQr(this.dataset.user)" title="QR ساب متنی" class="w-[26.6px] h-[26.6px] p-0 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded-full transition border border-amber-200 dark:border-amber-800"><svg class="w-[14px] h-[14px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 19h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg></button>' +
-								'<span class="w-[2.1px] h-[22.4px] bg-gray-300 dark:bg-zinc-700 mx-[2.8px] shrink-0 self-center" aria-hidden="true"></span>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="editUser(this.dataset.user)" title="ویرایش" class="w-[26.6px] h-[26.6px] p-0 flex items-center justify-center bg-green-50 dark:bg-green-950/40 border border-green-300 dark:border-green-800 hover:bg-green-100 dark:hover:bg-green-900/60 text-green-600 dark:text-green-400 rounded-full transition shadow-sm"><svg class="w-[14px] h-[14px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg></button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="toggleUserStatus(this.dataset.user)" title="' + statusBtnTitle + '" class="w-[26.6px] h-[26.6px] p-0 flex items-center justify-center bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-800 hover:bg-amber-100 dark:hover:bg-amber-900/60 ' + statusBtnColor + ' rounded-full transition shadow-sm">' + statusBtnIcon + '</button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="deleteUser(this.dataset.user)" title="حذف" class="w-[26.6px] h-[26.6px] p-0 flex items-center justify-center bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 hover:bg-red-100 dark:hover:bg-red-900/60 text-red-600 dark:text-red-400 rounded-full transition shadow-sm"><svg class="w-[14px] h-[14px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
-								'<div class="!hidden">' +
-									'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copySingboxLink(this.dataset.user)" title="سینگ‌باکس" class="w-[26.6px] h-[26.6px] p-0 flex items-center justify-center bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50 rounded-full transition border border-purple-200 dark:border-purple-800"><svg class="w-[14px] h-[14px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path></svg></button>' +
-									'<button data-user="' + encodeURIComponent(user.username) + '" onclick="showSingboxQr(this.dataset.user)" title="QR سینگ‌باکس" class="w-[26.6px] h-[26.6px] p-0 flex items-center justify-center bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50 rounded-full transition border border-purple-200 dark:border-purple-800"><svg class="w-[14px] h-[14px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 19h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg></button>' +
+							'<div class="uc-stats">' + volumeHtml + reqHtml + '</div>' +
+							'<div class="uc-actions-overlay">' +
+								'<div class="uc-actions-inner">' +
+									'<div class="uc-actions-header"><button type="button" onclick="toggleCardActions(this)" class="uc-action-close" title="بستن">✕</button></div>' +
+									'<div class="uc-actions-grid">' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="openStatusLink(this.dataset.user)" title="وضعیت اتصال" class="uc-action-btn" style="background:rgba(22,163,74,0.12);color:#16a34a"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg></button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copySubLink(this.dataset.user)" title="ساب متنی" class="uc-action-btn" style="background:rgba(79,70,229,0.12);color:#4f46e5"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg></button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copyConfig(this.dataset.user)" title="کپی کـانفـیگ" class="uc-action-btn" style="background:rgba(37,99,235,0.12);color:#2563eb"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="showSubQr(this.dataset.user)" title="QR ساب متنی" class="uc-action-btn" style="background:rgba(217,119,6,0.12);color:#d97706"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 19h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg></button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="editUser(this.dataset.user)" title="ویرایش" class="uc-action-btn" style="background:rgba(5,150,105,0.12);color:#059669"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg></button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="toggleUserStatus(this.dataset.user)" title="' + statusBtnTitle + '" class="uc-action-btn" style="' + ucStatusStyle + '">' + statusBtnIcon + '</button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="deleteUser(this.dataset.user)" title="حذف" class="uc-action-btn" style="background:rgba(220,38,38,0.12);color:#dc2626"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
+									'</div>' +
 								'</div>' +
 							'</div>' +
-							'<div class="grid grid-cols-2 gap-[5.6px] w-full">' + volumeHtml + reqHtml + '</div>' +
 						'</div>';
 				}).join('');
 				updateBulkActionsBar();
@@ -7812,6 +7921,29 @@ let activeRocketBtn = null;
 				});
 			}
 		}
+		function ucHashColor(str) {
+			let hash = 0;
+			for (let i = 0; i < str.length; i++) { hash = str.charCodeAt(i) + ((hash << 5) - hash); }
+			const hue = Math.abs(hash) % 360;
+			return 'linear-gradient(135deg, hsl(' + hue + ',72%,58%), hsl(' + ((hue + 45) % 360) + ',72%,42%))';
+		}
+		function toggleCardActions(btn) {
+			const card = btn.closest('.uc-card');
+			if (!card) return;
+			const overlay = card.querySelector('.uc-actions-overlay');
+			if (!overlay) return;
+			const willOpen = !overlay.classList.contains('uc-actions-open');
+			document.querySelectorAll('.uc-actions-overlay.uc-actions-open').forEach(function (el) {
+				if (el !== overlay) el.classList.remove('uc-actions-open');
+			});
+			overlay.classList.toggle('uc-actions-open', willOpen);
+		}
+		document.addEventListener('click', function (e) {
+			if (e.target.closest('.uc-more-btn') || e.target.closest('.uc-actions-overlay')) return;
+			document.querySelectorAll('.uc-actions-overlay.uc-actions-open').forEach(function (el) {
+				el.classList.remove('uc-actions-open');
+			});
+		});
 		async function toggleUserStatus(encodedUsername) {
 			const username = decodeURIComponent(encodedUsername);
 			try {
