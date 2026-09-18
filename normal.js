@@ -5282,6 +5282,11 @@ Commercial support is available at
 			font-family: 'Poppins', 'Vazirmatn', sans-serif;
 			box-shadow: inset 0 0 0 1px rgba(255,255,255,0.3);
 		}
+		@keyframes ucAvatarAlarm {
+			0%, 100% { background-color: #dc2626; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.3), 0 0 0 0 rgba(220,38,38,0.65); }
+			50% { background-color: #7f1d1d; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.3), 0 0 0 5px rgba(220,38,38,0); }
+		}
+		.uc-avatar-alarm { animation: ucAvatarAlarm 1s ease-in-out infinite; }
 		.uc-online-dot {
 			position: absolute; bottom: -2px; right: -2px;
 			width: 10px; height: 10px; border-radius: 50%;
@@ -7804,6 +7809,24 @@ let activeRocketBtn = null;
 					const usedGb = user.used_gb || 0;
 					const formattedUsed = usedGb < 1 ? (usedGb * 1024).toFixed(0) + ' MB' : usedGb.toFixed(2) + ' GB';
 					const usedReq = user.used_req || 0;
+					// وضعیت «منقضی‌شدن» کاربر (حجم/ریکوئست تمام‌شده یا تاریخ گذشته) - عیناً همون
+					// منطقی که در filterAndRenderUsers برای فیلتر «expired» استفاده می‌شه، اینجا هم
+					// برای تعیین رنگ آواتار (خاکستری) به‌کار می‌ره.
+					let isUserExpired = false;
+					if (user.limit_gb && usedGb >= user.limit_gb) isUserExpired = true;
+					if (user.limit_req && usedReq >= user.limit_req) isUserExpired = true;
+					if (user.expiry_days) {
+						if (user.start_on_first_connect === 1) {
+							if (user.first_connection_time) {
+								const ucExpiryCheckDate = new Date(user.first_connection_time + (user.expiry_days * 24 * 60 * 60 * 1000));
+								if (new Date(serverTime) > ucExpiryCheckDate) isUserExpired = true;
+							}
+						} else if (user.created_at) {
+							const ucCreatedCheck = new Date(user.created_at);
+							const ucExpiryCheckDate = new Date(ucCreatedCheck.getTime() + (user.expiry_days * 24 * 60 * 60 * 1000));
+							if (new Date(serverTime) > ucExpiryCheckDate) isUserExpired = true;
+						}
+					}
 					// وقتی کاربر هیچ مصرفی نداشته (حجم/ریکوئست صفر)، progress و عدد مصرف
 					// invisible می‌شن (نه حذف کامل - جاشون در گرید حفظ می‌مونه) و به محض
 					// شروع مصرف دوباره نمایش داده می‌شن. (این کارت‌ها در لیست اصلی کاربران
@@ -7886,7 +7909,9 @@ let activeRocketBtn = null;
 						  '</span>'
 						: '';
 					const ucAvatarLetter = (user.username || '?').charAt(0).toUpperCase();
-					const ucAvatarBg = ucHashColor(user.username || '');
+					const ucAvatarColorInfo = ucAvatarStatusColor(user.is_active, isUserExpired, user.is_online === 1, onlineCount);
+					const ucAvatarBg = ucAvatarColorInfo.bg;
+					const ucAvatarAlarmClass = ucAvatarColorInfo.alarm ? ' uc-avatar-alarm' : '';
 					let ucDaysChip = '';
 					if (daysRemaining === 'نامحدود') {
 						ucDaysChip = '<span class="uc-chip uc-chip-infinite" style="background:rgba(37,99,235,0.12)">∞ نامحدود</span>';
@@ -7904,7 +7929,7 @@ let activeRocketBtn = null;
 							'<div class="uc-top">' +
 								'<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="uc-checkbox" style="filter: none !important; accent-color: #16a34a !important;">' +
 								'<span class="drag-handle uc-drag" title="جابجایی">☰</span>' +
-								'<div class="uc-avatar" style="background:' + ucAvatarBg + '">' + ucAvatarLetter + (user.is_online === 1 ? '<span class="uc-online-dot ' + onlineBadgeColor + '"></span>' : '') + '</div>' +
+								'<div class="uc-avatar' + ucAvatarAlarmClass + '" style="background:' + ucAvatarBg + '">' + ucAvatarLetter + (user.is_online === 1 ? '<span class="uc-online-dot ' + onlineBadgeColor + '"></span>' : '') + '</div>' +
 								'<div class="uc-identity">' +
 									'<span class="uc-username" title="' + user.username + '">' + user.username + '</span>' +
 									'<div class="uc-subline">' + ucDaysChip + ucOnlineChip + deviceWarningBadge + '</div>' +
@@ -7961,11 +7986,18 @@ let activeRocketBtn = null;
 				});
 			}
 		}
-		function ucHashColor(str) {
-			let hash = 0;
-			for (let i = 0; i < str.length; i++) { hash = str.charCodeAt(i) + ((hash << 5) - hash); }
-			const hue = Math.abs(hash) % 360;
-			return 'linear-gradient(135deg, hsl(' + hue + ',72%,58%), hsl(' + ((hue + 45) % 360) + ',72%,42%))';
+		// رنگ آواتار کاربر دیگه رندوم/هش نیست، بلکه بر اساس وضعیت واقعی‌شه:
+		//  - غیرفعال (is_active=0) یا منقضی (حجم/ریکوئست/زمان تمام‌شده): خاکستری - بالاترین اولویت
+		//  - آنلاین نبودن (حالت عادی): آبی
+		//  - آنلاین با ۱ دستگاه: سبز | ۲ دستگاه: زرد | ۳ دستگاه: قرمز | ۴+ دستگاه: قرمزِ چشمک‌زن (آلارم)
+		function ucAvatarStatusColor(isActive, isExpired, isOnline, onlineCount) {
+			if (isActive === 0 || isExpired) return { bg: '#6b7280', alarm: false };
+			if (!isOnline) return { bg: '#3b82f6', alarm: false };
+			const devices = onlineCount || 0;
+			if (devices <= 1) return { bg: '#16a34a', alarm: false };
+			if (devices === 2) return { bg: '#ca8a04', alarm: false };
+			if (devices === 3) return { bg: '#dc2626', alarm: false };
+			return { bg: '#dc2626', alarm: true };
 		}
 		function toggleCardActions(btn) {
 			const card = btn.closest('.uc-card');
