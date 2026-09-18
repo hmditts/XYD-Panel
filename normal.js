@@ -4784,23 +4784,64 @@ const COMMON_HEAD = `
 	<link rel="manifest" href="/manifest.json">
 	<link rel="icon" type="image/svg+xml" href="/icon.svg">
 	<link rel="apple-touch-icon" href="/icon.svg">
-	<meta name="theme-color" content="#0a0f1c">
+	<meta name="theme-color" content="#0a0a0a">
 	<meta name="mobile-web-app-capable" content="yes">
 	<meta name="apple-mobile-web-app-capable" content="yes">
 	<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-	<meta name="apple-mobile-web-app-title" content="ZEUS Panel">
+	<meta name="apple-mobile-web-app-title" content="ZYX Panel">
 	<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
 	<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/lipis/flag-icons@7.3.2/css/flag-icons.min.css">
-	<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700&display=swap" rel="stylesheet">
+	<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@700;800&display=swap" rel="stylesheet">
+<style>
+	/* ===== هویت بصری مشترک (نئوبروتالیسم تیره) — در COMMON_HEAD تا روی همه‌ی صفحات
+	   (لاگین/تعریف رمز/پنل اصلی) یکسان اعمال بشه، نه فقط پنل. با !important چون
+	   ترتیب تزریق <style> تیلویند CDN تضمین‌شده نیست. */
+	.rounded-md, .rounded-lg, .rounded-xl, .rounded-2xl {
+		border-radius: 4px !important;
+	}
+	.shadow-sm {
+		box-shadow: 2px 2px 0 0 rgba(124,58,237,0.35) !important;
+	}
+	.shadow-md, .hover\\:shadow-md:hover {
+		box-shadow: 3px 3px 0 0 rgba(124,58,237,0.45) !important;
+	}
+	.shadow-lg {
+		box-shadow: 4px 4px 0 0 rgba(124,58,237,0.55) !important;
+	}
+	.shadow-xl, .shadow-2xl {
+		box-shadow: 6px 6px 0 0 rgba(124,58,237,0.6) !important;
+	}
+	@keyframes logoPop {
+		0%, 100% { box-shadow: 2px 2px 0 0 #d7ff3d; }
+		50% { box-shadow: 4px 4px 0 0 #d7ff3d; }
+	}
+	.logo-glow {
+		border: 2px solid #0a0a0a;
+		animation: logoPop 2.4s ease-in-out infinite;
+	}
+	.dark .logo-glow {
+		border-color: #d7ff3d;
+	}
+	.brand-logo-text {
+		font-family: 'Space Grotesk', 'Vazirmatn', sans-serif;
+		font-weight: 800;
+		letter-spacing: 0.01em;
+		background: linear-gradient(90deg, #a78bfa 0%, #d7ff3d 100%);
+		-webkit-background-clip: text;
+		background-clip: text;
+		color: transparent !important;
+	}
+</style>
 <script>
 	tailwind.config = {
 		darkMode: 'class',
 		theme: {
 			extend: {
-				fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
+				fontFamily: { sans: ['Vazirmatn', 'sans-serif'], display: ['"Space Grotesk"', 'Vazirmatn', 'sans-serif'] },
 				colors: {
-					amoled: { bg: '#0a0f1c', card: '#111a2e', input: '#16213a', border: '#25324a' },
-					navy: { 50: '#eef2f8', 100: '#d7e0ef', 400: '#7089b3', 500: '#3f5a86', 600: '#2f486d', 700: '#243a58', 800: '#1a2b42', 900: '#111c2c' }
+					amoled: { bg: '#0a0a0a', card: '#141414', input: '#1b1b1b', border: '#3a3a42' },
+					navy: { 50: '#f5f3ff', 100: '#ede9fe', 400: '#a78bfa', 500: '#8b5cf6', 600: '#7c3aed', 700: '#6d28d9', 800: '#5b21b6', 900: '#4c1d95' },
+					brand: { DEFAULT: '#d7ff3d', dark: '#a6cc00' }
 				}
 			}
 		}
@@ -4874,11 +4915,12 @@ Commercial support is available at
 	${COMMON_HEAD}
 </head>
 <body class="bg-gray-100 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
-	<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-lg shadow-lg p-8 relative z-10">
-		<div class="flex items-center justify-center mb-5">
-			<div class="w-11 h-11 rounded-md bg-navy-700 dark:bg-navy-600 flex items-center justify-center">
-				<svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+	<div class="w-full max-w-md bg-white dark:bg-amoled-card border-[3px] border-black dark:border-brand rounded-lg shadow-lg p-8 relative z-10">
+		<div class="flex flex-col items-center justify-center mb-6 gap-2">
+			<div class="w-12 h-12 rounded-md bg-navy-700 dark:bg-navy-600 flex items-center justify-center logo-glow">
+				<svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z"></path></svg>
 			</div>
+			<span class="tracking-wide brand-logo-text text-xl" dir="ltr">Z Y X</span>
 		</div>
 		<h2 class="text-lg font-bold mb-1.5 text-center text-gray-900 dark:text-zinc-100">تنظیم رمز عبور جدید</h2>
 		<p class="text-sm text-gray-500 dark:text-zinc-400 text-center mb-7 leading-relaxed">این اولین ورود شما به پـنـل مدیریت است. لطفاً رمز عبور خود را تعیین کنید.</p>
@@ -4891,7 +4933,7 @@ Commercial support is available at
 				<label class="block text-xs font-semibold text-gray-600 dark:text-zinc-400 mb-1.5">تکرار رمز عبور</label>
 				<input type="password" id="confirm-password" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-navy-500 focus:border-navy-500 text-sm text-center font-mono" required minlength="4">
 			</div>
-			<button type="submit" id="submit-btn" class="w-full py-2.5 bg-navy-700 hover:bg-navy-800 dark:bg-navy-600 dark:hover:bg-navy-700 text-white font-semibold rounded-md text-sm transition">ثبت و ورود</button>
+			<button type="submit" id="submit-btn" class="w-full py-2.5 bg-brand hover:bg-brand-dark text-black font-black border-[3px] border-black rounded-md text-sm transition">ثبت و ورود</button>
 		</form>
 	</div>
 	${COMMON_TOAST_HTML}
@@ -4942,12 +4984,13 @@ Commercial support is available at
 	${COMMON_HEAD}
 </head>
 <body class="bg-gray-100 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
-	<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-lg shadow-lg p-8 relative z-10">
+	<div class="w-full max-w-md bg-white dark:bg-amoled-card border-[3px] border-black dark:border-brand rounded-lg shadow-lg p-8 relative z-10">
 		<div id="login-section">
-			<div class="flex items-center justify-center mb-5">
-				<div class="w-11 h-11 rounded-md bg-navy-700 dark:bg-navy-600 flex items-center justify-center">
-					<svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+			<div class="flex flex-col items-center justify-center mb-6 gap-2">
+				<div class="w-12 h-12 rounded-md bg-navy-700 dark:bg-navy-600 flex items-center justify-center logo-glow">
+					<svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z"></path></svg>
 				</div>
+				<span class="tracking-wide brand-logo-text text-xl" dir="ltr">Z Y X</span>
 			</div>
 			<h2 class="text-lg font-bold mb-6 text-center text-gray-900 dark:text-zinc-100">ورود به پـنـل مدیریت</h2>
 			<form onsubmit="handleLogin(event)" class="space-y-4">
@@ -4955,7 +4998,7 @@ Commercial support is available at
 					<label class="block text-xs font-semibold text-gray-600 dark:text-zinc-400 mb-1.5">رمز عبور</label>
 					<input type="password" id="password" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-navy-500 focus:border-navy-500 text-sm text-center font-mono" required>
 				</div>
-				<button type="submit" id="submit-btn" class="w-full py-2.5 bg-navy-700 hover:bg-navy-800 dark:bg-navy-600 dark:hover:bg-navy-700 text-white font-semibold rounded-md text-sm transition">ورود</button>
+				<button type="submit" id="submit-btn" class="w-full py-2.5 bg-brand hover:bg-brand-dark text-black font-black border-[3px] border-black rounded-md text-sm transition">ورود</button>
 			</form>
 			<div class="mt-5 text-center">
 				<button onclick="toggleRecovery(true)" class="text-xs text-navy-600 dark:text-navy-400 hover:underline font-medium">بازیابی رمز پـنـل</button>
@@ -4976,7 +5019,7 @@ Commercial support is available at
 				</div>
 				<div class="flex gap-2 pt-2">
 					<button type="button" onclick="toggleRecovery(false)" class="w-1/3 py-2.5 bg-white dark:bg-transparent border border-gray-300 dark:border-amoled-border text-gray-600 dark:text-zinc-300 hover:bg-gray-50 dark:hover:bg-amoled-input font-semibold rounded-md text-sm transition">انصراف</button>
-					<button type="submit" id="recover-btn" class="w-2/3 py-2.5 bg-navy-700 hover:bg-navy-800 dark:bg-navy-600 dark:hover:bg-navy-700 text-white font-semibold rounded-md text-sm transition">بازیابی رمز پـنـل</button>
+					<button type="submit" id="recover-btn" class="w-2/3 py-2.5 bg-brand hover:bg-brand-dark text-black font-black border-[3px] border-black rounded-md text-sm transition">بازیابی رمز پـنـل</button>
 				</div>
 			</form>
 		</div>
@@ -5060,24 +5103,12 @@ Commercial support is available at
 	${COMMON_HEAD}
 	<style>
 		body { font-family: 'Vazirmatn', sans-serif; }
-		/* درخشش ملایم و پیوسته‌ی جعبه‌ی آیکون لوگو (کنار متن Z Y X در هدر) */
-		@keyframes logoGlow {
-			0%, 100% { box-shadow: 0 0 5px 1px rgba(59,130,246,0.55), 0 0 0 0 rgba(96,165,250,0); }
-			50% { box-shadow: 0 0 13px 4px rgba(96,165,250,0.9), 0 0 20px 6px rgba(59,130,246,0.35); }
-		}
-		.logo-glow {
-			animation: logoGlow 2.6s ease-in-out infinite;
-		}
-		/* فونت و استایل شیک‌تر برای متن برند Z Y X کنار لوگو */
-		.brand-logo-text {
-			font-family: 'Orbitron', 'Vazirmatn', sans-serif;
-			font-weight: 700;
-			letter-spacing: 0.14em;
-			background: linear-gradient(90deg, #60a5fa 0%, #38bdf8 45%, #93c5fd 55%, #60a5fa 100%);
-			-webkit-background-clip: text;
-			background-clip: text;
-			color: transparent !important;
-		}
+		/* ===== هویت بصری جدید (بازطراحی کامل ظاهر) =====
+		   جهت‌گیری: نئوبروتالیسم تیره — گوشه‌های تیزتر، سایه‌ی افستِ سخت به‌جای درخشش نرم،
+		   دو رنگ برند جدید (بنفش الکتریک برای عناصر تعاملی + سبز-لیمویی برای لهجه‌ی برند)
+		   به‌جای آبی سرمه‌ای قبلی. قوانین مشترک (radius/shadow override, logo-glow,
+		   brand-logo-text) به COMMON_HEAD منتقل شدن تا صفحه‌ی لاگین/تعریف رمز هم همین
+		   هویت بصری رو بگیرن، نه فقط پنل اصلی — اینجا فقط چیزهای مخصوص پنل باقی موندن. */
 		.zeus-flag {
 			display: inline-block;
 			width: 1.35em;
@@ -5092,6 +5123,16 @@ Commercial support is available at
 			font-size: 1.1em;
 			line-height: 1;
 			vertical-align: -0.05em;
+		}
+		/* آواتار دایره‌ای برای گرید کشورها در تنظیمات لوکیشن‌ها (جایگزین لیست/دراپ‌داون قبلی) */
+		.zeus-flag-circle {
+			display: block;
+			width: 100%;
+			height: 100%;
+			background-size: cover;
+			background-position: 50%;
+			background-repeat: no-repeat;
+			border-radius: 50%;
 		}
 		body:not(.selection-mode-active) input[name="select-user"] {
 			display: none !important;
@@ -5122,15 +5163,15 @@ Commercial support is available at
 		}
 		html.dark::-webkit-scrollbar-track,
 		.dark *::-webkit-scrollbar-track {
-			background: #0a0f1c !important;
+			background: #0a0a0a !important;
 		}
 		html.dark::-webkit-scrollbar-thumb,
 		.dark *::-webkit-scrollbar-thumb {
-			background: #25324a !important;
+			background: #4c3a66 !important;
 		}
 		html.dark::-webkit-scrollbar-thumb:hover,
 		.dark *::-webkit-scrollbar-thumb:hover {
-			background: #354968 !important;
+			background: #6d28d9 !important;
 		}
 		html, * {
 			scrollbar-width: thin;
@@ -5138,7 +5179,7 @@ Commercial support is available at
 		}
 		
 		html.dark, .dark * {
-			scrollbar-color: #25324a #0a0f1c !important;
+			scrollbar-color: #4c3a66 #0a0a0a !important;
 		}
 		@media (min-width: 769px) {
 			header, main { zoom: 1.25; }
@@ -5219,7 +5260,7 @@ Commercial support is available at
 			background: #ffffff;
 		}
 		.dark .neon-orbit::after {
-			background: #111a2e;
+			background: #141414;
 		}
 		.neon-orbit > * {
 			position: relative;
@@ -5246,7 +5287,7 @@ Commercial support is available at
 			<div class="flex flex-row flex-wrap justify-center items-center gap-3 w-full md:w-auto">
 				<h1 class="text-lg font-bold flex items-center gap-2.5" dir="ltr">
 					<span class="w-7 h-7 rounded-md bg-navy-700 dark:bg-navy-600 flex items-center justify-center flex-shrink-0 logo-glow">
-						<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.456-2.456L14.25 6l1.035-.259a3.375 3.375 0 002.456-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z"></path></svg>
+						<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z"></path></svg>
 					</span>
 					<span class="tracking-wide brand-logo-text">Z Y X</span>
 					<span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-navy-100 text-navy-700 dark:bg-navy-900/40 dark:text-navy-400 rounded-full"></span>
@@ -5326,7 +5367,7 @@ Commercial support is available at
 	</header>
 	<main class="max-w-6xl mx-auto px-4 pt-4 pb-56 md:pb-32 relative z-10">
 <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
-	<div id="card-cf-requests" onclick="openUsageChart('requests')" class="neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
+	<div id="card-cf-requests" onclick="openUsageChart('requests')" class="neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border-[3px] border-black dark:border-brand rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
 		<div class="flex items-center justify-center gap-1.5 relative z-10">
 			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Request</span>
 			<div class="p-1 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-md flex-shrink-0">
@@ -5357,7 +5398,7 @@ Commercial support is available at
 			</div>
 		</div>
 	</div>
-	<div id="card-d1-usage" class="neon-orbit neon-orbit-2 col-span-2 lg:col-span-1 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-purple-400 dark:hover:border-purple-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
+	<div id="card-d1-usage" class="neon-orbit neon-orbit-2 col-span-2 lg:col-span-1 bg-white dark:bg-amoled-card border-[3px] border-black dark:border-brand rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-purple-400 dark:hover:border-purple-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
 		<div class="flex items-center justify-center gap-1.5 relative z-10">
 			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">D1</span>
 			<div class="p-1 bg-purple-50 dark:bg-purple-950/30 text-purple-600 dark:text-purple-400 rounded-md flex-shrink-0">
@@ -5386,7 +5427,7 @@ Commercial support is available at
 			</div>
 		</div>
 	</div>
-	<div id="card-traffic" onclick="openUsageChart('traffic')" class="neon-orbit neon-orbit-3 col-span-2 lg:col-span-1 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
+	<div id="card-traffic" onclick="openUsageChart('traffic')" class="neon-orbit neon-orbit-3 col-span-2 lg:col-span-1 bg-white dark:bg-amoled-card border-[3px] border-black dark:border-brand rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
 		<div class="flex items-center justify-center gap-1.5 relative z-10">
 			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Traffic</span>
 			<div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0">
@@ -6539,10 +6580,13 @@ Commercial support is available at
 						</span>
 						<span id="pinned-locations-count" class="text-[10px] font-normal text-gray-400 dark:text-zinc-500"></span>
 					</label>
-					<div id="pinned-locations-list" class="max-h-48 overflow-y-auto border border-gray-200 dark:border-amoled-border rounded-md bg-white dark:bg-amoled-input mb-2"></div>
-					<div class="flex items-center gap-2">
-						<select id="pinned-location-add-select" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100"></select>
-						<button type="button" onclick="pinnedLocationAdd()" class="px-3 py-2 bg-gray-600 hover:bg-gray-700 dark:bg-zinc-600 dark:hover:bg-zinc-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">افزودن</button>
+					<div id="pinned-locations-list" class="flex flex-wrap gap-1.5 mb-2 min-h-[2.25rem] p-1.5 border-2 border-dashed border-gray-200 dark:border-amoled-border rounded-md"></div>
+					<div class="relative mb-2">
+						<input type="text" id="pinned-location-search" oninput="renderPinnedLocationsGrid()" placeholder="جستجوی کد کشور (مثلاً DE, US, TR)..." class="w-full pl-9 pr-3 py-2 bg-white dark:bg-amoled-input border-2 border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-navy-500 focus:border-navy-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						<svg class="w-4 h-4 absolute top-1/2 -translate-y-1/2 left-3 text-gray-400 dark:text-zinc-500 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+					</div>
+					<div id="pinned-locations-grid" class="grid grid-cols-5 sm:grid-cols-6 gap-2 max-h-56 overflow-y-auto p-1.5 border-2 border-gray-200 dark:border-amoled-border rounded-md bg-white dark:bg-amoled-input mb-2"></div>
+					<div class="flex items-center justify-end">
 						<button type="button" onclick="savePinnedLocations()" id="save-pinned-locations-btn" class="px-3 py-2 bg-emerald-700 hover:bg-emerald-800 dark:bg-emerald-600 dark:hover:bg-emerald-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
 					</div>
 				</div>
@@ -7467,7 +7511,7 @@ let activeRocketBtn = null;
 				const warningBtn = document.getElementById('cf-warning-btn');
 				if (cfRequests >= 90000) {
 					if (reqCard) {
-						reqCard.className = "neon-orbit neon-orbit-1 col-span-2 bg-red-50 dark:bg-red-950/20 border border-red-500 rounded-md p-2.5 flex flex-col justify-center gap-1 hover:shadow-md transition duration-300 relative overflow-hidden group min-h-[64px] animate-pulse cursor-pointer";
+						reqCard.className = "neon-orbit neon-orbit-1 col-span-2 bg-red-50 dark:bg-red-950/20 border-[3px] border-red-600 dark:border-red-500 rounded-md p-2.5 flex flex-col justify-center gap-1 hover:shadow-md transition duration-300 relative overflow-hidden group min-h-[64px] animate-pulse cursor-pointer";
 					}
 					if (warningBtn) {
 						warningBtn.classList.remove('hidden');
@@ -7478,7 +7522,7 @@ let activeRocketBtn = null;
 					}
 				} else {
 					if (reqCard) {
-						reqCard.className = "neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer";
+						reqCard.className = "neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border-[3px] border-black dark:border-brand rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer";
 					}
 					if (warningBtn) {
 						warningBtn.classList.add('hidden');
@@ -9146,49 +9190,54 @@ window.renderPinnedLocationsList = function() {
 	const container = document.getElementById('pinned-locations-list');
 	const countEl = document.getElementById('pinned-locations-count');
 	if (countEl) countEl.innerText = window.PINNED_LOCATIONS_CACHE.length + ' کشور';
-	if (!container) return;
-	const lastIdx = window.PINNED_LOCATIONS_CACHE.length - 1;
-	container.innerHTML = window.PINNED_LOCATIONS_CACHE.map(function(cc, i) {
-		const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
-		return '<div class="flex items-center gap-2 py-1.5 px-2 border-b border-gray-100 dark:border-zinc-800 last:border-0">' +
-			'<span class="flex-1 text-xs font-bold text-gray-800 dark:text-zinc-200">' + flag + ' ' + cc + '</span>' +
-			'<button type="button" onclick="pinnedLocationMoveUp(' + i + ')" ' + (i === 0 ? 'disabled' : '') + ' class="p-1 rounded text-gray-500 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed">▲</button>' +
-			'<button type="button" onclick="pinnedLocationMoveDown(' + i + ')" ' + (i === lastIdx ? 'disabled' : '') + ' class="p-1 rounded text-gray-500 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed">▼</button>' +
-			'<button type="button" onclick="pinnedLocationRemove(' + i + ')" class="p-1 rounded text-red-500 hover:text-red-700">✕</button>' +
-			'</div>';
-	}).join('');
-	if (typeof renderGlobalLocationBadges === 'function') renderGlobalLocationBadges();
-};
-window.pinnedLocationMoveUp = function(i) {
-	const arr = window.PINNED_LOCATIONS_CACHE;
-	if (i <= 0 || i >= arr.length) return;
-	const tmp = arr[i - 1];
-	arr[i - 1] = arr[i];
-	arr[i] = tmp;
-	window.renderPinnedLocationsList();
-};
-window.pinnedLocationMoveDown = function(i) {
-	const arr = window.PINNED_LOCATIONS_CACHE;
-	if (i < 0 || i >= arr.length - 1) return;
-	const tmp = arr[i + 1];
-	arr[i + 1] = arr[i];
-	arr[i] = tmp;
-	window.renderPinnedLocationsList();
-};
-window.pinnedLocationRemove = function(i) {
-	window.PINNED_LOCATIONS_CACHE.splice(i, 1);
-	window.renderPinnedLocationsList();
-};
-window.pinnedLocationAdd = function() {
-	const select = document.getElementById('pinned-location-add-select');
-	if (!select || !select.value) return;
-	const cc = select.value;
-	if (window.PINNED_LOCATIONS_CACHE.indexOf(cc) === -1) {
-		window.PINNED_LOCATIONS_CACHE.push(cc);
-		window.renderPinnedLocationsList();
-	} else {
-		showToast('این کشور از قبل توی لیست پین‌شده‌هاست.');
+	if (container) {
+		container.innerHTML = window.PINNED_LOCATIONS_CACHE.length === 0
+			? '<span class="text-[10px] text-gray-400 dark:text-zinc-500 px-1">هنوز کشوری پین نشده — از گرید پایین انتخاب کنید</span>'
+			: window.PINNED_LOCATIONS_CACHE.map(function(cc) {
+				const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
+				return '<span class="inline-flex items-center gap-1 pl-1 pr-2 py-1 border-2 border-black dark:border-brand rounded-md bg-white dark:bg-amoled-card text-[11px] font-bold text-gray-800 dark:text-zinc-200">' +
+					'<button type="button" onclick="pinnedLocationToggle(\'' + cc + '\')" class="text-red-500 hover:text-red-700 font-black leading-none">✕</button>' +
+					'<span>' + flag + ' ' + cc + '</span>' +
+					'</span>';
+			}).join('');
 	}
+	if (typeof renderGlobalLocationBadges === 'function') renderGlobalLocationBadges();
+	window.renderPinnedLocationsGrid();
+};
+// گرید دایره‌ای قابل‌جستجوی همه‌ی کشورهای ISO؛ کلیک روی هر دایره پین/آن‌پین می‌کنه
+// (جایگزین دراپ‌داون + لیست قبلی، طبق طرح جدید کاربر).
+window.renderPinnedLocationsGrid = function() {
+	const grid = document.getElementById('pinned-locations-grid');
+	if (!grid) return;
+	const searchInput = document.getElementById('pinned-location-search');
+	const q = (searchInput && searchInput.value ? searchInput.value : '').trim().toUpperCase();
+	const list = window.ALL_ISO_COUNTRIES_LIST.filter(function(cc) {
+		return !q || cc.indexOf(q) !== -1;
+	});
+	if (list.length === 0) {
+		grid.innerHTML = '<div class="col-span-full text-center text-[11px] text-gray-400 dark:text-zinc-500 py-3">موردی پیدا نشد</div>';
+		return;
+	}
+	grid.innerHTML = list.map(function(cc) {
+		const pinned = window.PINNED_LOCATIONS_CACHE.indexOf(cc) !== -1;
+		return '<button type="button" onclick="pinnedLocationToggle(\'' + cc + '\')" title="' + cc + '" class="relative flex flex-col items-center justify-center gap-0.5 p-1 rounded-md transition hover:scale-105">' +
+			'<span class="w-9 h-9 rounded-full overflow-hidden border-[3px] ' + (pinned ? 'border-black dark:border-brand' : 'border-gray-200 dark:border-amoled-border opacity-50 hover:opacity-100') + '">' +
+				'<span class="fi fi-' + cc.toLowerCase() + ' zeus-flag-circle"></span>' +
+			'</span>' +
+			'<span class="text-[9px] font-bold text-gray-600 dark:text-zinc-400">' + cc + '</span>' +
+			(pinned ? '<span class="absolute -top-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-emerald-600 border border-white dark:border-amoled-bg text-white text-[8px] flex items-center justify-center font-black leading-none">✓</span>' : '') +
+			'</button>';
+	}).join('');
+};
+window.pinnedLocationToggle = function(cc) {
+	if (!cc) return;
+	const idx = window.PINNED_LOCATIONS_CACHE.indexOf(cc);
+	if (idx === -1) {
+		window.PINNED_LOCATIONS_CACHE.push(cc);
+	} else {
+		window.PINNED_LOCATIONS_CACHE.splice(idx, 1);
+	}
+	window.renderPinnedLocationsList();
 };
 window.savePinnedLocations = async function() {
 	const btn = document.getElementById('save-pinned-locations-btn');
@@ -9246,19 +9295,11 @@ window.applyPinnedLocationsToAllUsers = async function(btn) {
 		showToast('⚠️ ذخیره شد ولی اعمال خودکار لوکیشن‌ها روی کاربرها با خطا مواجه شد.');
 	}
 };
+// قبلاً دراپ‌داون افزودن کشور رو پر می‌کرد؛ حالا که اون select حذف شده و جاش گرید
+// دایره‌ای قابل‌جستجو نشسته، این تابع فقط گرید اولیه رو می‌سازه (اسمش برای سازگاری
+// با نقطه‌ی صدازدن در initPanel دست‌نخورده مونده).
 window.populatePinnedLocationSelects = function() {
-	const addSelect = document.getElementById('pinned-location-add-select');
-	[addSelect].forEach(function(select) {
-		if (!select) return;
-		select.innerHTML = '';
-		window.ALL_ISO_COUNTRIES_LIST.forEach(function(cc) {
-			const option = document.createElement('option');
-			option.value = cc;
-			const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
-			option.textContent = flag + ' ' + cc;
-			select.appendChild(option);
-		});
-	});
+	window.renderPinnedLocationsGrid();
 };
 
 function generateInlineProxyJunkClient(len) {
@@ -9766,7 +9807,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '3.32.0';
+const CURRENT_VERSION = '3.33.0';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
@@ -10820,8 +10861,8 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 	<style>
 		body { font-family: 'Vazirmatn', sans-serif; }
 		.glass {
-			background: rgba(17, 26, 46, 0.75);
-			border: 1px solid rgba(255, 255, 255, 0.06);
+			background: rgba(20, 20, 20, 0.75);
+			border: 1px solid rgba(215, 255, 61, 0.08);
 		}
 		.zeus-flag {
 			display: inline-block;
