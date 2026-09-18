@@ -5301,6 +5301,8 @@ Commercial support is available at
 			padding: 1px 6px; border-radius: 999px;
 			font-weight: 700; font-size: 9px; white-space: nowrap;
 		}
+		.uc-chip-infinite { color: #2563eb; }
+		.dark .uc-chip-infinite { color: #60a5fa; }
 		.uc-more-btn {
 			width: 27px; height: 27px; border-radius: 9px; flex-shrink: 0; padding: 0; border: 1px solid rgba(100,116,139,0.18);
 			display: flex; align-items: center; justify-content: center;
@@ -5341,28 +5343,31 @@ Commercial support is available at
 	<header class="border-b border-gray-200 dark:border-amoled-border bg-gray-50/95 dark:bg-amoled-card/95 px-4 py-4 relative z-10">
 		<div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-2 md:gap-4">
 			<div class="flex flex-wrap items-center justify-center gap-3 w-full max-w-[260px] mx-auto md:max-w-none md:mx-0 md:w-auto mt-3 md:mt-0">
-				<button onclick="toggleImportModal(true)"
+				<button onclick="logoutAdmin()"
 				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-teal-50 dark:bg-teal-950/30
-				           border border-teal-200 dark:border-teal-900
-				           hover:bg-teal-100 dark:hover:bg-teal-900/50
+				           bg-red-50 dark:bg-red-950/30
+				           border border-red-200 dark:border-red-900
+				           hover:bg-red-100 dark:hover:bg-red-900/50
 				           transition-all duration-200
-				           text-teal-600 dark:text-teal-400 shadow-sm"
-				    title="ایمپورت کاربران">
+				           text-red-600 dark:text-red-400
+				           shadow-sm hover:shadow-md"
+				    title="خروج">
 				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
 				    </svg>
 				</button>
-				<button id="github-update-toggle" onclick="applyGithubUpdate()"
+				
+				<button onclick="toggleSettingsModal(true)"
 				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-indigo-50 dark:bg-indigo-950/30
-				           border border-indigo-200 dark:border-indigo-900
-				           hover:bg-indigo-100 dark:hover:bg-indigo-900/50
+				           bg-gray-50 dark:bg-zinc-800/50
+				           border border-gray-200 dark:border-zinc-700
+				           hover:bg-gray-100 dark:hover:bg-zinc-700/80
 				           transition-all duration-200
-				           text-indigo-600 dark:text-indigo-400 shadow-sm"
-				    title="Update">
+				           text-gray-600 dark:text-zinc-400 shadow-sm"
+				    title="تنظیمات">
 				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"></path>
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
 				    </svg>
 				</button>
 				<button id="theme-toggle"
@@ -5380,32 +5385,28 @@ Commercial support is available at
 				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path>
 				    </svg>
 				</button>
-				
-				<button onclick="toggleSettingsModal(true)"
+				<button id="github-update-toggle" onclick="applyGithubUpdate()"
 				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-gray-50 dark:bg-zinc-800/50
-				           border border-gray-200 dark:border-zinc-700
-				           hover:bg-gray-100 dark:hover:bg-zinc-700/80
+				           bg-indigo-50 dark:bg-indigo-950/30
+				           border border-indigo-200 dark:border-indigo-900
+				           hover:bg-indigo-100 dark:hover:bg-indigo-900/50
 				           transition-all duration-200
-				           text-gray-600 dark:text-zinc-400 shadow-sm"
-				    title="تنظیمات">
+				           text-indigo-600 dark:text-indigo-400 shadow-sm"
+				    title="Update">
 				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"></path>
 				    </svg>
 				</button>
-				
-				<button onclick="logoutAdmin()"
+				<button onclick="toggleImportModal(true)"
 				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-red-50 dark:bg-red-950/30
-				           border border-red-200 dark:border-red-900
-				           hover:bg-red-100 dark:hover:bg-red-900/50
+				           bg-teal-50 dark:bg-teal-950/30
+				           border border-teal-200 dark:border-teal-900
+				           hover:bg-teal-100 dark:hover:bg-teal-900/50
 				           transition-all duration-200
-				           text-red-600 dark:text-red-400
-				           shadow-sm hover:shadow-md"
-				    title="خروج">
+				           text-teal-600 dark:text-teal-400 shadow-sm"
+				    title="ایمپورت کاربران">
 				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
 				    </svg>
 				</button>
 			</div>
@@ -7851,7 +7852,7 @@ let activeRocketBtn = null;
 					const ucAvatarBg = ucHashColor(user.username || '');
 					let ucDaysChip = '';
 					if (daysRemaining === 'نامحدود') {
-						ucDaysChip = '<span class="uc-chip" style="color:#2563eb;background:rgba(37,99,235,0.12)">∞ نامحدود</span>';
+						ucDaysChip = '<span class="uc-chip uc-chip-infinite" style="background:rgba(37,99,235,0.12)">∞ نامحدود</span>';
 					} else if (isTimerPending) {
 						ucDaysChip = '<span class="uc-chip" style="color:#2563eb;background:rgba(37,99,235,0.12)">⏳ شروع نشده</span>';
 					} else {
@@ -11036,6 +11037,16 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 			line-height: 1;
 			vertical-align: -0.05em;
 		}
+		.req-ring-svg { transform: rotate(-90deg); }
+		.req-ring-track { stroke: currentColor; }
+		.req-ring-bar {
+			stroke-linecap: round;
+			animation: reqRingReach 2.2s ease-in-out infinite;
+		}
+		@keyframes reqRingReach {
+			0%, 100% { stroke-dashoffset: var(--req-offset); filter: drop-shadow(0 0 0 transparent); }
+			50% { stroke-dashoffset: var(--req-offset-reach); filter: drop-shadow(0 0 3px currentColor); }
+		}
 	</style>
 </head>
 <body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex flex-col items-center py-12 px-4 overflow-x-hidden">
@@ -11094,14 +11105,19 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 						<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
 						ریکوئست‌ها
 					</span>
-					<span id="req-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
 				</div>
-				<div id="req-progress-wrap" class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
-					<div id="req-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
-				</div>
-				<div id="req-amounts-row" class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
-					<span id="used-req" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
-					<span id="limit-req" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
+				<div id="req-progress-wrap" class="flex items-center gap-2.5 mb-1">
+					<div class="relative w-11 h-11 shrink-0">
+						<svg class="req-ring-svg w-11 h-11" viewBox="0 0 40 40">
+							<circle class="req-ring-track text-gray-200 dark:text-zinc-800" cx="20" cy="20" r="16" fill="none" stroke-width="3.5"></circle>
+							<circle id="req-progress" class="req-ring-bar" cx="20" cy="20" r="16" fill="none" stroke-width="3.5" stroke-dasharray="100.53" style="--req-offset:100.53; --req-offset-reach:100.53; stroke-dashoffset:100.53;"></circle>
+						</svg>
+						<span id="req-pct" class="absolute inset-0 flex items-center justify-center text-[9px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
+					</div>
+					<div id="req-amounts-row" class="flex flex-col justify-center gap-1 text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
+						<span dir="ltr">مصرف: <span id="used-req" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+						<span dir="ltr">سقف: <span id="limit-req" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+					</div>
 				</div>
 			</div>
 			<div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
@@ -11689,20 +11705,29 @@ const flagContainer = document.getElementById('display-flag');
 			const usedReq = u.used_req || 0;
 			const limitReq = u.limit_req;
 			document.getElementById('used-req').innerText = usedReq.toLocaleString();
+			const reqCirc = 2 * Math.PI * 16;
+			const reqRing = document.getElementById('req-progress');
 			let isReqExpired = false;
 			if (limitReq) {
 				document.getElementById('limit-req').innerText = limitReq.toLocaleString();
 				const rPct = Math.min((usedReq / limitReq) * 100, 100);
+				// درصد «تلاش برای پر شدن بیشتر» در انیمیشن پالس - چند درصد جلوتر از مقدار واقعی
+				const rPctReach = Math.min(rPct + 4, 100);
 				document.getElementById('req-pct').innerText = rPct.toFixed(0) + '٪';
-				document.getElementById('req-progress').style.width = rPct + '%';
 				const rHue = 120 - (rPct * 1.2);
-				document.getElementById('req-progress').style.backgroundColor = 'hsl(' + rHue + ', 80%, 45%)';
+				const rColor = 'hsl(' + rHue + ', 80%, 45%)';
+				reqRing.style.stroke = rColor;
+				reqRing.style.color = rColor;
+				reqRing.style.setProperty('--req-offset', reqCirc - (reqCirc * rPct / 100));
+				reqRing.style.setProperty('--req-offset-reach', reqCirc - (reqCirc * rPctReach / 100));
 				if (usedReq >= limitReq) isReqExpired = true;
 			} else {
 				document.getElementById('limit-req').innerText = 'نامحدود';
 				document.getElementById('req-pct').innerText = '۰٪';
-				document.getElementById('req-progress').style.width = '100%';
-				document.getElementById('req-progress').style.backgroundColor = '#3b82f6';
+				reqRing.style.stroke = '#3b82f6';
+				reqRing.style.color = '#3b82f6';
+				reqRing.style.setProperty('--req-offset', 0);
+				reqRing.style.setProperty('--req-offset-reach', 0);
 			}
 			const reqHasUsage = usedReq > 0;
 			document.getElementById('req-pct').classList.toggle('invisible', !reqHasUsage);
