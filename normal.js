@@ -7787,17 +7787,20 @@ let activeRocketBtn = null;
 						const reqPercent = Math.min((usedReq / user.limit_req) * 100, 100);
 						const reqHue = 120 - (reqPercent * 1.2);
 						reqHtml = '<div class="flex flex-col gap-[5.6px] w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
-							'<div class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold text-center leading-none' + reqInvisibleClass + '" dir="ltr">' + usedReq.toLocaleString() + ' Req</div>' +
+							'<div class="flex items-baseline justify-center gap-1' + reqInvisibleClass + '" dir="ltr">' +
+								'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none">' + usedReq.toLocaleString() + '</span>' +
+								'<span class="text-[8.5px] text-gray-400 dark:text-zinc-500 font-semibold leading-none">/' + user.limit_req.toLocaleString() + ' Req</span>' +
+							'</div>' +
 							'<div class="w-full h-[8.4px] bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + reqInvisibleClass + '">' +
 								'<div class="h-full rounded-full transition-all duration-500" style="width: ' + reqPercent + '%; background-color: hsl(' + reqHue + ', 80%, 45%)"></div>' +
 							'</div>' +
 						'</div>';
 					} else {
-						reqHtml = '<div class="flex flex-col gap-[5.6px] w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
-							'<div class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold text-center leading-none' + reqInvisibleClass + '" dir="ltr">' + usedReq.toLocaleString() + ' Req</div>' +
-							'<div class="w-full h-[8.4px] bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + reqInvisibleClass + '">' +
-								'<div class="w-full h-full bg-blue-500 rounded-full transition-all duration-500"></div>' +
-							'</div>' +
+						// بدون محدودیت: به‌جای نوار پیشرفتِ ساکن و بی‌معنی (که نه پر می‌شد نه خالی)،
+						// فقط عدد مصرف به‌همراه یک نشانه‌ی کوچیک «∞ بدون محدودیت» نشون داده می‌شه.
+						reqHtml = '<div class="flex flex-col items-center gap-1 w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
+							'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none' + reqInvisibleClass + '" dir="ltr">' + usedReq.toLocaleString() + ' Req</span>' +
+							'<span class="text-[8.5px] font-bold text-blue-500/80 dark:text-blue-400/80 tracking-wide leading-none' + reqInvisibleClass + '">∞ بدون محدودیت</span>' +
 						'</div>';
 					}
 					let volumeHtml = '';
@@ -7806,18 +7809,20 @@ let activeRocketBtn = null;
 						const limitHue = 120 - (limitPercent * 1.2);
 						const formattedUsedClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) + 'MB' : usedGb.toFixed(2) + 'GB';
 						volumeHtml = '<div class="flex flex-col gap-[5.6px] w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
-							'<div class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold text-center leading-none' + volInvisibleClass + '" dir="ltr">' + formattedUsedClean + '</div>' +
+							'<div class="flex items-baseline justify-center gap-1' + volInvisibleClass + '" dir="ltr">' +
+								'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none">' + formattedUsedClean + '</span>' +
+								'<span class="text-[8.5px] text-gray-400 dark:text-zinc-500 font-semibold leading-none">/' + user.limit_gb + 'GB</span>' +
+							'</div>' +
 							'<div class="w-full h-[8.4px] bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + volInvisibleClass + '">' +
 								'<div class="h-full rounded-full transition-all duration-500" style="width: ' + limitPercent + '%; background-color: hsl(' + limitHue + ', 80%, 45%)"></div>' +
 							'</div>' +
 						'</div>';
 					} else {
 						const formattedUsedClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) + 'MB' : usedGb.toFixed(2) + 'GB';
-						volumeHtml = '<div class="flex flex-col gap-[5.6px] w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
-							'<div class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold text-center leading-none' + volInvisibleClass + '" dir="ltr">' + formattedUsedClean + '</div>' +
-							'<div class="w-full h-[8.4px] bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + volInvisibleClass + '">' +
-								'<div class="w-full h-full bg-blue-500 rounded-full transition-all duration-500"></div>' +
-							'</div>' +
+						// همون منطق «بدون محدودیت» که برای ریکوئست پیاده شد، اینجا هم برای حجم اعمال می‌شه.
+						volumeHtml = '<div class="flex flex-col items-center gap-1 w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
+							'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none' + volInvisibleClass + '" dir="ltr">' + formattedUsedClean + '</span>' +
+							'<span class="text-[8.5px] font-bold text-blue-500/80 dark:text-blue-400/80 tracking-wide leading-none' + volInvisibleClass + '">∞ بدون محدودیت</span>' +
 						'</div>';
 					}
 					const onlineCount = user.online_count || 0;
@@ -7860,7 +7865,7 @@ let activeRocketBtn = null;
 						ucDaysChip = '<span class="uc-chip" style="color:hsl(' + ucDaysHue + ',75%,40%);background:hsla(' + ucDaysHue + ',75%,50%,0.15)">' + daysRemaining + ' روز</span>';
 					}
 					const ucOnlineChip = user.is_online === 1
-						? '<span class="uc-chip" style="color:' + (onlineCount >= 3 ? '#dc2626' : onlineCount === 2 ? '#ca8a04' : '#16a34a') + ';background:' + (onlineCount >= 3 ? 'rgba(220,38,38,0.12)' : onlineCount === 2 ? 'rgba(202,138,4,0.14)' : 'rgba(22,163,74,0.12)') + '">' + onlineCount + ' دستگاه</span>'
+						? '<span class="uc-chip" style="color:' + (onlineCount >= 3 ? '#dc2626' : onlineCount === 2 ? '#ca8a04' : '#16a34a') + ';background:' + (onlineCount >= 3 ? 'rgba(220,38,38,0.12)' : onlineCount === 2 ? 'rgba(202,138,4,0.14)' : 'rgba(22,163,74,0.12)') + '"><svg class="w-[11px] h-[11px] shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="7" y="2" width="10" height="20" rx="2.4"></rect><path stroke-linecap="round" d="M11 18h2"></path></svg>' + onlineCount + ' دستگاه</span>'
 						: '';
 					const ucStatusStyle = user.is_active === 0 ? 'color:#16a34a;background:rgba(22,163,74,0.12)' : 'color:#d97706;background:rgba(217,119,6,0.12)';
 					return '<div class="uc-card" data-username="' + user.username + '">' +
