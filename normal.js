@@ -338,6 +338,35 @@ const DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK = 4;
 // می‌شه، برای وقتی تنظیم 'default_port' هیچ‌وقت توی settings ذخیره نشده باشه
 // (نصب تازه).
 const DEFAULT_PORT_FALLBACK = "2083";
+// «پیش‌فرض‌های کاربر جدید» - دقیقاً همان مقادیری که فرم دستی «ایجاد کاربر جدید»
+// (openCreateModal سمت کلاینت) از قبل hardcode می‌کرد، حالا به‌صورت Settings واقعی
+// (کلیدهای new_user_* در جدول settings) تا هم از مودال «تنظیمات پـنـل» قابل ویرایش
+// باشند و هم پنل مادر بتواند با POST /api/settings/bulk همه‌ی پنل‌ها را با هم
+// یکسان کند. سه جا از این‌ها می‌خوانند: (۱) ensureSchema() اگر کلیدی نبود
+// seed می‌کند، (۲) POST /api/users برای هر فیلدی که درخواست نفرستاده باشد (مثلاً
+// وقتی پنل مادر فقط username می‌فرستد)، (۳) فرم «ایجاد کاربر جدید» و Import Users
+// سمت کلاینت. همه‌ی مقدارها رشته‌اند (ستون value جدول settings TEXT است):
+// فلگ‌ها "1"/"0"، frag_len/frag_int خالی = فرگمنتیشن خاموش.
+const NEW_USER_DEFAULTS_FALLBACK = {
+	new_user_fingerprint: "ios",
+	new_user_auto_reset_vol_days: "1",
+	new_user_auto_reset_req_days: "1",
+	new_user_auto_rotate_user_proxy: "1",
+	new_user_enable_direct: "0",
+	new_user_block_porn: "0",
+	new_user_block_ads: "0",
+	new_user_frag_len: "",
+	new_user_frag_int: "",
+	new_user_ip_operator: "all",
+	new_user_ip_count: "15",
+	new_user_auto_rotate_ip: "0",
+	new_user_start_on_first_connect: "0",
+	new_user_connection_type: "vless",
+};
+// فقط این دو کلید مجازند خالی ذخیره شوند (خالی = فرگمنت خاموش)؛ برای بقیه، مقدار
+// خالی/نامعتبر یعنی «از NEW_USER_DEFAULTS_FALLBACK استفاده کن».
+const NEW_USER_DEFAULTS_EMPTY_OK = ["new_user_frag_len", "new_user_frag_int"];
+const NEW_USER_TLS_PORTS = ["443", "2053", "2083", "2087", "2096", "8443"];
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
 // runs automatically for every user right after the admin saves the pinned
@@ -2068,6 +2097,19 @@ const Router = {
 						// این کاربر تازه ست می‌شه. اگه مقداری فرستاده شده باشه (مثلاً از چک‌باکس‌های
 						// فرم افزودن کاربر)، همون مقدار برنده‌ست.
 						const finalPort = port !== undefined && port !== null && String(port).trim() !== "" ? port : await getDefaultPortSetting(env);
+						// «پیش‌فرض‌های کاربر جدید» (Settings → new_user_*): هر فیلدی که درخواست
+						// اصلاً نفرستاده باشد (undefined/null) از این‌جا پر می‌شود، تا کاربری که با API
+						// ساخته می‌شود (مثلاً از پنل مادر) دقیقاً همان مقادیری را بگیرد که فرم دستی
+						// «ایجاد کاربر جدید» پیش‌فرض می‌کند. فرم دستی همه‌ی این فیلدها را صریح
+						// می‌فرستد، پس رفتار آن عوض نمی‌شود - مقدار صریح همیشه برنده است.
+						const nud = await getNewUserDefaults(env);
+						const given = (v) => v !== undefined && v !== null;
+						const flagOf = (v, dfltStr) => (given(v) ? (v && v !== "0" && v !== "false" ? 1 : 0) : dfltStr === "1" ? 1 : 0);
+						const intOf = (v, dfltStr) => (given(v) ? parseInt(v) || 0 : parseInt(dfltStr) || 0);
+						const finalFingerprint = fingerprint || nud.new_user_fingerprint;
+						const finalIps = ips !== undefined ? ips : nud.global_clean_ip;
+						const finalTls = given(tls) && String(tls).trim() !== "" ? tls : String(finalPort).split(",").some((p) => NEW_USER_TLS_PORTS.includes(p.trim())) ? "on" : "off";
+						if (!(protocols && Array.isArray(protocols) && protocols.length > 0) && !connection_type) finalConnType = nud.new_user_connection_type;
 						// Every new user is always pinned to whatever the current
 						// pinned_locations setting holds (see getPinnedLocationsSetting();
 						// falls back to the built-in 15-country default if that setting
@@ -2077,7 +2119,7 @@ const Router = {
 						// this request doesn't have to wait on a full round of live
 						// proxy testing.
 						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, finalPort, fingerprint || "chrome", finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, 1, start_on_first_connect ? 1 : 0, null, trojanHash, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1)
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 20, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct))
 							.run();
 						// Clears any stale negative-cache ("no such user") entry that might exist for
 						// this uuid/hash from an earlier probe or connection attempt with this UUID.
@@ -2133,6 +2175,9 @@ const DbService = {
 				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('other_clean_ips', ?)").bind(DEFAULT_OTHER_CLEAN_IPS_FALLBACK.join("\n")).run();
 				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('inline_proxy_ip', ?)").bind(DEFAULT_INLINE_PROXY_IP_FALLBACK).run();
 				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_port', ?)").bind(DEFAULT_PORT_FALLBACK).run();
+				// پیش‌فرض‌های کاربر جدید (new_user_*) - یک batch، INSERT OR IGNORE: کلیدی که
+				// ادمین/پنل مادر قبلاً ذخیره کرده دست‌نخورده می‌ماند.
+				await db.batch(Object.entries(NEW_USER_DEFAULTS_FALLBACK).map(([k, v]) => db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").bind(k, v)));
 			} catch (e) { }
 			try {
 				// جدول ترافیک، به تفکیک ساعت UTC (ستون "date" همچنان TEXT PRIMARY KEY است، فقط از این پس
@@ -2466,6 +2511,27 @@ async function getDefaultPortSetting(env) {
 	} catch (e) {
 		return DEFAULT_PORT_FALLBACK;
 	}
+}
+// «پیش‌فرض‌های کاربر جدید»: همه‌ی کلیدهای new_user_* (+ global_clean_ip برای ستون
+// ips) در یک کوئری. برای هر کلیدی که نبود/خالی بود (به‌جز frag_len/frag_int که
+// خالی معنی‌دار دارد) مقدار NEW_USER_DEFAULTS_FALLBACK برمی‌گردد. فقط وقتی
+// global_clean_ip اصلاً در settings نیست، DEFAULT_GLOBAL_CLEAN_IP_FALLBACK؛ اگر
+// ادمین عمداً خالی ذخیره کرده باشد همان خالی رعایت می‌شود.
+async function getNewUserDefaults(env) {
+	const out = Object.assign({}, NEW_USER_DEFAULTS_FALLBACK, { global_clean_ip: DEFAULT_GLOBAL_CLEAN_IP_FALLBACK });
+	if (!env || !env.DB) return out;
+	try {
+		const { results } = await env.DB.prepare("SELECT key, value FROM settings WHERE key LIKE 'new_user_%' OR key = 'global_clean_ip'").all();
+		(results || []).forEach((r) => {
+			if (r.value === null || r.value === undefined) return;
+			const v = String(r.value);
+			if (r.key === "global_clean_ip") { out.global_clean_ip = v; return; }
+			if (!Object.prototype.hasOwnProperty.call(NEW_USER_DEFAULTS_FALLBACK, r.key)) return;
+			if (v.trim() === "" && !NEW_USER_DEFAULTS_EMPTY_OK.includes(r.key)) return;
+			out[r.key] = v.trim();
+		});
+	} catch (e) { }
+	return out;
 }
 const SubscriptionService = {
 	async generateText(user, host, env) {
@@ -6738,6 +6804,102 @@ Commercial support is available at
 					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">این عدد فقط پیش‌فرضِ فیلد «محدودیت کاربر» برای کاربرهای جدیده (اگه دستی چیزی وارد نشه)؛ برای هر کاربر جدا هم قابل تغییره و صرفاً هشدار روی کارتشه، اتصالی قطع نمی‌کنه.</p>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🆕 پیش‌فرض کاربر جدید</h5>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mb-3">مقدارهایی که فرم «ایجاد کاربر جدید»، Import Users و کاربرهایی که از پنل مادر (API) ساخته می‌شن به‌صورت پیش‌فرض می‌گیرن. روی کاربرهای موجود اثری نداره. پورت و آیپی تمیز از بخش‌های بالا خونده می‌شن.</p>
+					<div class="grid grid-cols-2 gap-3">
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">Fingerprint</label>
+							<select id="nud-fingerprint" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="chrome">🌐 Chrome</option>
+								<option value="firefox">🦊 Firefox</option>
+								<option value="safari">🧭 Safari</option>
+								<option value="ios">📱 iOS</option>
+								<option value="android">🤖 Android</option>
+								<option value="edge">🌀 Edge</option>
+								<option value="360">🔒 360 Browser</option>
+								<option value="qq">💬 QQ Browser</option>
+								<option value="random">🎲 Random</option>
+								<option value="randomized">🎭 Dynamic</option>
+								<option value="unsafe">🚀 Unsafe</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">پروتکل</label>
+							<select id="nud-connection-type" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="vless">VLESS</option>
+								<option value="trojan">Trojan</option>
+								<option value="vless,trojan">VLESS + Trojan</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">تمدید خودکار حجم (روز)</label>
+							<input type="number" id="nud-auto-reset-vol" dir="ltr" min="0" step="1" placeholder="۰ = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">تمدید خودکار ریکوئست (روز)</label>
+							<input type="number" id="nud-auto-reset-req" dir="ltr" min="0" step="1" placeholder="۰ = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">اوپراتور آیپی</label>
+							<input type="text" id="nud-ip-operator" dir="ltr" placeholder="all" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">تعداد آیپی</label>
+							<input type="number" id="nud-ip-count" dir="ltr" min="1" step="1" placeholder="15" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">طول فرگمنت</label>
+							<input type="text" id="nud-frag-len" dir="ltr" placeholder="خالی = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">بازه فرگمنت (ms)</label>
+							<input type="text" id="nud-frag-int" dir="ltr" placeholder="خالی = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">اتصال مستقیم</label>
+							<select id="nud-enable-direct" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">تعویض خودکار پروکسی خراب</label>
+							<select id="nud-auto-rotate-user-proxy" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">چرخش خودکار آیپی</label>
+							<select id="nud-auto-rotate-ip" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">شروع از اولین اتصال</label>
+							<select id="nud-start-on-first-connect" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">بلاک تبلیغات</label>
+							<select id="nud-block-ads" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">بلاک محتوای بزرگسال</label>
+							<select id="nud-block-porn" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+					</div>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🔐 امنیت و یکپارچه‌سازی</h5>
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path></svg>
@@ -7401,10 +7563,13 @@ let activeRocketBtn = null;
 				const dwThreshold = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
 				ipLimitInputEl.placeholder = 'پیش‌فرض: ' + dwThreshold;
 			}
+			// پیش‌فرض‌ها از Settings (کلیدهای new_user_* - مودال «تنظیمات پـنـل» → «پیش‌فرض کاربر
+			// جدید») خوانده می‌شن، نه hardcode؛ اگه هیچ‌چیز تغییر نکرده باشه دقیقاً همون مقادیر قبلیه.
+			const nud = window.getNewUserDefaultsTyped();
 			const vlessCb2 = document.getElementById('input-proto-vless');
 			const trojanCb2 = document.getElementById('input-proto-trojan');
-			if (vlessCb2) vlessCb2.checked = true;
-			if (trojanCb2) trojanCb2.checked = false;
+			if (vlessCb2) vlessCb2.checked = nud.protocols.indexOf('vless') !== -1;
+			if (trojanCb2) trojanCb2.checked = nud.protocols.indexOf('trojan') !== -1;
 			const nonTlsDefaultSet = { '80': true, '8080': true, '8880': true, '2052': true, '2082': true, '2086': true, '2095': true };
 			const createModalDefaultPort = window.DEFAULT_PORT_SETTING || '2083';
 			document.querySelectorAll('input[name="ports"]').forEach(function(cb) {
@@ -7412,34 +7577,45 @@ let activeRocketBtn = null;
 				cb.checked = (cb.value === createModalDefaultPort);
 			});
 			const fpSelect = document.getElementById('fingerprint-select');
-			if (fpSelect) fpSelect.value = 'ios';
+			if (fpSelect) {
+				fpSelect.value = nud.fingerprint;
+				if (fpSelect.value !== nud.fingerprint) fpSelect.value = 'ios';
+			}
+			const fragOn = nud.frag_len !== '' || nud.frag_int !== '';
 			const fragToggle = document.getElementById('input-frag-toggle');
-			if (fragToggle) fragToggle.checked = false;
-			if (typeof window.toggleFragInputs === 'function') window.toggleFragInputs(false);
+			if (fragToggle) fragToggle.checked = fragOn;
+			const fragLenInput = document.getElementById('input-frag-len');
+			const fragIntInput = document.getElementById('input-frag-int');
+			if (fragOn && fragLenInput && nud.frag_len !== '') fragLenInput.value = nud.frag_len;
+			if (fragOn && fragIntInput && nud.frag_int !== '') fragIntInput.value = nud.frag_int;
+			if (typeof window.toggleFragInputs === 'function') window.toggleFragInputs(fragOn);
+			const autoResetOn = nud.auto_reset_vol_days > 0 || nud.auto_reset_req_days > 0;
 			const autoResetToggle = document.getElementById('input-auto-reset-toggle');
-			if (autoResetToggle) autoResetToggle.checked = true;
-			document.getElementById('input-auto-reset-vol').value = '1';
-			document.getElementById('input-auto-reset-req').value = '1';
-			window.toggleAutoResetInputs(true);
+			if (autoResetToggle) autoResetToggle.checked = autoResetOn;
+			document.getElementById('input-auto-reset-vol').value = nud.auto_reset_vol_days > 0 ? String(nud.auto_reset_vol_days) : '';
+			document.getElementById('input-auto-reset-req').value = nud.auto_reset_req_days > 0 ? String(nud.auto_reset_req_days) : '';
+			window.toggleAutoResetInputs(autoResetOn);
+			const blockPornToggle = document.getElementById('input-block-porn');
+			if (blockPornToggle) blockPornToggle.checked = nud.block_porn;
 			const blockAdsToggle = document.getElementById('input-block-ads');
-			if (blockAdsToggle) blockAdsToggle.checked = false;
+			if (blockAdsToggle) blockAdsToggle.checked = nud.block_ads;
 			const autoRotateUserProxyCheck = document.getElementById('input-auto-rotate-user-proxy');
-			if (autoRotateUserProxyCheck) autoRotateUserProxyCheck.checked = true;
+			if (autoRotateUserProxyCheck) autoRotateUserProxyCheck.checked = nud.auto_rotate_user_proxy;
 			const startOnFirstConnectCheck = document.getElementById('input-start-on-first-connect');
-			if (startOnFirstConnectCheck) startOnFirstConnectCheck.checked = false;
+			if (startOnFirstConnectCheck) startOnFirstConnectCheck.checked = nud.start_on_first_connect;
 			const userProxyToggle = document.getElementById('user-proxy-mode-toggle');
 			if (userProxyToggle) userProxyToggle.checked = true;
 			if (typeof window.toggleUserProxyMode === 'function') window.toggleUserProxyMode(true);
 			const enableDirectCheck = document.getElementById('input-enable-direct');
-			if (enableDirectCheck) enableDirectCheck.checked = false;
+			if (enableDirectCheck) enableDirectCheck.checked = nud.enable_direct;
 			window.proxyFieldsData = [""];
 			window.activeProxyIndex = 0;
 			if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
 			const autoRotateIpToggle = document.getElementById('input-auto-rotate-ip-toggle');
-			if (autoRotateIpToggle) autoRotateIpToggle.checked = false;
+			if (autoRotateIpToggle) autoRotateIpToggle.checked = nud.auto_rotate_ip;
 			document.getElementById('hidden-rotate-time').value = '';
-			document.getElementById('hidden-ip-operator').value = 'all';
-			document.getElementById('hidden-ip-count').value = '15';
+			document.getElementById('hidden-ip-operator').value = nud.ip_operator;
+			document.getElementById('hidden-ip-count').value = String(nud.ip_count);
 			const cleanIpsField = document.getElementById('input-ips');
 			if (cleanIpsField) cleanIpsField.value = window.GLOBAL_CLEAN_IP || window.DEFAULT_GLOBAL_CLEAN_IP;
 			toggleModal(true);
@@ -9600,6 +9776,104 @@ window.loadDefaultPortSetting = async function() {
 	if (typeof renderPortCheckboxes === 'function') renderPortCheckboxes();
 	return value;
 };
+window.NEW_USER_DEFAULTS_FALLBACK = {
+	new_user_fingerprint: 'ios',
+	new_user_auto_reset_vol_days: '1',
+	new_user_auto_reset_req_days: '1',
+	new_user_auto_rotate_user_proxy: '1',
+	new_user_enable_direct: '0',
+	new_user_block_porn: '0',
+	new_user_block_ads: '0',
+	new_user_frag_len: '',
+	new_user_frag_int: '',
+	new_user_ip_operator: 'all',
+	new_user_ip_count: '15',
+	new_user_auto_rotate_ip: '0',
+	new_user_start_on_first_connect: '0',
+	new_user_connection_type: 'vless'
+};
+window.NEW_USER_DEFAULTS = Object.assign({}, window.NEW_USER_DEFAULTS_FALLBACK);
+window.NEW_USER_INPUT_IDS = {
+	new_user_fingerprint: 'nud-fingerprint',
+	new_user_auto_reset_vol_days: 'nud-auto-reset-vol',
+	new_user_auto_reset_req_days: 'nud-auto-reset-req',
+	new_user_auto_rotate_user_proxy: 'nud-auto-rotate-user-proxy',
+	new_user_enable_direct: 'nud-enable-direct',
+	new_user_block_porn: 'nud-block-porn',
+	new_user_block_ads: 'nud-block-ads',
+	new_user_frag_len: 'nud-frag-len',
+	new_user_frag_int: 'nud-frag-int',
+	new_user_ip_operator: 'nud-ip-operator',
+	new_user_ip_count: 'nud-ip-count',
+	new_user_auto_rotate_ip: 'nud-auto-rotate-ip',
+	new_user_start_on_first_connect: 'nud-start-on-first-connect',
+	new_user_connection_type: 'nud-connection-type'
+};
+window.NEW_USER_EMPTY_OK = { new_user_frag_len: true, new_user_frag_int: true };
+window.fillNewUserDefaultsInputs = function() {
+	Object.keys(window.NEW_USER_INPUT_IDS).forEach(function(k) {
+		const el = document.getElementById(window.NEW_USER_INPUT_IDS[k]);
+		if (!el) return;
+		const v = window.NEW_USER_DEFAULTS[k];
+		el.value = (k === 'new_user_auto_reset_vol_days' || k === 'new_user_auto_reset_req_days') && (parseInt(v) || 0) <= 0 ? '0' : v;
+	});
+};
+window.loadNewUserDefaultsSetting = async function() {
+	const merged = Object.assign({}, window.NEW_USER_DEFAULTS_FALLBACK);
+	try {
+		const res = await fetch('/api/settings/bulk');
+		const data = await res.json();
+		Object.keys(merged).forEach(function(k) {
+			if (data && data[k] !== undefined && data[k] !== null) {
+				const v = String(data[k]).trim();
+				if (v !== '' || window.NEW_USER_EMPTY_OK[k]) merged[k] = v;
+			}
+		});
+	} catch (e) {}
+	window.NEW_USER_DEFAULTS = merged;
+	window.fillNewUserDefaultsInputs();
+	return merged;
+};
+window.collectNewUserDefaultsFromInputs = function() {
+	const out = {};
+	Object.keys(window.NEW_USER_INPUT_IDS).forEach(function(k) {
+		const el = document.getElementById(window.NEW_USER_INPUT_IDS[k]);
+		let v = el ? String(el.value).trim() : window.NEW_USER_DEFAULTS[k];
+		if (k === 'new_user_auto_reset_vol_days' || k === 'new_user_auto_reset_req_days') {
+			v = String(Math.max(0, parseInt(v) || 0));
+		} else if (k === 'new_user_ip_count') {
+			v = String(Math.max(1, parseInt(v) || parseInt(window.NEW_USER_DEFAULTS_FALLBACK[k])));
+		} else if (v === '' && !window.NEW_USER_EMPTY_OK[k]) {
+			v = window.NEW_USER_DEFAULTS_FALLBACK[k];
+		}
+		out[k] = v;
+	});
+	return out;
+};
+window.getNewUserDefaultsTyped = function() {
+	const d = window.NEW_USER_DEFAULTS;
+	const toInt = function(v, f) { const n = parseInt(v); return isNaN(n) ? f : n; };
+	const ct = String(d.new_user_connection_type || 'vless');
+	let protocols = ct.split(',').map(function(x) { return x.trim(); }).filter(function(x) { return x === 'vless' || x === 'trojan'; });
+	if (protocols.length === 0) protocols = ['vless'];
+	return {
+		fingerprint: d.new_user_fingerprint || 'ios',
+		auto_reset_vol_days: Math.max(0, toInt(d.new_user_auto_reset_vol_days, 0)),
+		auto_reset_req_days: Math.max(0, toInt(d.new_user_auto_reset_req_days, 0)),
+		auto_rotate_user_proxy: d.new_user_auto_rotate_user_proxy === '1',
+		enable_direct: d.new_user_enable_direct === '1',
+		block_porn: d.new_user_block_porn === '1',
+		block_ads: d.new_user_block_ads === '1',
+		frag_len: d.new_user_frag_len || '',
+		frag_int: d.new_user_frag_int || '',
+		ip_operator: d.new_user_ip_operator || 'all',
+		ip_count: Math.max(1, toInt(d.new_user_ip_count, 15)),
+		auto_rotate_ip: d.new_user_auto_rotate_ip === '1',
+		start_on_first_connect: d.new_user_start_on_first_connect === '1',
+		connection_type: protocols.join(','),
+		protocols: protocols
+	};
+};
 window.generateMasterKey = async function() {
 	if (!confirm('یک کلید مادر جدید ساخته می‌شود و کلید قبلی (اگه وجود داشت) بلافاصله از کار می‌افتد. ادامه می‌دی؟')) return;
 	const btn = document.getElementById('generate-master-key-btn');
@@ -9650,6 +9924,7 @@ window.saveSettings = async function() {
 	const proxyIpVal = (proxyIpInput && proxyIpInput.value.trim()) ? proxyIpInput.value.trim() : '';
 	const defaultPortParsed = defaultPortInput ? parseInt(defaultPortInput.value) : NaN;
 	const defaultPortVal = (!isNaN(defaultPortParsed) && defaultPortParsed > 0 && defaultPortParsed <= 65535) ? String(defaultPortParsed) : window.DEFAULT_PORT_SETTING_FALLBACK;
+	const nudSettings = window.collectNewUserDefaultsFromInputs();
 
 	const buttons = [document.getElementById('save-settings-btn'), document.getElementById('save-settings-fab-btn')].filter(Boolean);
 	buttons.forEach(function(b) { b.disabled = true; });
@@ -9659,14 +9934,14 @@ window.saveSettings = async function() {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
-				settings: {
+				settings: Object.assign({
 					global_clean_ip: cleanIpVal,
 					global_req_limit: reqLimitVal,
 					device_warning_threshold: deviceWarningThresholdVal,
 					other_clean_ips: otherIpsVal,
 					inline_proxy_ip: proxyIpVal,
 					default_port: defaultPortVal
-				}
+				}, nudSettings)
 			})
 		});
 		window.GLOBAL_CLEAN_IP = cleanIpVal;
@@ -9675,6 +9950,8 @@ window.saveSettings = async function() {
 		window.OTHER_CLEAN_IPS = otherIpsParsed;
 		window.INLINE_PROXY_IP = proxyIpVal;
 		window.DEFAULT_PORT_SETTING = defaultPortVal;
+		window.NEW_USER_DEFAULTS = Object.assign({}, window.NEW_USER_DEFAULTS, nudSettings);
+		window.fillNewUserDefaultsInputs();
 		if (cleanIpInput) cleanIpInput.value = cleanIpVal;
 		if (reqLimitInput) reqLimitInput.value = reqLimitVal;
 		if (deviceWarningThresholdInput) deviceWarningThresholdInput.value = deviceWarningThresholdVal;
@@ -10465,6 +10742,7 @@ function applySelectedIps() {
 			window.loadOtherCleanIpsSetting();
 			window.loadInlineProxyIpSetting();
 			window.loadDefaultPortSetting();
+			window.loadNewUserDefaultsSetting();
 			window.populatePinnedLocationSelects();
 			window.loadPinnedLocationsSetting();
 			window.usersRefreshIntervalId = null;
@@ -10965,6 +11243,7 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 				logEl.innerHTML += '<div class="' + color + '">⚠️ ' + w.text + '</div>';
 			});
 			let done = 0, ok = 0, failed = 0;
+			const nudImp = window.getNewUserDefaultsTyped();
 			for (const c of candidates) {
 				progressText.innerText = 'در حال ایجاد (' + (done + 1) + '/' + candidates.length + '): ' + c.username;
 				try {
@@ -10980,29 +11259,29 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 							tls: 'on',
 							port: window.DEFAULT_PORT_SETTING || '2083',
 							ips: window.GLOBAL_CLEAN_IP || window.DEFAULT_GLOBAL_CLEAN_IP || '104.20.25.138',
-							fingerprint: 'ios',
+							fingerprint: nudImp.fingerprint,
 							ip_limit: null,
-							block_porn: 0,
-							block_ads: 0,
-							frag_len: '',
-							frag_int: '',
+							block_porn: nudImp.block_porn ? 1 : 0,
+							block_ads: nudImp.block_ads ? 1 : 0,
+							frag_len: nudImp.frag_len,
+							frag_int: nudImp.frag_int,
 							advanced_frag: null,
 							cipher_suites: null,
 							tls_mask: null,
 							user_proxy_iata: null,
 							user_socks5: null,
 							user_proxy_ip: null,
-							auto_reset_vol_days: 1,
-							auto_reset_req_days: 1,
-							auto_rotate_ip: 0,
+							auto_reset_vol_days: nudImp.auto_reset_vol_days,
+							auto_reset_req_days: nudImp.auto_reset_req_days,
+							auto_rotate_ip: nudImp.auto_rotate_ip ? 1 : 0,
 							rotate_time: 0,
-							ip_operator: 'all',
-							ip_count: 15,
-							auto_rotate_user_proxy: 1,
-							start_on_first_connect: 0,
-							enable_direct: false,
-							connection_type: 'vless',
-							protocols: ['vless']
+							ip_operator: nudImp.ip_operator,
+							ip_count: nudImp.ip_count,
+							auto_rotate_user_proxy: nudImp.auto_rotate_user_proxy ? 1 : 0,
+							start_on_first_connect: nudImp.start_on_first_connect ? 1 : 0,
+							enable_direct: nudImp.enable_direct,
+							connection_type: nudImp.connection_type,
+							protocols: nudImp.protocols
 						})
 					});
 					if (response.ok) {
