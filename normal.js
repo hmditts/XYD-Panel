@@ -579,9 +579,10 @@ async function buildPinnedDefaultProxyList(locations) {
 // each {proxy, country} slot); every slot already present - pinned or not -
 // is left completely untouched (not re-tested, not removed). This is what
 // makes changing the pinned_locations setting non-destructive: a country
-// that gets un-pinned later keeps working for anyone who already has it,
-// and replaceBrokenProxy() keeps auto-healing it forever regardless of its
-// current pinned status.
+// that was never pinned (or was added by hand) is never removed by this
+// function. NOTE: un-pinning a country in settings DOES now remove it from
+// every existing user - see removeCountriesFromAllUsers() and POST
+// /api/settings/bulk - but that is a separate step, not part of this merge.
 // Never grows a user past MAX_LOCATIONS_PER_USER. If there isn't room for
 // every missing pinned country, as many as fit are added and the rest are
 // returned in `cappedOut` so the caller can warn the admin (nothing is
@@ -606,6 +607,41 @@ async function mergePinnedLocationsForUser(existingProxyList, pinnedLocations) {
 		});
 	}
 	return { list, added: toAdd, cappedOut };
+}
+
+// Removes every slot tagged with one of `countries` (ISO alpha-2) from EVERY user's
+// user_socks5 list. Called from POST /api/settings/bulk when countries were just
+// un-pinned (pinned_locations shrank), so an un-pinned country actually disappears
+// from the users' configs instead of lingering forever. Only countries that were in
+// the previous pinned list and are not in the new one are passed in - a country the
+// admin never pinned (or a legacy non-object slot without a country tag) is never
+// touched here. Returns { countries, usersUpdated }.
+async function removeCountriesFromAllUsers(env, ctx, countries) {
+	const targets = new Set((countries || []).map((c) => String(c).trim().toUpperCase()).filter(Boolean));
+	if (targets.size === 0) return { countries: [], usersUpdated: 0 };
+	const { results } = await env.DB.prepare("SELECT username, uuid, trojan_hash, user_socks5 FROM users WHERE user_socks5 IS NOT NULL AND user_socks5 != ''").all();
+	const stmts = [];
+	const changedUsers = [];
+	for (const row of results || []) {
+		const raw = String(row.user_socks5 || "").trim();
+		if (!raw.startsWith("[")) continue;
+		let list;
+		try {
+			list = JSON.parse(raw);
+		} catch (e) {
+			continue;
+		}
+		if (!Array.isArray(list)) continue;
+		const kept = list.filter((p) => !(typeof p === "object" && p !== null && targets.has(String(p.country || "").trim().toUpperCase())));
+		if (kept.length === list.length) continue;
+		stmts.push(env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(kept), row.username));
+		changedUsers.push(row);
+	}
+	for (let i = 0; i < stmts.length; i += 50) {
+		await env.DB.batch(stmts.slice(i, i + 50));
+	}
+	await Promise.all(changedUsers.map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
+	return { countries: Array.from(targets), usersUpdated: changedUsers.length };
 }
 
 async function replaceBrokenProxy(username, env, oldProxy) {
@@ -1538,6 +1574,7 @@ const Router = {
 			}
 			if (request.method === "POST") {
 				const body = await readJsonBody(request);
+				let unpinRemoval = { countries: [], usersUpdated: 0 };
 				if (body.settings && typeof body.settings === "object") {
 					// «هشدار تعداد دستگاه» (device_warning_threshold): برخلاف بقیه‌ی تنظیمات
 					// global، این یکی روی ستون ip_limit/max_connections همه‌ی کاربرهای *موجود*
@@ -1559,10 +1596,26 @@ const Router = {
 					}
 					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
 					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
+					// «لیست لوکیشن‌های پین‌شده»: اگه این کلید توی همین درخواست هست، لیست قبلی رو
+					// قبل از نوشتن نگه می‌داریم تا بعدش بفهمیم کدوم کشورها آن‌پین شدن (چه از
+					// تنظیمات همین پنل، چه از «Push to All Panels» پنل مادر).
+					let previousPinnedLocations = null;
+					if (Object.prototype.hasOwnProperty.call(body.settings, "pinned_locations")) {
+						previousPinnedLocations = await getPinnedLocationsSetting(env);
+					}
 					const settingsStmts = Object.entries(body.settings).map(([k, v]) =>
 						env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v))
 					);
 					if (settingsStmts.length > 0) await env.DB.batch(settingsStmts);
+					// کشوری که از لیست پین‌شده‌ها حذف شده، از کانفیگ همه‌ی کاربرهای موجود هم
+					// پاک می‌شه (فقط کشورهایی که همین الان آن‌پین شدن - نه هر کشوری که پین نبوده).
+					if (previousPinnedLocations) {
+						const nowPinnedLocations = await getPinnedLocationsSetting(env);
+						const unpinned = previousPinnedLocations.filter((cc) => !nowPinnedLocations.includes(cc));
+						if (unpinned.length > 0) {
+							unpinRemoval = await removeCountriesFromAllUsers(env, ctx, unpinned);
+						}
+					}
 					if (overrideDeviceWarningThreshold !== undefined) {
 						await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ?").bind(overrideDeviceWarningThreshold, overrideDeviceWarningThreshold).run();
 					}
@@ -1570,7 +1623,7 @@ const Router = {
 						await env.DB.prepare("UPDATE users SET port = ?").bind(overrideDefaultPort).run();
 					}
 				}
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/proxy-ip") {
@@ -1790,8 +1843,9 @@ const Router = {
 							// Manual cleanup: strips one specific country (body.country, e.g.
 							// "TR") out of this user's proxy list, if present. Independent of
 							// the additive "locations" action above - un-pinning a country in
-							// settings never does this automatically; the admin has to pick
-							// this action explicitly per country/user(s).
+							// settings now removes the country from all users automatically (see
+							// removeCountriesFromAllUsers()); this action is for removing a country
+							// from one specific user by hand.
 							const targetCountry = String(body.country || "").trim().toUpperCase();
 							if (!targetCountry) {
 								return new Response(JSON.stringify({ error: "Missing country" }), { status: 400, headers: { "Content-Type": "application/json" } });
@@ -9656,12 +9710,18 @@ window.savePinnedLocations = async function() {
 	const btn = document.getElementById('save-pinned-locations-btn');
 	if (btn) { btn.disabled = true; btn.innerText = 'در حال ذخیره...'; }
 	try {
-		await fetch('/api/settings/bulk', {
+		const saveRes = await fetch('/api/settings/bulk', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ settings: { pinned_locations: JSON.stringify(window.PINNED_LOCATIONS_CACHE) } })
 		});
-		showToast('✅ لیست ذخیره شد؛ در حال اعمال روی کاربرها...');
+		let saveData = null;
+		try { saveData = await saveRes.json(); } catch (e) {}
+		if (saveData && saveData.users_updated > 0) {
+			showToast('✅ لیست ذخیره شد؛ کشور(های) حذف‌شده از کانفیگ ' + saveData.users_updated + ' کاربر پاک شد. در حال اعمال روی کاربرها...');
+		} else {
+			showToast('✅ لیست ذخیره شد؛ در حال اعمال روی کاربرها...');
+		}
 		await window.applyPinnedLocationsToAllUsers(btn);
 	} catch (e) {
 		showToast('❌ ذخیره‌سازی لوکیشن‌ها ناموفق بود.');
