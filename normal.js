@@ -7403,7 +7403,12 @@ ${COMMON_TOAST_HTML}
 				cb.checked = (cb.value === defaultPort);
 			});
 		}, 100);
-		function toggleSettingsModal(show) { setModalState('settings-modal', show); }
+		function toggleSettingsModal(show) {
+			setModalState('settings-modal', show);
+			// Re-read the new-user defaults when the modal opens, so the form never shows stale values
+			// (e.g. after the mother panel pushed new ones) that a Save would write back over them.
+			if (show && typeof window.loadNewUserDefaultsSetting === 'function') window.loadNewUserDefaultsSetting();
+		}
 		window.toggleAutoResetInputs = function(show) {
 			const container = document.getElementById('auto-reset-inputs-container');
 			const volInput = document.getElementById('input-auto-reset-vol');
@@ -9879,20 +9884,26 @@ window.fillNewUserDefaultsInputs = function() {
 	});
 };
 window.loadNewUserDefaultsSetting = async function() {
-	const merged = Object.assign({}, window.NEW_USER_DEFAULTS_FALLBACK);
+	let data = null;
 	try {
 		const res = await fetch('/api/settings/bulk');
-		const data = await res.json();
+		if (res.ok) data = await res.json();
+	} catch (e) {}
+	// A failed fetch keeps what is already known (the built-in fallbacks on the very
+	// first load) instead of resetting it, but the form always ends up matching it -
+	// otherwise the on/off selects would show their first option and a Save would write it.
+	if (data && typeof data === 'object') {
+		const merged = Object.assign({}, window.NEW_USER_DEFAULTS_FALLBACK);
 		Object.keys(merged).forEach(function(k) {
-			if (data && data[k] !== undefined && data[k] !== null) {
+			if (data[k] !== undefined && data[k] !== null) {
 				const v = String(data[k]).trim();
 				if (v !== '' || window.NEW_USER_EMPTY_OK[k]) merged[k] = v;
 			}
 		});
-	} catch (e) {}
-	window.NEW_USER_DEFAULTS = merged;
+		window.NEW_USER_DEFAULTS = merged;
+	}
 	window.fillNewUserDefaultsInputs();
-	return merged;
+	return window.NEW_USER_DEFAULTS;
 };
 window.collectNewUserDefaultsFromInputs = function() {
 	const out = {};
