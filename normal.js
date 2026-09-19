@@ -345,7 +345,9 @@ const DEFAULT_PORT_FALLBACK = "2083";
 // brand-new user is NOT capped by this (a new user always gets the full
 // current pinned list, even if that list itself has grown past this number).
 const MAX_LOCATIONS_PER_USER = 20;
-const MASTER_KEY_BLOCKED_PATHS = ["/api/change-password", "/api/auto-update-setup", "/api/update-panel", "/api/update-panel-github"];
+// /api/change-password was removed from this list: the mother panel's "Push to All Panels" now sets the
+// default admin password through it with X-Master-Key (see the handler below for the master-key branch).
+const MASTER_KEY_BLOCKED_PATHS = ["/api/auto-update-setup", "/api/update-panel", "/api/update-panel-github"];
 
 // Full ISO 3166-1 alpha-2 -> alpha-3 table (249 entries), used to compute a
 // permanent WS path segment for ANY country in the VIP proxy repository -
@@ -1450,23 +1452,30 @@ const Router = {
 			}
 		}
 		if (url.pathname === "/api/change-password" && request.method === "POST") {
-			const { current_password, new_password } = await readJsonBody(request);
+			const { current_password, new_password, password } = await readJsonBody(request);
+			// Master-key call (mother panel): the gate above already validated X-Master-Key against
+			// settings.master_api_key (verifyApiAuth uses ONLY the header when it is present), so the
+			// current password is not required. The mother sends the new password as `password`;
+			// the panel's own UI keeps sending current_password + new_password, unchanged.
+			const viaMasterKey = !!request.headers.get("X-Master-Key");
 			const cleanCurrent = (current_password || "").trim();
-			const cleanNew = (new_password || "").trim();
-			if (!cleanCurrent || !cleanNew) {
-				return new Response(JSON.stringify({ error: "رمز عبور فعلی و جدید الزامی هستند" }), {
+			const cleanNew = (new_password || password || "").trim();
+			if (!cleanNew || (!viaMasterKey && !cleanCurrent)) {
+				return new Response(JSON.stringify({ error: viaMasterKey ? "رمز عبور جدید الزامی است" : "رمز عبور فعلی و جدید الزامی هستند" }), {
 					status: 400,
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
 			}
-			const currentHash = await DbService.sha256(cleanCurrent);
-			const oldCurrentHash = await DbService.oldSha256(cleanCurrent);
-			const storedHash = await DbService.getPanelPassword(env.DB, true);
-			if (storedHash && storedHash !== currentHash && storedHash !== oldCurrentHash) {
-				return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), {
-					status: 401,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
+			if (!viaMasterKey) {
+				const currentHash = await DbService.sha256(cleanCurrent);
+				const oldCurrentHash = await DbService.oldSha256(cleanCurrent);
+				const storedHash = await DbService.getPanelPassword(env.DB, true);
+				if (storedHash && storedHash !== currentHash && storedHash !== oldCurrentHash) {
+					return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), {
+						status: 401,
+						headers: { "Content-Type": "application/json; charset=utf-8" },
+					});
+				}
 			}
 			if (cleanNew.length < 4) {
 				return new Response(JSON.stringify({ error: "رمز عبور جدید باید حداقل ۴ کاراکتر باشد" }), {
