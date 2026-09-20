@@ -358,7 +358,7 @@ const NEW_USER_DEFAULTS_FALLBACK = {
 	new_user_frag_len: "",
 	new_user_frag_int: "",
 	new_user_ip_operator: "all",
-	new_user_ip_count: "15",
+	new_user_ip_count: "999999", // no count cap — getRandomIps() returns every available Clean IP once count >= pool size
 	new_user_auto_rotate_ip: "0",
 	new_user_start_on_first_connect: "0",
 	new_user_connection_type: "vless",
@@ -1145,7 +1145,7 @@ const Router = {
 			}
 			if (user.auto_rotate_ip === 1) {
 				const cachedIpsData = await getCachedIps();
-				const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 20);
+				const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
 				if (randomIps.length > 0) user.ips = randomIps.join("\n");
 			}
 			const statusPageIpSettings = await getSubscriptionIpSettings(env);
@@ -1975,7 +1975,7 @@ const Router = {
 						const trojanHash = finalUuid ? sha224Pure(finalUuid) : null;
 						try {
 							await env.DB.prepare("UPDATE users SET username = ?, uuid = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, advanced_frag = ?, cipher_suites = ?, tls_mask = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ?, start_on_first_connect = ?, enable_direct = ?, connection_type = CASE WHEN ? IS NOT NULL THEN ? ELSE connection_type END, trojan_hash = ? WHERE username = ?")
-								.bind(new_username || username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
+								.bind(new_username || username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 999999, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
 								.run();
 						} catch (err) {
 							// اگه این خطا دقیقاً برخورد با ایندکس UNIQUE جدید uuid باشه (فقط در یک ریس-کاندیشن واقعی ممکنه، چون بالاتر همین uuid چک شده)، همون پیام دوستانه‌ی همیشگی رو برگردون؛ برای هر خطای دیگه‌ی دیتابیس هم به‌جای کرش کردن، خطای تمیز JSON برگردون
@@ -2021,7 +2021,7 @@ const Router = {
 						const enrichedUsers = (results || []).map((user) => {
 							let finalIps = user.ips;
 							if (user.auto_rotate_ip === 1) {
-								const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 20);
+								const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
 								if (randomIps.length > 0) finalIps = randomIps.join("\n");
 							}
 							const currentOnlineCount = Math.max((ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0), getActiveIpCount(user.active_ips));
@@ -2225,7 +2225,7 @@ const Router = {
 						// this request doesn't have to wait on a full round of live
 						// proxy testing.
 						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 20, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct))
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct))
 							.run();
 						// Clears any stale negative-cache ("no such user") entry that might exist for
 						// this uuid/hash from an earlier probe or connection attempt with this UUID.
@@ -2337,7 +2337,7 @@ const DbService = {
 					{ name: "auto_rotate_ip", def: "INTEGER DEFAULT 1" },
 					{ name: "rotate_time", def: "INTEGER DEFAULT 0" },
 					{ name: "ip_operator", def: "TEXT DEFAULT 'all'" },
-					{ name: "ip_count", def: "INTEGER DEFAULT 15" },
+					{ name: "ip_count", def: "INTEGER DEFAULT 999999" },
 					{ name: "last_rotate_time", def: "INTEGER DEFAULT 0" },
 					{ name: "auto_rotate_user_proxy", def: "INTEGER DEFAULT 0" },
 					{ name: "start_on_first_connect", def: "INTEGER DEFAULT 0" },
@@ -2650,7 +2650,7 @@ const SubscriptionService = {
 		let ips = [host];
 		if (user.auto_rotate_ip === 1) {
 			const cachedIpsData = await getCachedIps();
-			const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 20);
+			const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
 			if (randomIps.length > 0) ips = randomIps;
 		}
 		if (ips.length === 1 && ips[0] === host && user.ips) {
@@ -2866,7 +2866,7 @@ const SubscriptionService = {
 		let ips = [host];
 		if (user.auto_rotate_ip === 1) {
 			const cachedIpsData = await getCachedIps();
-			const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 20);
+			const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
 			if (randomIps.length > 0) ips = randomIps;
 		}
 		if (ips.length === 1 && ips[0] === host && user.ips) {
@@ -8580,7 +8580,7 @@ let activeRocketBtn = null;
 			const auto_rotate_ip = document.getElementById('input-auto-rotate-ip-toggle') ? (document.getElementById('input-auto-rotate-ip-toggle').checked ? 1 : 0) : 0;
 			const rotate_time = 0;
 			const ip_operator = document.getElementById('hidden-ip-operator').value || 'all';
-			const ip_count = parseInt(document.getElementById('hidden-ip-count').value) || 20;
+			const ip_count = parseInt(document.getElementById('hidden-ip-count').value) || 999999;
 			const userProxyMode = document.getElementById('user-proxy-mode-toggle') ? document.getElementById('user-proxy-mode-toggle').checked : false;
 			let userSocks5 = null;
 			if (userProxyMode && window.proxyFieldsData && window.proxyFieldsData.length > 0) {
@@ -9501,7 +9501,7 @@ function populateUserFormFields(user) {
 	if (autoRotateIpToggle) autoRotateIpToggle.checked = (user.auto_rotate_ip === 1);
 	document.getElementById('hidden-rotate-time').value = user.rotate_time || '';
 	document.getElementById('hidden-ip-operator').value = user.ip_operator || 'all';
-	document.getElementById('hidden-ip-count').value = user.ip_count || '20';
+	document.getElementById('hidden-ip-count').value = user.ip_count || '999999';
 	document.getElementById('input-block-porn').checked = (user.block_porn === 1);
 	document.getElementById('input-block-ads').checked = (user.block_ads === 1);
 	const fragLenInput = document.getElementById('input-frag-len');
@@ -9967,7 +9967,7 @@ window.NEW_USER_DEFAULTS_FALLBACK = {
 	new_user_frag_len: '',
 	new_user_frag_int: '',
 	new_user_ip_operator: 'all',
-	new_user_ip_count: '15',
+	new_user_ip_count: '999999', // no count cap
 	new_user_auto_rotate_ip: '0',
 	new_user_start_on_first_connect: '0',
 	new_user_connection_type: 'vless'
