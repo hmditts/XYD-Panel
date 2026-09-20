@@ -609,6 +609,67 @@ async function mergePinnedLocationsForUser(existingProxyList, pinnedLocations) {
 	return { list, added: toAdd, cappedOut };
 }
 
+// Re-attaches the {proxy, country} tag to slots the admin did NOT touch when the edit-user
+// modal is saved. The modal only keeps the bare proxy string of each slot (populateUserFormFields
+// drops the `country` tag) and posts user_socks5 back as a plain string / array of strings, so
+// without this every "save" - whatever field was changed - wiped every country tag, and
+// getSelectedUserProxy() (which matches /XYZ/<country-code> against slot.country) then found
+// nothing and the config silently fell back to a direct/Cloudflare connection.
+// Every incoming string that is identical to a tagged slot already stored for this user gets that
+// slot's country back (each stored slot is consumed once, so duplicated proxy strings can't steal
+// each other's tag). A slot the admin really added/changed by hand stays untagged, exactly as before.
+// Objects already carrying a tag are left alone. Returns the original value when nothing matched.
+function preserveProxyCountryTags(incomingRaw, existingRaw) {
+	if (incomingRaw === undefined || incomingRaw === null || incomingRaw === "") return incomingRaw;
+	let existingList = [];
+	try {
+		const es = String(existingRaw || "").trim();
+		if (es.startsWith("[")) {
+			const parsed = JSON.parse(es);
+			if (Array.isArray(parsed)) existingList = parsed;
+		}
+	} catch (e) {
+		return incomingRaw;
+	}
+	const tagPool = new Map();
+	for (const slot of existingList) {
+		if (typeof slot === "object" && slot !== null && slot.country && typeof slot.proxy === "string" && slot.proxy.trim()) {
+			const key = slot.proxy.trim();
+			if (!tagPool.has(key)) tagPool.set(key, []);
+			tagPool.get(key).push(String(slot.country));
+		}
+	}
+	if (tagPool.size === 0) return incomingRaw;
+	let incomingList;
+	if (Array.isArray(incomingRaw)) {
+		incomingList = incomingRaw;
+	} else {
+		const is = String(incomingRaw).trim();
+		if (is.startsWith("[")) {
+			try {
+				incomingList = JSON.parse(is);
+			} catch (e) {
+				return incomingRaw;
+			}
+			if (!Array.isArray(incomingList)) return incomingRaw;
+		} else {
+			incomingList = [is];
+		}
+	}
+	let changed = false;
+	const out = incomingList.map((item) => {
+		if (typeof item !== "string") return item;
+		const key = item.trim();
+		const queue = tagPool.get(key);
+		if (queue && queue.length > 0) {
+			changed = true;
+			return { proxy: key, country: queue.shift() };
+		}
+		return item;
+	});
+	return changed ? JSON.stringify(out) : incomingRaw;
+}
+
 // Removes every slot tagged with one of `countries` (ISO alpha-2) from EVERY user's
 // user_socks5 list. Called from POST /api/settings/bulk when countries were just
 // un-pinned (pinned_locations shrank), so an un-pinned country actually disappears
@@ -1982,7 +2043,7 @@ const Router = {
 						} else if (connection_type) {
 							finalConnType = connection_type;
 						}
-						const existingUser = await env.DB.prepare("SELECT id, uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
+						const existingUser = await env.DB.prepare("SELECT id, uuid, trojan_hash, user_socks5 FROM users WHERE username = ?").bind(username).first();
 						let finalUuid = existingUser ? existingUser.uuid : null;
 						if (new_uuid !== undefined && new_uuid !== null && String(new_uuid).trim() !== "") {
 							const trimmedUuid = String(new_uuid).trim().toLowerCase();
@@ -1998,9 +2059,30 @@ const Router = {
 							finalUuid = trimmedUuid;
 						}
 						const trojanHash = finalUuid ? sha224Pure(finalUuid) : null;
+						// "Reset to Default" (edit-user modal): the form already carries every other field at its
+						// new-user default (the client did that), so the rest of this PUT just saves them; usage
+						// counters (used_gb, used_req, lifetime_used_gb, created_at, first_connection_time ...) are
+						// not in the UPDATE below and stay untouched. What only the server can do is throw the
+						// user's proxy list away and rebuild it from the pinned locations in Settings - the same
+						// list a brand-new user gets. Otherwise keep the country tag of every slot the admin left
+						// unchanged (see preserveProxyCountryTags() for why the form alone can't do it).
+						const resetProxyToDefault = body.reset_user_to_default === true;
+						let finalUserSocks5 = user_socks5;
+						if (resetProxyToDefault) {
+							const pinnedForReset = await getPinnedLocationsSetting(env);
+							const rebuiltList = await buildPinnedDefaultProxyList(pinnedForReset);
+							// Every VIP list unreachable/empty (e.g. the source is down right now) would turn a
+							// working-but-mistagged user into a direct-only one - refuse and leave the user untouched.
+							if (rebuiltList.length > 0 && rebuiltList.every((slot) => !slot.proxy)) {
+								return new Response(JSON.stringify({ error: "لیست پروکسی‌های VIP در حال حاضر در دسترس نیست؛ هیچ تغییری اعمال نشد. کمی بعد دوباره تلاش کنید." }), { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } });
+							}
+							finalUserSocks5 = JSON.stringify(rebuiltList);
+						} else {
+							finalUserSocks5 = preserveProxyCountryTags(user_socks5, existingUser ? existingUser.user_socks5 : null);
+						}
 						try {
 							await env.DB.prepare("UPDATE users SET username = ?, uuid = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, advanced_frag = ?, cipher_suites = ?, tls_mask = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ?, start_on_first_connect = ?, enable_direct = ?, connection_type = CASE WHEN ? IS NOT NULL THEN ? ELSE connection_type END, trojan_hash = ? WHERE username = ?")
-								.bind(new_username || username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 999999, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
+								.bind(new_username || username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, finalUserSocks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 999999, (resetProxyToDefault || auto_rotate_user_proxy) ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
 								.run();
 						} catch (err) {
 							// اگه این خطا دقیقاً برخورد با ایندکس UNIQUE جدید uuid باشه (فقط در یک ریس-کاندیشن واقعی ممکنه، چون بالاتر همین uuid چک شده)، همون پیام دوستانه‌ی همیشگی رو برگردون؛ برای هر خطای دیگه‌ی دیتابیس هم به‌جای کرش کردن، خطای تمیز JSON برگردون
@@ -2009,6 +2091,14 @@ const Router = {
 								return new Response(JSON.stringify({ error: "این UUID قبلاً برای کاربر دیگری استفاده شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
 							}
 							return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
+						}
+						if (resetProxyToDefault) {
+							// fresh list => old per-country auto-heal cooldowns no longer apply. The auto-reset timers
+							// are restarted from today exactly like POST /api/users does for a new user: last_reset_*_time
+							// defaults to 0 for old rows, so once the defaults switch auto-reset on, checkAutoResets()
+							// would otherwise see a "period long overdue" and zero used_gb / used_req at its next run.
+							const resetTodayUtc = Math.floor(Date.now() / 86400000) * 86400000;
+							try { await env.DB.prepare("UPDATE users SET proxy_rotate_cooldowns = '{}', last_reset_vol_time = ?, last_reset_req_time = ? WHERE username = ?").bind(resetTodayUtc, resetTodayUtc, new_username || username).run(); } catch (e) { }
 						}
 						// Invalidate the old identity's cache entries (covers the common case where
 						// uuid didn't change too). If the admin also assigned a new uuid, invalidate
@@ -6555,6 +6645,13 @@ Commercial support is available at
 								</div>
 							</div>
 							
+							<div id="reset-user-default-wrap" style="display:none" class="space-y-2">
+								<button type="button" id="reset-user-default-btn" onclick="resetUserToDefault()" class="w-full py-2.5 bg-orange-700 hover:bg-orange-800 dark:bg-orange-600 dark:hover:bg-orange-700 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-1.5 shadow-sm">
+									<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+									<span>Reset to Default</span>
+								</button>
+								<p id="reset-user-default-note" style="display:none" class="text-[10px] font-bold text-orange-700 dark:text-orange-400 leading-relaxed text-justify">همه‌ی فیلدهای فرم به مقادیر پیش‌فرض یک کاربر جدید برگشت (نام کاربری، UUID و آمار مصرف دست‌نخورده می‌مانند). لیست لوکیشن‌ها و پروکسی‌ها هم با «ذخیره تغییرات» از لوکیشن‌های پین‌شده‌ی تنظیمات دوباره ساخته می‌شود. برای انصراف، بدون ذخیره مودال را ببندید.</p>
+							</div>
 							<div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
 								<button type="button" onclick="toggleDonateModal(true)" class="py-2.5 px-3 bg-red-700 hover:bg-red-800 dark:bg-red-600 dark:hover:bg-red-700 text-white rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
 									<svg class="w-4 h-4 text-red-500" fill="currentColor" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3 9.24 3 10.91 3.81 12 5.08 13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
@@ -7633,6 +7730,7 @@ ${COMMON_TOAST_HTML}
 			if (!show) {
 				isEditMode = false;
 				editingUsername = '';
+				if (typeof window.syncResetUserUi === 'function') window.syncResetUserUi(false);
 				document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
 				updateSubmitBtnState('ایجاد کاربر');
 				document.getElementById('input-name').disabled = false;
@@ -7693,13 +7791,7 @@ let activeRocketBtn = null;
 
 
 
-		function openCreateModal() {
-			isEditMode = false;
-			editingUsername = '';
-			document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
-			updateSubmitBtnState('ایجاد کاربر');
-			document.getElementById('input-name').disabled = false;
-			document.getElementById('create-user-form').reset();
+		window.applyNewUserFormDefaults = function() {
 			const ipLimitInputEl = document.getElementById('input-ip-limit');
 			if (ipLimitInputEl) {
 				const dwThreshold = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
@@ -7760,6 +7852,16 @@ let activeRocketBtn = null;
 			document.getElementById('hidden-ip-count').value = String(nud.ip_count);
 			const cleanIpsField = document.getElementById('input-ips');
 			if (cleanIpsField) cleanIpsField.value = window.GLOBAL_CLEAN_IP || window.DEFAULT_GLOBAL_CLEAN_IP;
+		};
+		function openCreateModal() {
+			isEditMode = false;
+			editingUsername = '';
+			if (typeof window.syncResetUserUi === 'function') window.syncResetUserUi(false);
+			document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
+			updateSubmitBtnState('ایجاد کاربر');
+			document.getElementById('input-name').disabled = false;
+			document.getElementById('create-user-form').reset();
+			window.applyNewUserFormDefaults();
 			toggleModal(true);
 		}
 		
@@ -8639,6 +8741,7 @@ let activeRocketBtn = null;
 						advanced_frag: advanced_frag || null, cipher_suites: cipher_suites || null, tls_mask: tls_mask || null,
 						user_proxy_iata: null,
 						user_socks5: userSocks5 || null,
+						reset_user_to_default: isEditMode && window.resetUserToDefaultPending === true,
 						user_proxy_ip: null,
 						auto_reset_vol_days: auto_reset_vol_days,
 						auto_reset_req_days: auto_reset_req_days,
@@ -9612,6 +9715,7 @@ function editUser(encodedUsername) {
 	const uuidInputEdit = document.getElementById('input-uuid');
 	if (uuidInputEdit) uuidInputEdit.value = user.uuid || '';
 	populateUserFormFields(user);
+	if (typeof window.syncResetUserUi === 'function') window.syncResetUserUi(true);
 	toggleModal(true);
 }
 		async function deleteUser(encodedUsername) {
@@ -10178,6 +10282,58 @@ window.saveSettings = async function() {
 	} finally {
 		buttons.forEach(function(b) { b.disabled = false; });
 	}
+};
+window.resetUserToDefaultPending = false;
+window.syncResetUserUi = function(showBtn) {
+	window.resetUserToDefaultPending = false;
+	const wrap = document.getElementById('reset-user-default-wrap');
+	const note = document.getElementById('reset-user-default-note');
+	if (wrap) wrap.style.display = showBtn ? 'block' : 'none';
+	if (note) note.style.display = 'none';
+};
+// Edit-user modal only: puts EVERY field of the form back to what a brand-new user gets (same
+// defaults openCreateModal() uses, via applyNewUserFormDefaults) while keeping this user's
+// username + UUID. Nothing is saved until the admin presses "ذخیره تغییرات"; closing the modal
+// discards it. The saved request carries reset_user_to_default, which makes the server also
+// rebuild the proxy list from the pinned locations. Usage counters are never part of the form.
+window.resetUserToDefault = async function() {
+	if (!isEditMode) return;
+	const ok = await customConfirm('همه‌ی تنظیمات این کاربر (محدودیت حجم/زمان/ریکوئست، پورت‌ها، آی‌پی‌ها، فرگمنت، لوکیشن‌ها و پروکسی‌ها و ...) به حالت پیش‌فرض یک کاربر جدید برمی‌گردد. نام کاربری، UUID و آمار مصرف حفظ می‌شود. ادامه می‌دهید؟');
+	if (!ok) return;
+	const form = document.getElementById('create-user-form');
+	const nameEl = document.getElementById('input-name');
+	const uuidEl = document.getElementById('input-uuid');
+	const keepName = nameEl ? nameEl.value : '';
+	const keepUuid = uuidEl ? uuidEl.value : '';
+	if (form) form.reset();
+	if (nameEl) nameEl.value = keepName;
+	if (uuidEl) uuidEl.value = keepUuid;
+	window.applyNewUserFormDefaults();
+	// چیزهایی که در حالت «ایجاد» از بسته‌شدن قبلی مودال (toggleModal(false)) پاک می‌ماند
+	const advSettingsToggle = document.getElementById('input-advanced-settings-toggle');
+	if (advSettingsToggle) advSettingsToggle.checked = false;
+	const advFragInput = document.getElementById('input-advanced-frag');
+	if (advFragInput) advFragInput.value = '';
+	const csInput = document.getElementById('input-cipher-suites');
+	if (csInput) csInput.value = '';
+	const maskInput = document.getElementById('input-tls-mask');
+	if (maskInput) maskInput.value = '';
+	if (typeof window.toggleAdvancedSettingsInputs === 'function') window.toggleAdvancedSettingsInputs(false);
+	const customPortInput = document.getElementById('input-custom-ports');
+	if (customPortInput) customPortInput.value = '';
+	document.querySelectorAll('.frag-preset-card').forEach(card => card.classList.remove('ring-2', 'ring-blue-500', 'border-blue-500', 'bg-blue-50/50', 'dark:bg-blue-950/40'));
+	// کاربر جدید بدون مقدار صریح، ip_limit = آستانه‌ی هشدار سراسری می‌گیرد؛ در ویرایش خالی یعنی نامحدود، پس صریح می‌نویسیم
+	const ipLimitInputEl = document.getElementById('input-ip-limit');
+	if (ipLimitInputEl) {
+		ipLimitInputEl.placeholder = 'نامحدود';
+		ipLimitInputEl.value = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
+	}
+	// سرور همیشه برای لیست تازه‌ساخته‌شده auto-heal را روشن می‌کند (مثل کاربر جدید)
+	const rotateCheck = document.getElementById('input-auto-rotate-user-proxy');
+	if (rotateCheck) rotateCheck.checked = true;
+	window.resetUserToDefaultPending = true;
+	const note = document.getElementById('reset-user-default-note');
+	if (note) note.style.display = 'block';
 };
 window.toggleUserProxyMode = function(isSocksMode) {
 	const socksContainer = document.getElementById('user-socks5-container');
