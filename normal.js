@@ -1619,6 +1619,7 @@ const Router = {
 			if (request.method === "POST") {
 				const body = await readJsonBody(request);
 				let unpinRemoval = { countries: [], usersUpdated: 0 };
+				let fragApplied = false;
 				if (body.settings && typeof body.settings === "object") {
 					// «هشدار تعداد دستگاه» (device_warning_threshold): برخلاف بقیه‌ی تنظیمات
 					// global، این یکی روی ستون ip_limit/max_connections همه‌ی کاربرهای *موجود*
@@ -1637,6 +1638,26 @@ const Router = {
 					if (Object.prototype.hasOwnProperty.call(body.settings, "default_port")) {
 						const parsedPort = parseInt(body.settings.default_port);
 						if (!isNaN(parsedPort) && parsedPort > 0 && parsedPort <= 65535) overrideDefaultPort = String(parsedPort);
+					}
+					// «فرگمنت» (new_user_frag_len / new_user_frag_int): کلیدهای new_user_* فقط
+					// پیش‌فرضِ کاربر *تازه‌ساز*ند. لینک‌ها از ستون‌های frag_len/frag_int خودِ هر
+					// کاربر ساخته می‌شوند (SubscriptionService.generateText)، نه از settings؛ پس
+					// ذخیره‌ی این دو کلید به‌تنهایی روی کانفیگ کاربرهای موجود هیچ اثری ندارد.
+					// فقط وقتی فراخواننده (Push پنل مادر) صریحاً apply_frag_to_existing_users: true
+					// بفرستد (فلگ بیرون از body.settings، مثل prune_unpinned_locations)، همین دو
+					// مقدار روی ستون frag_len/frag_int همه‌ی کاربرهای *موجود* هم نوشته می‌شود؛
+					// مقدار خالی = فرگمنتیشن خاموش. «ذخیره‌ی تنظیمات» خودِ همین پنل این فلگ را
+					// نمی‌فرستد، پس فقط برای کاربر بعدی اثر دارد. هر دو کلید باید در درخواست باشند.
+					let overrideFrag = undefined;
+					if (
+						body.apply_frag_to_existing_users === true &&
+						Object.prototype.hasOwnProperty.call(body.settings, "new_user_frag_len") &&
+						Object.prototype.hasOwnProperty.call(body.settings, "new_user_frag_int")
+					) {
+						overrideFrag = {
+							len: String(body.settings.new_user_frag_len == null ? "" : body.settings.new_user_frag_len).trim(),
+							int: String(body.settings.new_user_frag_int == null ? "" : body.settings.new_user_frag_int).trim(),
+						};
 					}
 					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
 					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
@@ -1674,8 +1695,12 @@ const Router = {
 					if (overrideDefaultPort !== undefined) {
 						await env.DB.prepare("UPDATE users SET port = ?").bind(overrideDefaultPort).run();
 					}
+					if (overrideFrag !== undefined) {
+						await env.DB.prepare("UPDATE users SET frag_len = ?, frag_int = ?").bind(overrideFrag.len, overrideFrag.int).run();
+						fragApplied = true;
+					}
 				}
-				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/proxy-ip") {
