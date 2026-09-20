@@ -44,6 +44,18 @@ async function fetchWithFallback(path, options = {}) {
 	} catch (e) { }
 	return await fetch(fallbackUrl, options);
 }
+// Both update endpoints (/api/update-panel, /api/update-panel-github) upload the fetched file to
+// Cloudflare unchanged, as an ES module (main_module: "zeus.js"). The plain decoded source (vX_Y.js)
+// is only a function BODY that ends with a top-level "return" of the worker object - it is not a
+// module (no default export, and a top-level return is illegal in a module), so Cloudflare refuses it.
+// Only the obfuscated stub (import ... + default export) or a real module can be deployed this way.
+// Fail early with a message that says so, instead of a bare Cloudflare syntax error. A valid module
+// can never end in a top-level return, so this can't block a good file; anything else is left to Cloudflare.
+function assertDeployableWorkerModule(code, sourceLabel) {
+	if (/return\s+__WORKER_EXPORT__\s*;?\s*$/.test(String(code).trim())) {
+		throw new Error("فایل «" + sourceLabel + "» نسخه‌ی decode‌شده (خوانا) است، نه فایل قابل‌دیپلوی: با «return __WORKER_EXPORT__» تمام می‌شود و export default ندارد، برای همین کلودفلر آن را رد می‌کند. نسخه‌ی obfuscated (stub دارای export default) را در گیت‌هاب بگذارید.");
+	}
+}
 let localLastAutoResetCheck = 0;
 async function checkAutoResets(env, ctx) {
 	const now = Date.now();
@@ -1489,11 +1501,16 @@ const Router = {
 				});
 				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
 				const newCode = await githubRes.text();
+				assertDeployableWorkerModule(newCode, "zeus.obfuscated.js");
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
 				});
-				if (!bindingsRes.ok) throw new Error("عدم دسترسی به تنظیمات ورکر. کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")");
+				if (!bindingsRes.ok) {
+					const bindingsErr = await bindingsRes.json().catch(() => ({}));
+					const bindingsErrMsg = bindingsErr && bindingsErr.errors && bindingsErr.errors[0] ? bindingsErr.errors[0].message : "";
+					throw new Error("عدم دسترسی به تنظیمات ورکر «" + scriptName + "». کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")" + (bindingsErrMsg ? ": " + bindingsErrMsg : ""));
+				}
 				const bindingsData = await bindingsRes.json().catch(() => ({}));
 				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
 				const newBindings = [];
@@ -1571,11 +1588,16 @@ const Router = {
 				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
 				const newCode = await githubRes.text();
 				if (!newCode || newCode.trim().length < 100) throw new Error("فایل دریافتی از گیت‌هاب خالی یا نامعتبر است.");
+				assertDeployableWorkerModule(newCode, "worker.js");
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
 				});
-				if (!bindingsRes.ok) throw new Error("عدم دسترسی به تنظیمات ورکر. کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")");
+				if (!bindingsRes.ok) {
+					const bindingsErr = await bindingsRes.json().catch(() => ({}));
+					const bindingsErrMsg = bindingsErr && bindingsErr.errors && bindingsErr.errors[0] ? bindingsErr.errors[0].message : "";
+					throw new Error("عدم دسترسی به تنظیمات ورکر «" + scriptName + "». کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")" + (bindingsErrMsg ? ": " + bindingsErrMsg : ""));
+				}
 				const bindingsData = await bindingsRes.json().catch(() => ({}));
 				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
 				const newBindings = [];
@@ -7342,7 +7364,7 @@ ${COMMON_TOAST_HTML}
 				if (disable !== null) btnDesk.disabled = disable;
 			}
 		}
-		function showToast(message, type = 'success') {
+		function showToast(message, type = 'success', duration = 3000) {
 			const container = document.getElementById('toast-container');
 			const toast = document.createElement('div');
 			const colors = type === 'error' 
@@ -7357,7 +7379,7 @@ ${COMMON_TOAST_HTML}
 			setTimeout(() => {
 				toast.classList.add('-translate-y-full', 'opacity-0');
 				setTimeout(() => toast.remove(), 300);
-			}, 3000);
+			}, duration);
 		}
 		function customConfirm(message) {
 			return new Promise((resolve) => {
@@ -7898,7 +7920,7 @@ let activeRocketBtn = null;
 					headers: { 'Content-Type': 'application/json' },
 					body: isUpdate ? reqBody : undefined
 				});
-				const data = await res.json();
+				const data = await res.json().catch(() => ({}));
 				if (res.status === 400 && data.error === "TOKEN_REQUIRED") {
 					toggleTokenModal(true);
 					if (btn) {
@@ -7924,7 +7946,12 @@ let activeRocketBtn = null;
 						window.location.href = window.location.pathname + '?t=' + Date.now();
 					}
 				} else {
-					alert(isUpdate ? 'خطا در بروزرسانی. لطفاً با استفاده از " ربات" اقدام کنید.' : 'خطا در ری‌استارت پـنـل: ' + (data.error || 'ناشناخته'));
+					if (isUpdate) {
+						// خطای آپدیت باید آن‌قدر روی صفحه بماند که بشود دلیلش را خواند (توست پیش‌فرض ۳ ثانیه‌ای زود ناپدید می‌شد)
+						showToast('خطا در بروزرسانی: ' + (data.error || ('کد وضعیت ' + res.status)) + ' — اگر مشکل ادامه داشت با استفاده از " ربات" اقدام کنید.', 'error', 20000);
+					} else {
+						alert('خطا در ری‌استارت پـنـل: ' + (data.error || 'ناشناخته'));
+					}
 					if (btn) {
 						btn.disabled = false;
 						if (!isUpdate || isGithubUpdate) btn.classList.remove('animate-pulse');
