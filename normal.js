@@ -644,6 +644,50 @@ async function removeCountriesFromAllUsers(env, ctx, countries) {
 	return { countries: Array.from(targets), usersUpdated: changedUsers.length };
 }
 
+// "Mirror" variant of removeCountriesFromAllUsers(): instead of being told WHICH countries
+// to remove, it is told which to KEEP (`keepCountries` = the pinned list that was just
+// saved) and strips every country-tagged slot that is not in it from EVERY user's
+// user_socks5 list. Used by POST /api/settings/bulk when the caller (the mother panel's
+// "Push") sends prune_unpinned_locations: true. This is what actually cleans up panels
+// that already carry countries which are no longer pinned (e.g. the 15 built-in defaults
+// left over from before an empty list could be saved) - the "previous vs. now" comparison
+// alone can never find those. Slots WITHOUT a country tag (proxies added by hand as a raw
+// string, legacy non-object slots) are never touched. Returns { countries, usersUpdated }
+// where `countries` = the country codes that were really removed from at least one user.
+async function removeUnpinnedCountriesFromAllUsers(env, ctx, keepCountries) {
+	const keep = new Set((keepCountries || []).map((c) => String(c).trim().toUpperCase()).filter(Boolean));
+	const { results } = await env.DB.prepare("SELECT username, uuid, trojan_hash, user_socks5 FROM users WHERE user_socks5 IS NOT NULL AND user_socks5 != ''").all();
+	const stmts = [];
+	const changedUsers = [];
+	const removedCountries = new Set();
+	for (const row of results || []) {
+		const raw = String(row.user_socks5 || "").trim();
+		if (!raw.startsWith("[")) continue;
+		let list;
+		try {
+			list = JSON.parse(raw);
+		} catch (e) {
+			continue;
+		}
+		if (!Array.isArray(list)) continue;
+		const kept = list.filter((p) => {
+			if (typeof p !== "object" || p === null) return true;
+			const cc = String(p.country || "").trim().toUpperCase();
+			if (!cc || keep.has(cc)) return true;
+			removedCountries.add(cc);
+			return false;
+		});
+		if (kept.length === list.length) continue;
+		stmts.push(env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(kept), row.username));
+		changedUsers.push(row);
+	}
+	for (let i = 0; i < stmts.length; i += 50) {
+		await env.DB.batch(stmts.slice(i, i + 50));
+	}
+	await Promise.all(changedUsers.map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
+	return { countries: Array.from(removedCountries), usersUpdated: changedUsers.length };
+}
+
 async function replaceBrokenProxy(username, env, oldProxy) {
 	try {
 		if (GLOBAL_WRITE_LOCK.get(username + "_proxy_rotate")) return;
@@ -1609,11 +1653,19 @@ const Router = {
 					if (settingsStmts.length > 0) await env.DB.batch(settingsStmts);
 					// کشوری که از لیست پین‌شده‌ها حذف شده، از کانفیگ همه‌ی کاربرهای موجود هم
 					// پاک می‌شه (فقط کشورهایی که همین الان آن‌پین شدن - نه هر کشوری که پین نبوده).
+					// اگه فراخواننده (Push پنل مادر) فلگ prune_unpinned_locations رو هم فرستاده
+					// باشه، حالت «آینه‌ای» اجرا می‌شه: هر کشور تگ‌دار که توی لیست جدید نیست از
+					// همه‌ی کاربرها پاک می‌شه (نه فقط اونایی که همین الان آن‌پین شدن). فلگ باید
+					// بیرون از body.settings باشه، چون settings بدون whitelist ذخیره می‌شه.
 					if (previousPinnedLocations) {
 						const nowPinnedLocations = await getPinnedLocationsSetting(env);
-						const unpinned = previousPinnedLocations.filter((cc) => !nowPinnedLocations.includes(cc));
-						if (unpinned.length > 0) {
-							unpinRemoval = await removeCountriesFromAllUsers(env, ctx, unpinned);
+						if (body.prune_unpinned_locations === true) {
+							unpinRemoval = await removeUnpinnedCountriesFromAllUsers(env, ctx, nowPinnedLocations);
+						} else {
+							const unpinned = previousPinnedLocations.filter((cc) => !nowPinnedLocations.includes(cc));
+							if (unpinned.length > 0) {
+								unpinRemoval = await removeCountriesFromAllUsers(env, ctx, unpinned);
+							}
 						}
 					}
 					if (overrideDeviceWarningThreshold !== undefined) {
@@ -2508,9 +2560,15 @@ async function getSubscriptionIpSettings(env) {
 // named with a German flag + zero-padded index (see call sites).
 // Reads the admin-editable pinned-locations list from the settings table
 // (see the "لوکیشن‌ها" section of the settings modal / saveLocations() on
-// the client side). Falls back to PINNED_DEFAULT_LOCATIONS_FALLBACK if the
-// setting was never saved, is malformed, or ends up empty after validation -
-// so a fresh install (or a corrupted value) never breaks user provisioning.
+// the client side). Falls back to PINNED_DEFAULT_LOCATIONS_FALLBACK ONLY if the
+// setting was never saved (no row / empty string) or is malformed (not valid
+// JSON, or not an array) - so a fresh install (or a corrupted value) never
+// breaks user provisioning.
+// An EXPLICITLY saved empty list ("[]", i.e. the admin removed every pinned
+// country) is respected and returned as [] - it is NOT turned back into the
+// 15-country default. (Before, an empty list silently came back as the
+// defaults, so "remove all countries" never actually removed anything: the
+// "which countries were un-pinned" comparison saw the defaults on both sides.)
 // Only valid ISO 3166-1 alpha-2 codes are kept; duplicates are dropped,
 // order is preserved (this order becomes loc-0..loc-N for new users).
 async function getPinnedLocationsSetting(env) {
@@ -2526,7 +2584,7 @@ async function getPinnedLocationsSetting(env) {
 			const cc = raw.trim().toUpperCase();
 			if (cc && ISO_ALPHA3_MAP[cc] && !cleaned.includes(cc)) cleaned.push(cc);
 		}
-		return cleaned.length > 0 ? cleaned : PINNED_DEFAULT_LOCATIONS_FALLBACK;
+		return cleaned;
 	} catch (e) {
 		return PINNED_DEFAULT_LOCATIONS_FALLBACK;
 	}
@@ -7961,7 +8019,8 @@ let activeRocketBtn = null;
 		function renderGlobalLocationBadges() {
 			const container = document.getElementById('global-location-badges');
 			if (!container) return;
-			const list = (window.PINNED_LOCATIONS_CACHE && window.PINNED_LOCATIONS_CACHE.length > 0)
+			// یک لیست خالی (ادمین عمداً همه را برداشته) خالی می‌ماند و به پیش‌فرض برنمی‌گردد.
+			const list = Array.isArray(window.PINNED_LOCATIONS_CACHE)
 				? window.PINNED_LOCATIONS_CACHE
 				: (window.PINNED_LOCATIONS_DEFAULT_FALLBACK || []);
 			if (!list || list.length === 0) {
@@ -9656,7 +9715,8 @@ window.loadPinnedLocationsSetting = async function() {
 		const data = await res.json();
 		if (data && typeof data.pinned_locations === 'string' && data.pinned_locations.trim() !== '') {
 			const parsed = JSON.parse(data.pinned_locations);
-			if (Array.isArray(parsed) && parsed.length > 0) list = parsed;
+			// لیست خالیِ ذخیره‌شده یعنی ادمین عمداً همه را برداشته؛ به ۱۵ کشور پیش‌فرض برنمی‌گردد.
+			if (Array.isArray(parsed)) list = parsed;
 		}
 	} catch (e) {}
 	window.PINNED_LOCATIONS_CACHE = list;
@@ -9669,10 +9729,15 @@ window.renderPinnedLocationsList = function() {
 	if (countEl) countEl.innerText = window.PINNED_LOCATIONS_CACHE.length + ' کشور';
 	if (!container) return;
 	const lastIdx = window.PINNED_LOCATIONS_CACHE.length - 1;
+	// اگر لیست VIP لود شده باشد، کشور پین‌شده‌ای که فایل VIP ندارد علامت ⚠ می‌گیرد
+	// (برایش پروکسی واقعی وجود ندارد و اسلاتش خالی می‌ماند).
+	const vipCodes = Array.isArray(window.VIP_COUNTRY_CODES) && window.VIP_COUNTRY_CODES.length > 0 ? window.VIP_COUNTRY_CODES : null;
 	container.innerHTML = window.PINNED_LOCATIONS_CACHE.map(function(cc, i) {
 		const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
+		const noVip = vipCodes && vipCodes.indexOf(cc) === -1;
+		const warn = noVip ? ' <span title="این کشور در لیست VIP نیست و پروکسی واقعی ندارد؛ بهتر است حذفش کنید" class="text-amber-500">⚠</span>' : '';
 		return '<div class="flex items-center gap-2 py-1.5 px-2 border-b border-gray-100 dark:border-zinc-800 last:border-0">' +
-			'<span class="flex-1 text-xs font-bold text-gray-800 dark:text-zinc-200">' + flag + ' ' + cc + '</span>' +
+			'<span class="flex-1 text-xs font-bold text-gray-800 dark:text-zinc-200">' + flag + ' ' + cc + warn + '</span>' +
 			'<button type="button" onclick="pinnedLocationMoveUp(' + i + ')" ' + (i === 0 ? 'disabled' : '') + ' class="p-1 rounded text-gray-500 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed">▲</button>' +
 			'<button type="button" onclick="pinnedLocationMoveDown(' + i + ')" ' + (i === lastIdx ? 'disabled' : '') + ' class="p-1 rounded text-gray-500 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed">▼</button>' +
 			'<button type="button" onclick="pinnedLocationRemove(' + i + ')" class="p-1 rounded text-red-500 hover:text-red-700">✕</button>' +
@@ -9702,7 +9767,12 @@ window.pinnedLocationRemove = function(i) {
 };
 window.pinnedLocationAdd = function() {
 	const select = document.getElementById('pinned-location-add-select');
-	if (!select || !select.value) return;
+	if (!select) return;
+	if (!select.value) {
+		// لیست VIP هنوز لود نشده یا لود نشد: با زدن «افزودن» دوباره تلاش می‌کند.
+		if (select.getAttribute('data-vip-state') !== 'ok') window.populatePinnedLocationSelects(true);
+		return;
+	}
 	const cc = select.value;
 	if (window.PINNED_LOCATIONS_CACHE.indexOf(cc) === -1) {
 		window.PINNED_LOCATIONS_CACHE.push(cc);
@@ -9773,19 +9843,64 @@ window.applyPinnedLocationsToAllUsers = async function(btn) {
 		showToast('⚠️ ذخیره شد ولی اعمال خودکار لوکیشن‌ها روی کاربرها با خطا مواجه شد.');
 	}
 };
-window.populatePinnedLocationSelects = function() {
-	const addSelect = document.getElementById('pinned-location-add-select');
-	[addSelect].forEach(function(select) {
-		if (!select) return;
-		select.innerHTML = '';
-		window.ALL_ISO_COUNTRIES_LIST.forEach(function(cc) {
-			const option = document.createElement('option');
-			option.value = cc;
-			const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
-			option.textContent = flag + ' ' + cc;
-			select.appendChild(option);
-		});
+// لیست کشورهای VIP (همان vip-list که initVipCache() هم می‌خواند؛ اینجا فقط کدهای کشور
+// لازم است، نه خود فایل پروکسی‌ها). نتیجه در window.VIP_COUNTRY_CODES می‌ماند و یک
+// درخواست هم‌زمان دوباره ارسال نمی‌شود. شکست، کش نمی‌شود تا دوباره بشود امتحان کرد.
+window.VIP_COUNTRY_CODES = null;
+window.vipCountryCodesPromise = null;
+window.loadVipCountryCodes = function(force) {
+	if (!force && Array.isArray(window.VIP_COUNTRY_CODES) && window.VIP_COUNTRY_CODES.length > 0) {
+		return Promise.resolve(window.VIP_COUNTRY_CODES);
+	}
+	if (!force && window.vipCountryCodesPromise) return window.vipCountryCodesPromise;
+	const task = (async function() {
+		try {
+			const res = await fetchWithFallbackUI('vip-list');
+			if (!res.ok) throw new Error('vip-list HTTP ' + res.status);
+			const files = await res.json();
+			const codes = [];
+			(Array.isArray(files) ? files : []).forEach(function(f) {
+				const name = typeof f === 'string' ? f : (f && f.name);
+				if (!name || typeof name !== 'string' || !name.toLowerCase().endsWith('.txt')) return;
+				const cc = name.slice(0, -4).trim().toUpperCase();
+				if (/^[A-Z]{2}$/.test(cc) && codes.indexOf(cc) === -1) codes.push(cc);
+			});
+			codes.sort();
+			if (codes.length > 0) window.VIP_COUNTRY_CODES = codes;
+			return codes;
+		} catch (e) {
+			return [];
+		}
+	})();
+	window.vipCountryCodesPromise = task;
+	task.then(function(codes) {
+		if (!codes || codes.length === 0) window.vipCountryCodesPromise = null;
 	});
+	return task;
+};
+window.populatePinnedLocationSelects = async function(force) {
+	const select = document.getElementById('pinned-location-add-select');
+	if (!select) return;
+	select.setAttribute('data-vip-state', 'loading');
+	select.innerHTML = '<option value="">در حال بارگذاری لیست VIP...</option>';
+	const codes = await window.loadVipCountryCodes(force === true);
+	select.innerHTML = '';
+	if (!codes || codes.length === 0) {
+		select.setAttribute('data-vip-state', 'failed');
+		select.innerHTML = '<option value="">لیست VIP در دسترس نیست - «افزودن» را بزنید تا دوباره تلاش شود</option>';
+		return;
+	}
+	select.setAttribute('data-vip-state', 'ok');
+	select.innerHTML = '<option value="">یک کشور VIP انتخاب کنید...</option>';
+	codes.forEach(function(cc) {
+		const option = document.createElement('option');
+		option.value = cc;
+		const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
+		option.textContent = flag + ' ' + cc;
+		select.appendChild(option);
+	});
+	// حالا که لیست VIP معلوم شد، ⚠ کشورهای پین‌شده‌ی بدون VIP را هم به‌روز کن.
+	if (typeof window.renderPinnedLocationsList === 'function') window.renderPinnedLocationsList();
 };
 
 function generateInlineProxyJunkClient(len) {
