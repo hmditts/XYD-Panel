@@ -3903,7 +3903,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				let isNewIp = false;
 				if (!activeIps[clientIP]) {
 					const sortedIps = Object.keys(activeIps);
-					/* Bypassed: if (user.ip_limit && user.ip_limit > 0 && sortedIps.length >= user.ip_limit) { serverSock.close(); return; } */
+					if (user.ip_limit && user.ip_limit > 0 && sortedIps.length >= user.ip_limit) { serverSock.close(); return; }
 					activeIps[clientIP] = { timestamp: now, count: 1 };
 					isNewIp = true;
 				} else {
