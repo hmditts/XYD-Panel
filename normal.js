@@ -335,12 +335,18 @@ const PINNED_DEFAULT_LOCATIONS_FALLBACK = ["UZ", "KZ", "TR", "LY", "NL", "AL", "
 const DEFAULT_GLOBAL_CLEAN_IP_FALLBACK = "104.20.25.138";
 const DEFAULT_OTHER_CLEAN_IPS_FALLBACK = ["104.26.1.116", "104.21.122.162", "185.162.228.105", "185.148.105.218", "104.18.39.219", "185.162.230.76"];
 const DEFAULT_INLINE_PROXY_IP_FALLBACK = "178.105.227.210";
-// «هشدار تعداد دستگاه» - آستانه‌ی پیش‌فرض سراسری که موقع ساخت کاربر جدید (اگه ادمین
-// دستی چیزی توی فیلد «محدودیت کاربر» وارد نکرده باشه) روی ستون ip_limit همون کاربر
-// ست می‌شه. توجه: این فقط برای هشداردهی در پنل ادمینه (device_warning_at / device_warning
-// - نزدیک persistActiveIp پایین‌تر)، هیچ enforcement/قطع اتصالی روش انجام نمی‌شه
-// (enforcement جدا و از قبل /* Bypassed */ شده). فقط وقتی استفاده می‌شه که تنظیم
-// 'device_warning_threshold' هیچ‌وقت توی settings ذخیره نشده باشه (نصب تازه).
+// «محدودیت کاربر» (user_limit) - سقف تعداد دستگاه هم‌زمان هر کاربر؛ همون فیلد «محدودیت
+// کاربر» توی فرم کاربر (ستون‌های ip_limit/max_connections). سه‌جا استفاده می‌شه: (۱) پیش‌فرض
+// کاربر جدید وقتی فرم/API چیزی توی این فیلد نفرستاده باشه (POST /api/users)، (۲) با «ذخیره‌ی
+// تنظیمات» یا Push پنل مادر روی ستون‌های ip_limit/max_connections همه‌ی کاربرهای *موجود* هم
+// اعمال می‌شه (POST /api/settings/bulk)، (۳) پیش‌فرض placeholder فرم. فقط وقتی مقدار
+// fallback استفاده می‌شه که تنظیم 'user_limit' هیچ‌وقت توی settings ذخیره نشده باشه (نصب تازه).
+const DEFAULT_USER_LIMIT_FALLBACK = 2;
+// «هشدار تعداد دستگاه» (device_warning_threshold) - آستانه‌ی سراسریِ *هشدار*: اگه تعداد
+// دستگاه‌های فعالِ یه کاربر از این عدد بیشتر بشه، device_warning_at ست می‌شه (persistActiveIp
+// پایین‌تر) و روی کارتش هشدار قرمز می‌آد. این عدد دیگه هیچ ربطی به ip_limit/max_connections
+// کاربرها نداره (اون‌ها با «محدودیت کاربر» بالا ست می‌شن) و هیچ اتصالی قطع نمی‌کنه.
+// 0 = هشدار خاموش. فقط وقتی fallback استفاده می‌شه که تنظیمش هیچ‌وقت ذخیره نشده باشه.
 const DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK = 4;
 // «پورت» - پورتی که هم به‌عنوان مقدار پیش‌فرض چک‌باکس پورت توی فرم افزودن
 // کاربر جدید انتخاب می‌شه (renderPortCheckboxes سمت کلاینت)، و هم موقع «ذخیره
@@ -1703,15 +1709,18 @@ const Router = {
 				const body = await readJsonBody(request);
 				let unpinRemoval = { countries: [], usersUpdated: 0 };
 				let fragApplied = false;
+				let userLimitApplied = false;
 				if (body.settings && typeof body.settings === "object") {
-					// «هشدار تعداد دستگاه» (device_warning_threshold): برخلاف بقیه‌ی تنظیمات
-					// global، این یکی روی ستون ip_limit/max_connections همه‌ی کاربرهای *موجود*
-					// هم override می‌شه (نه فقط پیش‌فرض کاربر تازه‌ساز - نگاه کنید به POST
-					// /api/users).
-					let overrideDeviceWarningThreshold = undefined;
-					if (Object.prototype.hasOwnProperty.call(body.settings, "device_warning_threshold")) {
-						const parsedThreshold = parseInt(body.settings.device_warning_threshold);
-						if (!isNaN(parsedThreshold) && parsedThreshold >= 0) overrideDeviceWarningThreshold = parsedThreshold;
+					// «محدودیت کاربر» (user_limit): برخلاف بقیه‌ی تنظیمات global، این یکی روی ستون
+					// ip_limit/max_connections همه‌ی کاربرهای *موجود* هم override می‌شه (نه فقط پیش‌فرض
+					// کاربر تازه‌ساز - نگاه کنید به POST /api/users). هم «ذخیره‌ی تنظیمات» همین پنل و
+					// هم «Push to Panels» پنل مادر از همین مسیر می‌رن. (تنظیم «هشدار تعداد دستگاه» -
+					// device_warning_threshold - فقط ذخیره می‌شه و آستانه‌ی هشدار رو تعیین می‌کنه؛
+					// دیگه روی ip_limit/max_connections کاربرها اثری نداره.)
+					let overrideUserLimit = undefined;
+					if (Object.prototype.hasOwnProperty.call(body.settings, "user_limit")) {
+						const parsedUserLimit = parseInt(body.settings.user_limit);
+						if (!isNaN(parsedUserLimit) && parsedUserLimit >= 0) overrideUserLimit = parsedUserLimit;
 					}
 					// «پورت»: مثل بالا، این یکی هم - برخلاف بقیه‌ی تنظیمات global - روی ستون
 					// port همه‌ی کاربرهای *موجود* بازنویسی کامل می‌شه (نه فقط پیش‌فرض کاربر
@@ -1772,8 +1781,9 @@ const Router = {
 							}
 						}
 					}
-					if (overrideDeviceWarningThreshold !== undefined) {
-						await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ?").bind(overrideDeviceWarningThreshold, overrideDeviceWarningThreshold).run();
+					if (overrideUserLimit !== undefined) {
+						await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ?").bind(overrideUserLimit, overrideUserLimit).run();
+						userLimitApplied = true;
 					}
 					if (overrideDefaultPort !== undefined) {
 						await env.DB.prepare("UPDATE users SET port = ?").bind(overrideDefaultPort).run();
@@ -1783,7 +1793,7 @@ const Router = {
 						fragApplied = true;
 					}
 				}
-				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/proxy-ip") {
@@ -2327,14 +2337,12 @@ const Router = {
 							finalConnType = connection_type;
 						}
 						const trojanHash = sha224Pure(finalUuid);
-						// «هشدار تعداد دستگاه»: اگه ادمین دستی چیزی توی فیلد «محدودیت کاربر» وارد
-						// نکرده باشه (ip_limit خالی/نال)، به‌جای نال، آستانه‌ی سراسری تنظیم‌شده
-						// (device_warning_threshold - پیش‌فرض ۴) روی ip_limit این کاربر جدید ست
-						// می‌شه. این فقط مبنای هشدار پنل ادمینه (persistActiveIp/device_warning_at
-						// پایین‌تر)، enforcement/قطع اتصال جدا و از قبل Bypass شده و دست‌نخورده
-						// می‌مونه. اگه ادمین عدد دیگه‌ای (حتی ۰) وارد کرده باشه، همون عدد ادمین
-						// برنده‌ست، نه پیش‌فرض سراسری.
-						const finalIpLimit = ip_limit !== undefined && ip_limit !== null && String(ip_limit).trim() !== "" ? parseInt(ip_limit) : await getDeviceWarningThresholdSetting(env);
+						// «محدودیت کاربر»: اگه ادمین/فرم/API چیزی توی این فیلد نفرستاده باشه (ip_limit
+						// خالی/نال)، به‌جای نال، عدد سراسریِ تنظیم‌شده (user_limit - پیش‌فرض ۲) روی
+						// ip_limit و max_connections این کاربر جدید ست می‌شه. اگه عدد دیگه‌ای (حتی ۰)
+						// فرستاده شده باشه، همون عدد برنده‌ست، نه پیش‌فرض سراسری. (تنظیم جدای «هشدار
+						// تعداد دستگاه» - device_warning_threshold - دیگه اینجا هیچ نقشی نداره.)
+						const finalIpLimit = ip_limit !== undefined && ip_limit !== null && String(ip_limit).trim() !== "" ? parseInt(ip_limit) : await getUserLimitSetting(env);
 						// «پورت»: اگه ادمین/فرم چیزی برای port نفرستاده باشه (خالی/نال)، به‌جای
 						// نال، پورت پیش‌فرض سراسری تنظیم‌شده (default_port - پیش‌فرض ۲۰۸۳) روی
 						// این کاربر تازه ست می‌شه. اگه مقداری فرستاده شده باشه (مثلاً از چک‌باکس‌های
@@ -2573,13 +2581,15 @@ const DbService = {
 async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 	const run = async () => {
 		let freshIps = {};
-		let ipLimit = null;
+		let warnThreshold = DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
 		let prevWarningAt = null;
 		let prevPeakCount = null;
 		try {
-			const row = await env.DB.prepare("SELECT active_ips, ip_limit, device_warning_at, device_warning_peak_count FROM users WHERE uuid = ?").bind(uuid).first();
+			// آستانه‌ی سراسری «هشدار تعداد دستگاه» (settings.device_warning_threshold) با همون کوئری
+			// ردیف کاربر و به‌صورت subselect خونده می‌شه - بدون رفت‌وبرگشت اضافه‌ی D1.
+			const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
 			freshIps = JSON.parse((row && row.active_ips) || "{}");
-			ipLimit = row ? row.ip_limit : null;
+			warnThreshold = parseDeviceWarningThreshold(row ? row.dw_threshold : null);
 			prevWarningAt = row ? row.device_warning_at : null;
 			prevPeakCount = row ? row.device_warning_peak_count : null;
 		} catch (e) { }
@@ -2599,12 +2609,14 @@ async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 		}
 		// «هشدار تعداد دستگاه» (admin-facing only - NOT enforcement, enforcement stays
 		// /* Bypassed */ elsewhere): همین‌جا، دقیقاً روی همون snapshot تازه‌ای که بالا
-		// merge شد (نه یک کپی جدا)، اگه تعداد دستگاه‌های فعال از ip_limit این کاربر
-		// بیشتر شده باشه، device_warning_at با زمان الان ست می‌شه. پنل/API با
+		// merge شد (نه یک کپی جدا)، اگه تعداد دستگاه‌های فعال از آستانه‌ی سراسری «هشدار
+		// تعداد دستگاه» (device_warning_threshold؛ 0 = خاموش) بیشتر شده باشه،
+		// device_warning_at با زمان الان ست می‌شه (این آستانه از «محدودیت کاربر» /
+		// ip_limit جداست). پنل/API با
 		// `(now - device_warning_at) < 24h` این رو به‌صورت یک هشدار روی کارت کاربر
 		// نشون می‌ده (نگاه کنید به GET /api/users و رندر کارت کاربر در پنل).
 		const activeDeviceCount = Object.keys(freshIps).length;
-		const exceededLimit = ipLimit && ipLimit > 0 && activeDeviceCount > ipLimit;
+		const exceededLimit = warnThreshold && warnThreshold > 0 && activeDeviceCount > warnThreshold;
 		// «بیشترین تعداد دستگاه» (device_warning_peak_count): اگه هشدار قبلی هنوز منقضی
 		// نشده (کمتر از ۲۴ ساعت از device_warning_at قبلی گذشته)، بیشینه‌ی activeDeviceCount
 		// نگه داشته می‌شه (همون چرخه‌ی هشدار ادامه داره). اگه هشدار قبلی منقضی شده بود یا
@@ -2726,24 +2738,33 @@ async function getPinnedLocationsSetting(env) {
 		return PINNED_DEFAULT_LOCATIONS_FALLBACK;
 	}
 }
-// Reads the admin-editable "هشدار تعداد دستگاه" (device-count warning) global
-// threshold from settings (key 'device_warning_threshold'). Used only as the
-// value auto-filled into a brand-new user's `ip_limit` column at creation time
-// (see the POST /api/users handler) - never for enforcement. Falls back to
-// DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK if never configured (fresh install)
-// or malformed; an explicitly-saved value of 0 is respected as-is (no warning
-// ever auto-set for new users, since 0/() falsy ip_limit skips the exceeded-check
-// in persistActiveIp too).
-async function getDeviceWarningThresholdSetting(env) {
-	if (!env || !env.DB) return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+// Reads the admin-editable «محدودیت کاربر» (user limit) global from settings (key
+// 'user_limit'). Used as the value auto-filled into a brand-new user's ip_limit and
+// max_connections columns at creation time when the request didn't carry one (see the
+// POST /api/users handler). The same setting is also written onto every EXISTING user by
+// POST /api/settings/bulk. Falls back to DEFAULT_USER_LIMIT_FALLBACK if never configured
+// (fresh install) or malformed; an explicitly-saved 0 is respected as-is (0 = no limit,
+// exactly like an empty per-user field).
+async function getUserLimitSetting(env) {
+	if (!env || !env.DB) return DEFAULT_USER_LIMIT_FALLBACK;
 	try {
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'device_warning_threshold'").first();
-		if (!row || row.value === null || row.value === undefined || String(row.value).trim() === "") return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'user_limit'").first();
+		if (!row || row.value === null || row.value === undefined || String(row.value).trim() === "") return DEFAULT_USER_LIMIT_FALLBACK;
 		const parsed = parseInt(row.value);
-		return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_USER_LIMIT_FALLBACK;
 	} catch (e) {
-		return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		return DEFAULT_USER_LIMIT_FALLBACK;
 	}
+}
+// Parses the raw value of the admin-editable «هشدار تعداد دستگاه» (device-count warning)
+// global threshold (settings key 'device_warning_threshold') - persistActiveIp reads it
+// together with the user row in one query and passes the raw text here. Missing/empty/
+// malformed => DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK; an explicitly-saved 0 is respected
+// (0 = the warning is off, since persistActiveIp skips the exceeded-check for a falsy value).
+function parseDeviceWarningThreshold(raw) {
+	if (raw === null || raw === undefined || String(raw).trim() === "") return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+	const parsed = parseInt(raw);
+	return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
 }
 // Reads the admin-editable «پورت» global default from settings (key
 // 'default_port'). Used only to pre-fill a brand-new user's `port` column at
@@ -7051,13 +7072,23 @@ Commercial support is available at
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
+						<svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+						محدودیت کاربر
+					</label>
+					<div class="flex items-center gap-2">
+						<input type="number" id="user-limit-input" dir="ltr" min="0" step="1" placeholder="2" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+					</div>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">سقف تعداد دستگاه هم‌زمانِ هر کاربر (همون فیلد «محدودیت کاربر» توی فرم کاربر). با ذخیره‌ی تنظیمات روی همه‌ی کاربرهای فعلی اعمال می‌شه و پیش‌فرضِ کاربرهای جدیده؛ برای هر کاربر جدا هم قابل تغییره. ۰ = نامحدود.</p>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
 						هشدار تعداد دستگاه
 					</label>
 					<div class="flex items-center gap-2">
 						<input type="number" id="device-warning-threshold-input" dir="ltr" min="0" step="1" placeholder="4" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-red-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 					</div>
-					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">این عدد فقط پیش‌فرضِ فیلد «محدودیت کاربر» برای کاربرهای جدیده (اگه دستی چیزی وارد نشه)؛ برای هر کاربر جدا هم قابل تغییره و صرفاً هشدار روی کارتشه، اتصالی قطع نمی‌کنه.</p>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">اگه تعداد دستگاه‌های هم‌زمانِ یه کاربر از این عدد بیشتر بشه، روی کارتش هشدار قرمز نشون داده می‌شه. جدا از «محدودیت کاربر» بالاست، روی حدِ کاربرها اثری نداره و اتصالی قطع نمی‌کنه. ۰ = هشدار خاموش.</p>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🆕 پیش‌فرض کاربر جدید</h5>
@@ -7816,8 +7847,8 @@ let activeRocketBtn = null;
 		window.applyNewUserFormDefaults = function() {
 			const ipLimitInputEl = document.getElementById('input-ip-limit');
 			if (ipLimitInputEl) {
-				const dwThreshold = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
-				ipLimitInputEl.placeholder = 'پیش‌فرض: ' + dwThreshold;
+				const defaultUserLimit = (window.USER_LIMIT !== undefined && window.USER_LIMIT !== null) ? window.USER_LIMIT : window.DEFAULT_USER_LIMIT;
+				ipLimitInputEl.placeholder = 'پیش‌فرض: ' + defaultUserLimit;
 			}
 			// پیش‌فرض‌ها از Settings (کلیدهای new_user_* - مودال «تنظیمات پـنـل» → «پیش‌فرض کاربر
 			// جدید») خوانده می‌شن، نه hardcode؛ اگه هیچ‌چیز تغییر نکرده باشه دقیقاً همون مقادیر قبلیه.
@@ -8359,9 +8390,10 @@ let activeRocketBtn = null;
 						? '<span class="min-w-[28px] h-[28px] px-[5.6px] relative inline-flex items-center justify-center text-center leading-none text-[21px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
 						: '';
 					// «هشدار تعداد دستگاه»: user.device_warning از GET /api/users میاد (تا ۲۴ ساعت
-					// بعد از آخرین باری که تعداد دستگاه فعال از ip_limit این کاربر بیشتر شده -
-					// نگاه کنید به persistActiveIp). فقط یک هشدار بصریه، هیچ اتصالی رو قطع نمی‌کنه.
-					const deviceWarningLimitText = (user.ip_limit !== undefined && user.ip_limit !== null) ? user.ip_limit : (user.max_connections || '?');
+					// بعد از آخرین باری که تعداد دستگاه فعال از آستانه‌ی سراسری هشدار
+					// (device_warning_threshold) بیشتر شده - نگاه کنید به persistActiveIp). فقط یک
+					// هشدار بصریه، هیچ اتصالی رو قطع نمی‌کنه.
+					const deviceWarningLimitText = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
 					// «بیشترین تعداد دستگاه»: user.device_warning_peak_count از GET /api/users میاد
 					// (ستون خام، persistActiveIp پرش می‌کنه - نگاه کنید بالاتر). کنار خودِ آیکون
 					// هشدار نشون داده می‌شه، سمت چپش (آیکون اول توی سورس میاد، عدد بعدش - چون
@@ -8369,7 +8401,7 @@ let activeRocketBtn = null;
 					const deviceWarningPeakCount = user.device_warning_peak_count || null;
 					const deviceWarningBadge = user.device_warning
 						? '<span class="inline-flex items-center gap-[2.8px] shrink-0">' +
-							'<span title="تعداد دستگاه‌های متصل این کاربر بیش از حد مجازش (' + deviceWarningLimitText + ' دستگاه) بوده است' + (deviceWarningPeakCount ? ' - بیشترین تعداد همزمان: ' + deviceWarningPeakCount + ' دستگاه' : '') + '" class="inline-flex items-center justify-center w-[22.4px] h-[22.4px] text-red-500 animate-pulse shrink-0">' +
+							'<span title="تعداد دستگاه‌های متصل این کاربر بیش از آستانه‌ی هشدار (' + deviceWarningLimitText + ' دستگاه) بوده است' + (deviceWarningPeakCount ? ' - بیشترین تعداد همزمان: ' + deviceWarningPeakCount + ' دستگاه' : '') + '" class="inline-flex items-center justify-center w-[22.4px] h-[22.4px] text-red-500 animate-pulse shrink-0">' +
 								'<svg class="w-[19.6px] h-[19.6px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>' +
 							  '</span>' +
 							(deviceWarningPeakCount ? '<span class="text-[14px] font-bold text-red-500 leading-none">' + deviceWarningPeakCount + '</span>' : '') +
@@ -9812,6 +9844,23 @@ window.loadGlobalReqLimitSetting = async function() {
 	if (input) input.value = value;
 	return value;
 };
+window.DEFAULT_USER_LIMIT = 2;
+window.USER_LIMIT = window.DEFAULT_USER_LIMIT;
+window.loadUserLimitSetting = async function() {
+	let value = window.DEFAULT_USER_LIMIT;
+	try {
+		const res = await fetch('/api/settings/bulk');
+		const data = await res.json();
+		if (data && data.user_limit !== undefined && data.user_limit !== null && String(data.user_limit).trim() !== '') {
+			const parsed = parseInt(data.user_limit);
+			if (!isNaN(parsed) && parsed >= 0) value = parsed;
+		}
+	} catch (e) {}
+	window.USER_LIMIT = value;
+	const input = document.getElementById('user-limit-input');
+	if (input) input.value = value;
+	return value;
+};
 window.DEFAULT_DEVICE_WARNING_THRESHOLD = 4;
 window.DEVICE_WARNING_THRESHOLD = window.DEFAULT_DEVICE_WARNING_THRESHOLD;
 window.loadDeviceWarningThresholdSetting = async function() {
@@ -10250,6 +10299,7 @@ window.fillPatternihaValues = function() {
 window.saveSettings = async function() {
 	const cleanIpInput = document.getElementById('global-clean-ip-input');
 	const reqLimitInput = document.getElementById('global-req-limit-input');
+	const userLimitInput = document.getElementById('user-limit-input');
 	const deviceWarningThresholdInput = document.getElementById('device-warning-threshold-input');
 	const otherIpsInput = document.getElementById('other-clean-ips-input');
 	const proxyIpInput = document.getElementById('inline-proxy-ip-input');
@@ -10258,6 +10308,8 @@ window.saveSettings = async function() {
 	const cleanIpVal = (cleanIpInput && cleanIpInput.value.trim()) ? cleanIpInput.value.trim() : window.DEFAULT_GLOBAL_CLEAN_IP;
 	const reqLimitParsed = reqLimitInput ? parseInt(reqLimitInput.value) : NaN;
 	const reqLimitVal = (!isNaN(reqLimitParsed) && reqLimitParsed >= 0) ? reqLimitParsed : window.DEFAULT_GLOBAL_REQ_LIMIT;
+	const userLimitParsed = userLimitInput ? parseInt(userLimitInput.value) : NaN;
+	const userLimitVal = (!isNaN(userLimitParsed) && userLimitParsed >= 0) ? userLimitParsed : window.DEFAULT_USER_LIMIT;
 	const deviceWarningThresholdParsed = deviceWarningThresholdInput ? parseInt(deviceWarningThresholdInput.value) : NaN;
 	const deviceWarningThresholdVal = (!isNaN(deviceWarningThresholdParsed) && deviceWarningThresholdParsed >= 0) ? deviceWarningThresholdParsed : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
 	const otherIpsRawVal = (otherIpsInput && otherIpsInput.value) ? otherIpsInput.value : '';
@@ -10279,6 +10331,7 @@ window.saveSettings = async function() {
 				settings: Object.assign({
 					global_clean_ip: cleanIpVal,
 					global_req_limit: reqLimitVal,
+					user_limit: userLimitVal,
 					device_warning_threshold: deviceWarningThresholdVal,
 					other_clean_ips: otherIpsVal,
 					inline_proxy_ip: proxyIpVal,
@@ -10288,6 +10341,7 @@ window.saveSettings = async function() {
 		});
 		window.GLOBAL_CLEAN_IP = cleanIpVal;
 		window.GLOBAL_REQ_LIMIT = reqLimitVal;
+		window.USER_LIMIT = userLimitVal;
 		window.DEVICE_WARNING_THRESHOLD = deviceWarningThresholdVal;
 		window.OTHER_CLEAN_IPS = otherIpsParsed;
 		window.INLINE_PROXY_IP = proxyIpVal;
@@ -10296,12 +10350,13 @@ window.saveSettings = async function() {
 		window.fillNewUserDefaultsInputs();
 		if (cleanIpInput) cleanIpInput.value = cleanIpVal;
 		if (reqLimitInput) reqLimitInput.value = reqLimitVal;
+		if (userLimitInput) userLimitInput.value = userLimitVal;
 		if (deviceWarningThresholdInput) deviceWarningThresholdInput.value = deviceWarningThresholdVal;
 		if (otherIpsInput) otherIpsInput.value = otherIpsVal;
 		if (proxyIpInput) proxyIpInput.value = proxyIpVal;
 		if (defaultPortInput) defaultPortInput.value = defaultPortVal;
 		if (typeof renderPortCheckboxes === 'function') renderPortCheckboxes();
-		showToast('✅ تنظیمات ذخیره شد؛ پورت همه‌ی کاربرها روی ' + defaultPortVal + ' ست شد.');
+		showToast('✅ تنظیمات ذخیره شد؛ پورت همه‌ی کاربرها روی ' + defaultPortVal + ' و محدودیت کاربر روی ' + userLimitVal + ' ست شد.');
 		toggleSettingsModal(false);
 		if (typeof loadUsers === 'function') await loadUsers(true);
 	} catch (e) {
@@ -10349,11 +10404,11 @@ window.resetUserToDefault = async function() {
 	const customPortInput = document.getElementById('input-custom-ports');
 	if (customPortInput) customPortInput.value = '';
 	document.querySelectorAll('.frag-preset-card').forEach(card => card.classList.remove('ring-2', 'ring-blue-500', 'border-blue-500', 'bg-blue-50/50', 'dark:bg-blue-950/40'));
-	// کاربر جدید بدون مقدار صریح، ip_limit = آستانه‌ی هشدار سراسری می‌گیرد؛ در ویرایش خالی یعنی نامحدود، پس صریح می‌نویسیم
+	// کاربر جدید بدون مقدار صریح، ip_limit = «محدودیت کاربر» سراسری (user_limit) می‌گیرد؛ در ویرایش خالی یعنی نامحدود، پس صریح می‌نویسیم
 	const ipLimitInputEl = document.getElementById('input-ip-limit');
 	if (ipLimitInputEl) {
 		ipLimitInputEl.placeholder = 'نامحدود';
-		ipLimitInputEl.value = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
+		ipLimitInputEl.value = (window.USER_LIMIT !== undefined && window.USER_LIMIT !== null) ? window.USER_LIMIT : window.DEFAULT_USER_LIMIT;
 	}
 	// سرور همیشه برای لیست تازه‌ساخته‌شده auto-heal را روشن می‌کند (مثل کاربر جدید)
 	const rotateCheck = document.getElementById('input-auto-rotate-user-proxy');
@@ -11132,6 +11187,7 @@ function applySelectedIps() {
 			loadTrafficCardChart();
 			window.loadGlobalCleanIpSetting();
 			window.loadGlobalReqLimitSetting();
+			window.loadUserLimitSetting();
 			window.loadDeviceWarningThresholdSetting();
 			window.loadOtherCleanIpsSetting();
 			window.loadInlineProxyIpSetting();
