@@ -4,8 +4,17 @@ const GLOBAL_LAST_ACTIVE_WRITE = new Map();
 const GLOBAL_LAST_DB_WRITE = new Map();
 const GLOBAL_WRITE_LOCK = new Map();
 // Serializes read-merge-write cycles on `active_ips` per username within the same isolate
-// (promise-chaining mutex). See persistActiveIp() near getActiveIpCount() for why this exists.
+// (promise-chaining mutex). See persistActiveIp() near getActiveIpCount() for why this exists
+// (shared with confirmActiveIp() - see the «دیده‌شده/تأییدشده» device policy notes there).
 const GLOBAL_ACTIVE_IPS_WRITE_LOCK = new Map();
+// «سیاست ثبت دستگاه متصل» (device seen/confirmed policy - see DEVICE_CONFIRM_* below): best-effort,
+// per-isolate running total of bytes (both directions) moved by short-lived connections of the
+// same (username, clientIP) pair, within a rolling DEVICE_CONFIRM_BURST_WINDOW_MS window. Used to
+// confirm a device that never keeps a single connection open for DEVICE_CONFIRM_MIN_DURATION_MS,
+// but reconnects often with real usage each time (a chat/browser app is the common case). Not
+// shared across isolates and not persisted to D1 - approximate by design, see handlevIees().
+// Pruned opportunistically in flushExpiredTraffic().
+const IP_BURST_BYTES = new Map();
 const DNS_CACHE = new Map();
 const USER_REQ_CACHE = new Map();
 const LOGIN_ATTEMPTS = new Map();
@@ -348,6 +357,35 @@ const DEFAULT_USER_LIMIT_FALLBACK = 2;
 // کاربرها نداره (اون‌ها با «محدودیت کاربر» بالا ست می‌شن) و هیچ اتصالی قطع نمی‌کنه.
 // 0 = هشدار خاموش. فقط وقتی fallback استفاده می‌شه که تنظیمش هیچ‌وقت ذخیره نشده باشه.
 const DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK = 4;
+// «سیاست ثبت دستگاه متصل» (device seen/confirmed policy). قبلاً همون لحظه‌ی اول پیام
+// VLESS/Trojan یه IP فوری «دستگاه» حساب می‌شد - بدون حداقل زمان یا حجم - برای همین یه
+// تست پینگِ چندثانیه‌ای (یا حتی یه هندشیکِ ناتمام) دقیقاً مثل یه دستگاه واقعی می‌شمرد.
+// حالا هر IPِ تازه اول فقط «دیده‌شده»ست (فقط توی حافظه‌ی خودِ همون اتصال - نه D1، نه
+// سقف ip_limit، نه شمارنده‌ی آنلاین) و با هر کدوم از این دو شرط «تأیید» می‌شه (نگاه
+// کنید به confirmActiveIp/checkDeviceConfirmation در handlevIees):
+//  (۱) اتصالِ پایدار: همون یک اتصال حداقل DEVICE_CONFIRM_MIN_DURATION_MS باز بمونه و
+//      حداقل DEVICE_CONFIRM_MIN_BYTES بایت (مجموع آپلود+دانلود، از addBytes) جابه‌جا کنه.
+//  (۲) اتصال‌های کوتاهِ زیاد: مجموع بایتِ همون (کاربر, IP) - نگاه کنید IP_BURST_BYTES -
+//      توی یه پنجره‌ی DEVICE_CONFIRM_BURST_WINDOW_MS به DEVICE_CONFIRM_BURST_BYTES برسه.
+// این عددها تخمینی‌ان (یه TLS handshake + یه پینگ معمولاً حدود ۵ تا ۸ کیلوبایته)، نه
+// اندازه‌گیری‌شده از داده‌ی واقعی - جایی برای تنظیم دقیق‌ترشون در آینده هست. سقفِ
+// «محدودیت کاربر»/ip_limit هم از همین نسخه به بعد فقط توی confirmActiveIp (لحظه‌ی
+// تأیید) اعمال می‌شه، نه موقع اولین هندشیک - یعنی یه تست پینگ همیشه رد می‌شه، ولی
+// استفاده‌ی واقعی‌ای که جا نداره بعد از چند ثانیه/چند KB قطع می‌شه. محدودیت‌های شناخته‌شده
+// (عمداً حل نشده): دستگاهی که همیشه خیلی کم‌حجمه اصلاً «تأیید» نمی‌شه (مصرفش همچنان
+// روی سهمیه‌ی حجم می‌ره)؛ IPِ قدیمیِ یه دستگاهی که شبکه عوض کرده تا ۱۸۰ ثانیه یه جای
+// سقف رو اشغال می‌کنه؛ IP_BURST_BYTES بین isolateها به اشتراک نیست (تقریبیه، نه دقیق).
+const DEVICE_CONFIRM_MIN_DURATION_MS = 10000;
+const DEVICE_CONFIRM_MIN_BYTES = 30 * 1024;
+const DEVICE_CONFIRM_BURST_WINDOW_MS = 5 * 60 * 1000;
+const DEVICE_CONFIRM_BURST_BYTES = 1024 * 1024;
+// «تأخیر هشدار تعداد دستگاه» - device_warning_at دیگه با همون اولین باری که تعداد
+// دستگاه‌های تأییدشده از آستانه (device_warning_threshold) رد می‌شه ست نمی‌شه؛ باید
+// این تعداد بار پشت‌سرهم (هر بار = یک تأیید دستگاه تازه یا یک رفرش هیت‌بیت - نگاه کنید
+// evaluateDeviceWarning) عبور از آستانه دیده بشه. برگشتن به زیر آستانه (حتی یه بار)
+// شمارش رو صفر می‌کنه. یه IP که با یه اتصال کوتاهِ لحظه‌ای از سقف رد بشه و توی همون
+// دور بعدی دیگه نباشه، هیچ‌وقت هشدار نمی‌سازه.
+const DEVICE_WARNING_CONFIRM_STREAK = 2;
 // «پورت» - پورتی که هم به‌عنوان مقدار پیش‌فرض چک‌باکس پورت توی فرم افزودن
 // کاربر جدید انتخاب می‌شه (renderPortCheckboxes سمت کلاینت)، و هم موقع «ذخیره
 // تنظیمات» به‌صورت override کامل روی ستون port همه‌ی کاربرهای *موجود* هم
@@ -2535,6 +2573,7 @@ const DbService = {
 					{ name: "proxy_rotate_cooldowns", def: "TEXT DEFAULT '{}'" },
 					{ name: "device_warning_at", def: "INTEGER DEFAULT NULL" },
 					{ name: "device_warning_peak_count", def: "INTEGER DEFAULT NULL" },
+					{ name: "device_warning_streak", def: "INTEGER DEFAULT 0" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
@@ -2621,20 +2660,41 @@ const DbService = {
 // instead of every connection/heartbeat. A per-username promise-chain lock serializes this
 // within the same isolate so two near-simultaneous writes for the same user can't still race
 // each other on the read step.
+//
+// «تأخیر هشدار تعداد دستگاه» (device_warning_at delay/streak - نگاه کنید DEVICE_WARNING_CONFIRM_STREAK
+// بالای فایل): به‌جای ثبتِ فوریِ هشدار همون اولین باری که activeDeviceCount از آستانه رد
+// می‌شه، device_warning_at فقط وقتی واقعاً ست می‌شه که این تعداد بار پشت‌سرهم عبور از
+// آستانه دیده شده باشه. persistActiveIp (رفرش IP از قبل تأییدشده) و confirmActiveIp (تأیید
+// IP تازه) هر دو از همین یه تابع استفاده می‌کنن تا این حساب یه‌جا بمونه و دوبار نوشته نشه.
+function evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now) {
+	const overThreshold = !!(warnThreshold && warnThreshold > 0 && activeDeviceCount > warnThreshold);
+	// برگشتن به زیر آستانه (حتی یه بار) شمارش رو صفر می‌کنه - یعنی نوسانِ کوتاه دور
+	// آستانه هیچ‌وقت به تنهایی هشدار نمی‌سازه، باید واقعاً پشت‌سرهم بمونه.
+	const newStreak = overThreshold ? (prevStreak || 0) + 1 : 0;
+	const shouldWarn = newStreak >= DEVICE_WARNING_CONFIRM_STREAK;
+	// «بیشترین تعداد دستگاه» (device_warning_peak_count): همون منطق قبلی، دست‌نخورده -
+	// فقط وقتی چرخه‌ی هشدارِ قبلی هنوز منقضی نشده (کمتر از ۲۴ ساعت) بیشینه نگه داشته
+	// می‌شه؛ وگرنه یه چرخه‌ی تازه از همین عدد فعلی شروع می‌شه.
+	const warningStillFresh = !!(prevWarningAt && now - prevWarningAt < 24 * 60 * 60 * 1000);
+	const newPeakCount = warningStillFresh ? Math.max(prevPeakCount || 0, activeDeviceCount) : activeDeviceCount;
+	return { shouldWarn, newStreak, newPeakCount };
+}
 async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 	const run = async () => {
 		let freshIps = {};
 		let warnThreshold = DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
 		let prevWarningAt = null;
 		let prevPeakCount = null;
+		let prevStreak = 0;
 		try {
 			// آستانه‌ی سراسری «هشدار تعداد دستگاه» (settings.device_warning_threshold) با همون کوئری
 			// ردیف کاربر و به‌صورت subselect خونده می‌شه - بدون رفت‌وبرگشت اضافه‌ی D1.
-			const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
+			const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, device_warning_streak, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
 			freshIps = JSON.parse((row && row.active_ips) || "{}");
 			warnThreshold = parseDeviceWarningThreshold(row ? row.dw_threshold : null);
 			prevWarningAt = row ? row.device_warning_at : null;
 			prevPeakCount = row ? row.device_warning_peak_count : null;
+			prevStreak = (row && row.device_warning_streak) || 0;
 		} catch (e) { }
 		for (const [ip, data] of Object.entries(freshIps)) {
 			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
@@ -2650,28 +2710,17 @@ async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 		} else {
 			freshIps[clientIP] = { timestamp: now, count: 1 };
 		}
-		// «هشدار تعداد دستگاه» (admin-facing only - NOT enforcement, enforcement stays
-		// /* Bypassed */ elsewhere): همین‌جا، دقیقاً روی همون snapshot تازه‌ای که بالا
-		// merge شد (نه یک کپی جدا)، اگه تعداد دستگاه‌های فعال از آستانه‌ی سراسری «هشدار
-		// تعداد دستگاه» (device_warning_threshold؛ 0 = خاموش) بیشتر شده باشه،
-		// device_warning_at با زمان الان ست می‌شه (این آستانه از «محدودیت کاربر» /
-		// ip_limit جداست). پنل/API با
-		// `(now - device_warning_at) < 24h` این رو به‌صورت یک هشدار روی کارت کاربر
-		// نشون می‌ده (نگاه کنید به GET /api/users و رندر کارت کاربر در پنل).
+		// «هشدار تعداد دستگاه» (admin-facing only - NOT enforcement, enforcement moved to
+		// confirmActiveIp() - نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): همین‌جا، دقیقاً
+		// روی همون snapshot تازه‌ای که بالا merge شد (نه یک کپی جدا)، evaluateDeviceWarning
+		// تصمیم می‌گیره که آیا device_warning_at واقعاً ست بشه یا فقط شمارش (streak) جلو بره.
 		const activeDeviceCount = Object.keys(freshIps).length;
-		const exceededLimit = warnThreshold && warnThreshold > 0 && activeDeviceCount > warnThreshold;
-		// «بیشترین تعداد دستگاه» (device_warning_peak_count): اگه هشدار قبلی هنوز منقضی
-		// نشده (کمتر از ۲۴ ساعت از device_warning_at قبلی گذشته)، بیشینه‌ی activeDeviceCount
-		// نگه داشته می‌شه (همون چرخه‌ی هشدار ادامه داره). اگه هشدار قبلی منقضی شده بود یا
-		// اصلاً نبود، یه چرخه‌ی تازه شروع می‌شه و peak از همین عدد فعلی شروع می‌شه - دقیقاً
-		// هم‌زمان با device_warning_at (که پنل با همون ۲۴ ساعت محو می‌کنه)، بدون کوئری اضافه.
-		const warningStillFresh = !!(prevWarningAt && now - prevWarningAt < 24 * 60 * 60 * 1000);
-		const newPeakCount = warningStillFresh ? Math.max(prevPeakCount || 0, activeDeviceCount) : activeDeviceCount;
+		const { shouldWarn, newStreak, newPeakCount } = evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now);
 		try {
-			if (exceededLimit) {
-				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, uuid).run();
+			if (shouldWarn) {
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, newStreak, uuid).run();
 			} else {
-				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, uuid).run();
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, newStreak, uuid).run();
 			}
 		} catch (e) { }
 	};
@@ -2680,6 +2729,90 @@ async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 	GLOBAL_ACTIVE_IPS_WRITE_LOCK.set(username, chained);
 	if (ctx) ctx.waitUntil(chained);
 	else await chained;
+}
+// «تأیید دستگاه» (confirmActiveIp) - طبق سیاستِ «دیده‌شده/تأییدشده» (نگاه کنید توضیح
+// DEVICE_CONFIRM_* بالای فایل)، این تنها جاییه که یک IPِ *تازه* واقعاً «تأییدشده» می‌شه:
+// توی active_ips نوشته می‌شه، جزو تعداد دستگاه‌ها حساب می‌شه، و به سقف «محدودیت
+// کاربر»/ip_limit می‌خوره - این سقف هم از همین نسخه به بعد فقط همین‌جا (لحظه‌ی تأیید)
+// چک می‌شه، نه موقع هندشیک اولیه‌ی اتصال. فقط از checkDeviceConfirmation() توی
+// handlevIees صدا زده می‌شه، وقتی شرطِ «اتصال پایدار» یا «اتصال‌های کوتاهِ زیاد» رد شده
+// باشه. با persistActiveIp() روی همون قفلِ per-username (GLOBAL_ACTIVE_IPS_WRITE_LOCK)
+// مشترکه تا این دوتا هیچ‌وقت رو نوشتنِ همدیگه روی ستون active_ips مسابقه ندن. خروجی:
+// true = تأیید شد/جا بود، false = سقف پر بود (تماس‌گیرنده باید همین اتصال رو ببنده).
+async function confirmActiveIp(env, ctx, uuid, username, clientIP, now) {
+	let admitted = true;
+	const run = async () => {
+		let freshIps = {};
+		let warnThreshold = DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		let prevWarningAt = null;
+		let prevPeakCount = null;
+		let prevStreak = 0;
+		let ipLimit = null;
+		try {
+			const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, device_warning_streak, ip_limit, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
+			freshIps = JSON.parse((row && row.active_ips) || "{}");
+			warnThreshold = parseDeviceWarningThreshold(row ? row.dw_threshold : null);
+			prevWarningAt = row ? row.device_warning_at : null;
+			prevPeakCount = row ? row.device_warning_peak_count : null;
+			prevStreak = (row && row.device_warning_streak) || 0;
+			ipLimit = row ? row.ip_limit : null;
+		} catch (e) { }
+		for (const [ip, data] of Object.entries(freshIps)) {
+			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+			const lastSeenNum = typeof lastSeen === "number" ? lastSeen : Number(lastSeen);
+			if (ip !== clientIP && (!isFinite(lastSeenNum) || now - lastSeenNum > 180000)) delete freshIps[ip];
+		}
+		if (!freshIps[clientIP]) {
+			// «سقف در لحظه‌ی تأیید، نه هندشیک»: دقیقاً همون مقایسه‌ای که قبلاً موقع هندشیک
+			// انجام می‌شد (>= ip_limit یعنی جا نیست)، فقط حالا اینجا و روی دیتای تازه.
+			const confirmedCount = Object.keys(freshIps).length;
+			if (ipLimit && ipLimit > 0 && confirmedCount >= ipLimit) {
+				admitted = false;
+				return;
+			}
+			freshIps[clientIP] = { timestamp: now, count: 1 };
+		} else {
+			// یه اتصال دیگه از همین (کاربر, IP) زودتر (مثلاً هم‌زمان) تأیید کرده بوده - فقط رفرش.
+			if (typeof freshIps[clientIP] === "object") {
+				freshIps[clientIP].timestamp = now;
+				freshIps[clientIP].count = (freshIps[clientIP].count || 0) + 1;
+			} else {
+				freshIps[clientIP] = { timestamp: now, count: 1 };
+			}
+		}
+		const activeDeviceCount = Object.keys(freshIps).length;
+		const { shouldWarn, newStreak, newPeakCount } = evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now);
+		try {
+			if (shouldWarn) {
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, newStreak, uuid).run();
+			} else {
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, newStreak, uuid).run();
+			}
+		} catch (e) { }
+	};
+	const prior = GLOBAL_ACTIVE_IPS_WRITE_LOCK.get(username) || Promise.resolve();
+	const chained = prior.then(run, run);
+	GLOBAL_ACTIVE_IPS_WRITE_LOCK.set(username, chained);
+	if (ctx) ctx.waitUntil(chained);
+	await chained;
+	return admitted;
+}
+// «دیده‌شده/تأییدشده» - کمک‌تابع‌های DEVICE_CONFIRM_BURST_* (شرط «اتصال‌های کوتاهِ زیاد»):
+// recordBurstBytes روی هر addBytes صدا زده می‌شه (فقط تا وقتی همون اتصال تأیید نشده)،
+// getBurstBytes فقط می‌خونه (از checkDeviceConfirmation/هیت‌بیت). کلید همیشه
+// `${username}|${clientIP}` است - نگاه کنید توضیح IP_BURST_BYTES بالای فایل.
+function recordBurstBytes(key, bytes, now) {
+	let entry = IP_BURST_BYTES.get(key);
+	if (!entry || now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) {
+		entry = { bytes: 0, windowStart: now };
+	}
+	entry.bytes += bytes;
+	IP_BURST_BYTES.set(key, entry);
+}
+function getBurstBytes(key, now) {
+	const entry = IP_BURST_BYTES.get(key);
+	if (!entry || now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) return 0;
+	return entry.bytes;
 }
 function getActiveIpCount(activeIpsJson) {
 	if (!activeIpsJson) return 0;
@@ -3288,6 +3421,9 @@ async function flushExpiredTraffic(env) {
 	for (const [ip, record] of LOGIN_ATTEMPTS.entries()) {
 		if (now - record.lastAttempt > 900000) LOGIN_ATTEMPTS.delete(ip);
 	}
+	for (const [key, entry] of IP_BURST_BYTES.entries()) {
+		if (now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) IP_BURST_BYTES.delete(key);
+	}
 	const allUsers = new Set([...GLOBAL_TRAFFIC_CACHE.keys(), ...USER_REQ_CACHE.keys()]);
 	// قبلاً به ازای هر کاربر یک UPDATE جدا + یک UPSERT جدای daily_traffic زده می‌شد، یعنی برای N
 	// کاربرِ در انتظار، 2N رفت‌وبرگشت پشت‌سرهم به D1. حالا همه‌ی UPDATE ها جمع می‌شن و با یک
@@ -3440,6 +3576,13 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	let validUUID = null;
 	let targetDns = "8.8.4.4";
 	let targetDoh = "https://cloudflare-dns.com/dns-query";
+	// «دیده‌شده/تأییدشده» (device seen/confirmed - نگاه کنید توضیح DEVICE_CONFIRM_* بالای
+	// فایل): وضعیتِ محلیِ همین یک اتصال، بین addBytes/هیت‌بیت/بلاکِ پارسِ هدر مشترکه.
+	// connectionStartTime همون لحظه‌ی accept شدنِ سوکته - معیار «حداقل ۱۰ ثانیه باز بمونه».
+	const connectionStartTime = Date.now();
+	let connectionBytesSoFar = 0;
+	let deviceConfirmed = false;
+	let deviceConfirmInFlight = false;
 	function addBytes(bytes) {
 		if (bytes <= 0) return;
 		if (!username) {
@@ -3449,6 +3592,11 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 		if (uncountedBytes > 0) {
 			bytes += uncountedBytes;
 			uncountedBytes = 0;
+		}
+		connectionBytesSoFar += bytes;
+		if (!deviceConfirmed && clientIP && clientIP !== "unknown") {
+			recordBurstBytes(username + "|" + clientIP, bytes, Date.now());
+			checkDeviceConfirmation();
 		}
 		let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
 		GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
@@ -3534,6 +3682,47 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			ACTIVE_CONNECTIONS_COUNT.set(uname, activeCount);
 		}
 	};
+	// «دیده‌شده/تأییدشده» (نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): فقط تصمیم
+	// می‌گیره که آیا شرایط تأیید (اتصال پایدار یا اتصال‌های کوتاهِ زیاد) رسیده یا نه -
+	// از addBytes (هر بار دیتا رد بشه) و از هیت‌بیت (هر ~۲۰-۲۵ ثانیه، برای اتصال‌های
+	// کم‌حجمی که addBytes به تنهایی زود بهشون نمی‌رسه) صدا زده می‌شه. تا وقتی شرط رد
+	// نشده کاملاً بی‌اثره - نه D1 می‌خونه/می‌نویسه، نه چیزی رو کند می‌کنه. فقط وقتی
+	// واقعاً رد بشه یک بار confirmActiveIp (تنها جایی که الان سقف ip_limit رو واقعاً
+	// اعمال می‌کنه) صدا زده می‌شه.
+	const checkDeviceConfirmation = () => {
+		if (deviceConfirmed || deviceConfirmInFlight) return;
+		if (!username || !validUUID || !clientIP || clientIP === "unknown") return;
+		const nowT = Date.now();
+		const stableOk = (nowT - connectionStartTime >= DEVICE_CONFIRM_MIN_DURATION_MS) && (connectionBytesSoFar >= DEVICE_CONFIRM_MIN_BYTES);
+		const burstOk = getBurstBytes(username + "|" + clientIP, nowT) >= DEVICE_CONFIRM_BURST_BYTES;
+		if (!stableOk && !burstOk) return;
+		deviceConfirmInFlight = true;
+		const task = (async () => {
+			try {
+				const admitted = await confirmActiveIp(env, ctx, validUUID, username, clientIP, nowT);
+				if (admitted) {
+					deviceConfirmed = true;
+					// اگه تا وقتی D1 round-trip بالا تموم بشه همین اتصال از قبل بسته شده باشه
+					// (setOffline زودتر اجرا شده)، شمارنده‌ی سوکت‌های زنده رو دست نمی‌زنیم -
+					// وگرنه یه شمارشِ اضافه‌ی «شبح» می‌مونه که هیچ‌وقت کم نمی‌شه.
+					if (!hasCountedAsActive && !isOfflineSet) {
+						let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+						ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+						hasCountedAsActive = true;
+					}
+				} else {
+					// سقف «محدودیت کاربر» پره - طبق سیاست، دقیقاً همین‌جا (لحظه‌ی تأیید) اعمال
+					// می‌شه، نه موقع هندشیک؛ نتیجه: تست‌های پینگِ کوتاه هیچ‌وقت به اینجا نمی‌رسن
+					// (رد نمی‌شن)، ولی استفاده‌ی واقعی‌ای که جا نداره همین‌جا قطع می‌شه.
+					closeSocketQuietly(serverSock);
+				}
+			} catch (e) {
+			} finally {
+				deviceConfirmInFlight = false;
+			}
+		})();
+		if (ctx) ctx.waitUntil(task);
+	};
 	let heartbeat;
 	const runHeartbeat = async () => {
 		if (serverSock.readyState === WebSocket.OPEN) {
@@ -3573,42 +3762,47 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 							}
 						}
 						if (!isExpired && clientIP && clientIP !== "unknown") {
-							let activeIps = {};
-							try {
-								activeIps = JSON.parse(user.active_ips || "{}");
-							} catch (e) { }
-							let hasChanges = false;
-							let needsDbUpdateForTimestamp = false;
-							
-							for (const [ip, data] of Object.entries(activeIps)) {
-								const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-								if (nowTime - lastSeen > 180000 && ip !== clientIP) {
-									delete activeIps[ip];
-									hasChanges = true;
-								}
-							}
-							if (!activeIps[clientIP]) {
-								activeIps[clientIP] = { timestamp: nowTime, count: 1 };
-								hasChanges = true;
+							if (!deviceConfirmed) {
+								// «دیده‌شده/تأییدشده»: این اتصال هنوز تأیید نشده - این هیت‌بیت فقط یه
+								// فرصت دیگه‌ست تا شرایط تأیید (DEVICE_CONFIRM_*) چک بشه، بدون اینکه
+								// مستقیم چیزی توی activeIps نوشته بشه یا سقف اعمال بشه (اون کار فقط
+								// با checkDeviceConfirmation/confirmActiveIp انجام می‌شه).
+								checkDeviceConfirmation();
 							} else {
-								const currentData = activeIps[clientIP];
-								const lastSeen = typeof currentData === "object" ? currentData.timestamp : currentData;
-								if (nowTime - lastSeen > 150000) {
-									if (typeof activeIps[clientIP] === "object") {
-										activeIps[clientIP].timestamp = nowTime;
-									} else {
-										activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+								let activeIps = {};
+								try {
+									activeIps = JSON.parse(user.active_ips || "{}");
+								} catch (e) { }
+								let hasChanges = false;
+								let needsDbUpdateForTimestamp = false;
+
+								for (const [ip, data] of Object.entries(activeIps)) {
+									const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+									if (nowTime - lastSeen > 180000 && ip !== clientIP) {
+										delete activeIps[ip];
+										hasChanges = true;
 									}
-									needsDbUpdateForTimestamp = true;
 								}
+								if (!activeIps[clientIP]) {
+									activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+									hasChanges = true;
+								} else {
+									const currentData = activeIps[clientIP];
+									const lastSeen = typeof currentData === "object" ? currentData.timestamp : currentData;
+									if (nowTime - lastSeen > 150000) {
+										if (typeof activeIps[clientIP] === "object") {
+											activeIps[clientIP].timestamp = nowTime;
+										} else {
+											activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+										}
+										needsDbUpdateForTimestamp = true;
+									}
+								}
+								// «سقف در لحظه‌ی تأیید، نه هندشیک/هیت‌بیت»: ip_limit دیگه اینجا (رفرشِ
+								// یه دستگاهِ از قبل تأییدشده) چک نمی‌شه - فقط توی confirmActiveIp، یه
+								// بار، موقع تأیید. نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل.
+								if (hasChanges || needsDbUpdateForTimestamp) updatedActiveIps = true;
 							}
-							const sortedIps = Object.keys(activeIps).sort((a, b) => {
-								const tA = typeof activeIps[a] === "object" ? activeIps[a].timestamp : activeIps[a];
-								const tB = typeof activeIps[b] === "object" ? activeIps[b].timestamp : activeIps[b];
-								return tB - tA;
-							});
-							/* Bypassed: if (user.ip_limit && user.ip_limit > 0 && sortedIps.indexOf(clientIP) >= user.ip_limit) isIpLimitExpired = true; */
-							if (hasChanges || needsDbUpdateForTimestamp || isIpLimitExpired) updatedActiveIps = true;
 						}
 					}
 					if (isExpired) {
@@ -3955,6 +4149,13 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				targetDoh = "https://dns.adguard-dns.com/dns-query";
 			}
 			if (clientIP && clientIP !== "unknown") {
+				// «دیده‌شده/تأییدشده» (نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): این IP فقط
+				// وقتی همین‌جا فوری «تأییدشده» حساب می‌شه که از قبل توی active_ips کاربر باشه و
+				// هنوز تازه باشه - یعنی همین دستگاه از قبل یه اتصال دیگه داشته و این یکی صرفاً
+				// reconnect/تب جدیدشه؛ دقیقاً همون رفتار قبلی، بدون تأخیر، تا سرعت یا اتصال
+				// دستگاه‌های از قبل متصل عوض نشه. اگه IP تازه باشه، هیچی اینجا روی D1 نوشته
+				// نمی‌شه و سقف «محدودیت کاربر»/ip_limit هم اینجا چک نمی‌شه؛ تصمیم می‌مونه برای
+				// checkDeviceConfirmation() (تعریف‌شده بالاتر، از addBytes/هیت‌بیت صدا زده می‌شه).
 				let activeIps = {};
 				try {
 					activeIps = JSON.parse(user.active_ips || "{}");
@@ -3964,33 +4165,28 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					const lastSeen = data && typeof data === "object" ? data.timestamp : data;
 					if (now - lastSeen > 180000) delete activeIps[ip];
 				}
-				let isNewIp = false;
-				if (!activeIps[clientIP]) {
-					const sortedIps = Object.keys(activeIps);
-					if (user.ip_limit && user.ip_limit > 0 && sortedIps.length >= user.ip_limit) { serverSock.close(); return; }
-					activeIps[clientIP] = { timestamp: now, count: 1 };
-					isNewIp = true;
-				} else {
+				if (activeIps[clientIP]) {
+					deviceConfirmed = true;
 					if (typeof activeIps[clientIP] === "object") {
 						activeIps[clientIP].timestamp = now;
 						activeIps[clientIP].count = (activeIps[clientIP].count || 0) + 1;
 					} else {
 						activeIps[clientIP] = { timestamp: now, count: 1 };
 					}
-				}
-				let lastDbW = GLOBAL_LAST_DB_WRITE.get(username) || 0;
-				let needIpWrite = isNewIp;
-				let needTimeWrite = (now - lastDbW > 900000);
-				if (needIpWrite || needTimeWrite) {
-					GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
-					GLOBAL_LAST_DB_WRITE.set(username, now);
-					persistActiveIp(env, ctx, reqUUID, username, clientIP, now);
+					let lastDbW = GLOBAL_LAST_DB_WRITE.get(username) || 0;
+					if (now - lastDbW > 900000) {
+						GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
+						GLOBAL_LAST_DB_WRITE.set(username, now);
+						persistActiveIp(env, ctx, reqUUID, username, clientIP, now);
+					}
 				}
 			}
 			isHeaderParsed = true;
-			let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
-			ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
-			hasCountedAsActive = true;
+			if (deviceConfirmed) {
+				let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+				ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+				hasCountedAsActive = true;
+			}
 			try {
 				let isDomainAddress = (isTrojanProto && addrType === 3) || (!isTrojanProto && addrType === 2);
 				let isIpAddress = (isTrojanProto && (addrType === 1 || addrType === 4)) || (!isTrojanProto && (addrType === 1 || addrType === 3));
