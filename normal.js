@@ -385,6 +385,9 @@ const NEW_USER_DEFAULTS_FALLBACK = {
 // خالی/نامعتبر یعنی «از NEW_USER_DEFAULTS_FALLBACK استفاده کن».
 const NEW_USER_DEFAULTS_EMPTY_OK = ["new_user_frag_len", "new_user_frag_int"];
 const NEW_USER_TLS_PORTS = ["443", "2053", "2083", "2087", "2096", "8443"];
+// Same list as the Fingerprint <select> of the panel (fingerprint-select / nud-fingerprint) — the only
+// values POST /api/settings/bulk accepts when it is asked to write a fingerprint onto existing users.
+const NEW_USER_FINGERPRINTS = ["chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized", "unsafe"];
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
 // runs automatically for every user right after the admin saves the pinned
@@ -1710,6 +1713,8 @@ const Router = {
 				let unpinRemoval = { countries: [], usersUpdated: 0 };
 				let fragApplied = false;
 				let userLimitApplied = false;
+				let fingerprintApplied = false;
+				let connTypeApplied = false;
 				if (body.settings && typeof body.settings === "object") {
 					// «محدودیت کاربر» (user_limit): برخلاف بقیه‌ی تنظیمات global، این یکی روی ستون
 					// ip_limit/max_connections همه‌ی کاربرهای *موجود* هم override می‌شه (نه فقط پیش‌فرض
@@ -1750,6 +1755,29 @@ const Router = {
 							len: String(body.settings.new_user_frag_len == null ? "" : body.settings.new_user_frag_len).trim(),
 							int: String(body.settings.new_user_frag_int == null ? "" : body.settings.new_user_frag_int).trim(),
 						};
+					}
+					// «فینگرپرینت» (new_user_fingerprint) و «پروتکل» (new_user_connection_type): مثل فرگمنت،
+					// این دو کلید هم فقط پیش‌فرضِ کاربر *تازه‌ساز*ند؛ لینک‌ها از ستون‌های fingerprint/
+					// connection_type خودِ هر کاربر ساخته می‌شوند (SubscriptionService.generateText و
+					// چک پروتکل هنگام اتصال)، نه از settings؛ پس ذخیره‌ی کلید به‌تنهایی روی کانفیگ
+					// کاربرهای موجود اثری نداشت. فقط وقتی فراخواننده (Push پنل مادر) صریحاً
+					// apply_fingerprint_to_existing_users / apply_connection_type_to_existing_users: true
+					// بفرستد (فلگ بیرون از body.settings، مثل apply_frag_to_existing_users)، مقدار روی
+					// ستون همه‌ی کاربرهای *موجود* هم نوشته می‌شود. «ذخیره‌ی تنظیمات» خودِ همین پنل این
+					// فلگ‌ها را نمی‌فرستد، پس فقط برای کاربر بعدی اثر دارد. مقدار نامعتبر = نادیده گرفته
+					// می‌شود (و چون *_applied برنمی‌گردد، مادر آن را به‌عنوان خطا گزارش می‌کند).
+					let overrideFingerprint = undefined;
+					if (body.apply_fingerprint_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_fingerprint")) {
+						const fpVal = String(body.settings.new_user_fingerprint == null ? "" : body.settings.new_user_fingerprint).trim();
+						if (NEW_USER_FINGERPRINTS.includes(fpVal)) overrideFingerprint = fpVal;
+					}
+					let overrideConnType = undefined;
+					if (body.apply_connection_type_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_connection_type")) {
+						const ctParts = String(body.settings.new_user_connection_type == null ? "" : body.settings.new_user_connection_type)
+							.split(",")
+							.map((x) => x.trim().toLowerCase());
+						const ctFinal = ["vless", "trojan"].filter((x) => ctParts.includes(x));
+						if (ctFinal.length > 0) overrideConnType = ctFinal.join(",");
 					}
 					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
 					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
@@ -1792,8 +1820,23 @@ const Router = {
 						await env.DB.prepare("UPDATE users SET frag_len = ?, frag_int = ?").bind(overrideFrag.len, overrideFrag.int).run();
 						fragApplied = true;
 					}
+					if (overrideFingerprint !== undefined) {
+						await env.DB.prepare("UPDATE users SET fingerprint = ?").bind(overrideFingerprint).run();
+						fingerprintApplied = true;
+					}
+					if (overrideConnType !== undefined) {
+						await env.DB.prepare("UPDATE users SET connection_type = ?").bind(overrideConnType).run();
+						connTypeApplied = true;
+						// connection_type is also checked on every incoming connection (VLESS/Trojan), and that
+						// lookup is cached for a few seconds — drop the cached entries so the new protocol
+						// takes effect immediately instead of after the TTL.
+						try {
+							const { results: ctUsers } = await env.DB.prepare("SELECT uuid, trojan_hash FROM users").all();
+							await Promise.all((ctUsers || []).map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
+						} catch (e) { /* best-effort: the cache expires by itself within seconds */ }
+					}
 				}
-				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/proxy-ip") {
