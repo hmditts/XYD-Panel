@@ -1753,6 +1753,7 @@ const Router = {
 				let userLimitApplied = false;
 				let fingerprintApplied = false;
 				let connTypeApplied = false;
+				let cleanIpApplied = false;
 				if (body.settings && typeof body.settings === "object") {
 					// «محدودیت کاربر» (user_limit): برخلاف بقیه‌ی تنظیمات global، این یکی روی ستون
 					// ip_limit/max_connections همه‌ی کاربرهای *موجود* هم override می‌شه (نه فقط پیش‌فرض
@@ -1773,6 +1774,19 @@ const Router = {
 					if (Object.prototype.hasOwnProperty.call(body.settings, "default_port")) {
 						const parsedPort = parseInt(body.settings.default_port);
 						if (!isNaN(parsedPort) && parsedPort > 0 && parsedPort <= 65535) overrideDefaultPort = String(parsedPort);
+					}
+					// «آی‌پی تمیز سراسری» (global_clean_ip): مثل «پورت» و «محدودیت کاربر» بالا -
+					// برخلاف بقیه‌ی تنظیمات global - این یکی هم روی ستون ips همه‌ی کاربرهای
+					// *موجود* بازنویسی کامل می‌شود (نه فقط پیش‌فرض کاربر تازه‌ساز؛ نگاه کنید به
+					// POST /api/users که nud.global_clean_ip را فقط وقتی می‌خواند که خودِ کاربر
+					// در لحظه‌ی ساخت مقدار ips جدا نداشته باشد). قبل از این تغییر این کلید فقط
+					// در جدول settings ذخیره می‌شد و هیچ‌وقت به کارت‌های موجود نمی‌رسید — همین
+					// نبود override باعث می‌شد تغییر «Global Clean IP» در پنل مادر روی کارت
+					// کاربرهایی که از قبل ساخته شده بودند اثر نکند.
+					let overrideGlobalCleanIp = undefined;
+					if (Object.prototype.hasOwnProperty.call(body.settings, "global_clean_ip")) {
+						const cleanIpVal = String(body.settings.global_clean_ip == null ? "" : body.settings.global_clean_ip).trim();
+						if (cleanIpVal) overrideGlobalCleanIp = cleanIpVal;
 					}
 					// «فرگمنت» (new_user_frag_len / new_user_frag_int): کلیدهای new_user_* فقط
 					// پیش‌فرضِ کاربر *تازه‌ساز*ند. لینک‌ها از ستون‌های frag_len/frag_int خودِ هر
@@ -1854,6 +1868,10 @@ const Router = {
 					if (overrideDefaultPort !== undefined) {
 						await env.DB.prepare("UPDATE users SET port = ?").bind(overrideDefaultPort).run();
 					}
+					if (overrideGlobalCleanIp !== undefined) {
+						await env.DB.prepare("UPDATE users SET ips = ?").bind(overrideGlobalCleanIp).run();
+						cleanIpApplied = true;
+					}
 					if (overrideFrag !== undefined) {
 						await env.DB.prepare("UPDATE users SET frag_len = ?, frag_int = ?").bind(overrideFrag.len, overrideFrag.int).run();
 						fragApplied = true;
@@ -1874,7 +1892,7 @@ const Router = {
 						} catch (e) { /* best-effort: the cache expires by itself within seconds */ }
 					}
 				}
-				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/proxy-ip") {
