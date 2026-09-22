@@ -835,7 +835,20 @@ async function removeUnpinnedCountriesFromAllUsers(env, ctx, keepCountries) {
 	return { countries: Array.from(removedCountries), usersUpdated: changedUsers.length };
 }
 
-async function replaceBrokenProxy(username, env, oldProxy) {
+// علت دوم (باگ دوم) که «لیست کشورها خالی می‌مونه»: اگه یه اسلاتِ کشور از همون اول
+// (موقع ساخت کاربر یا merge کردن پین‌ها) proxy خالی داشته باشه، هیچ‌وقت از این تابع
+// با oldProxy واقعی صدا زده نمی‌شد - چون این تابع فقط از مسیر «پروکسی موجود fail شد»
+// (خط connectProxy(...) catch در connectTCP) صدا زده می‌شد، و یه اسلاتِ از اول خالی
+// اصلاً وارد اون مسیر نمی‌شه (مستقیم می‌ره سراغ connectDirect). یعنی اون اسلات برای
+// همیشه بدون تلاش برای ترمیم می‌مونْد. حالا این تابع یک پارامتر چهارم اختیاری
+// expectedCountry هم می‌گیرد: وقتی oldProxy خالی/نامعتبر است ولی expectedCountry
+// پر شده (یعنی «این کشور مشخص را ترمیم کن»، نه «این پروکسی مشخص را عوض کن»)، اسلاتِ
+// هدف با تطبیقِ country (نه با تطبیق رشته‌ی پروکسی) پیدا می‌شود - دقیقاً همان اسلاتی
+// که proxy آن هنوز خالی است و country آن با expectedCountry یکی است. بقیه‌ی منطق
+// (cooldown، جست‌وجو در proxy_vip/<country>.txt، تایید کشور واقعی) بدون تغییر باقی
+// می‌ماند. صدا زدنش از داخل connectTCP (شاخه‌ی connectDirect، وقتی هیچ پروکسی‌ای برای
+// اسلاتِ انتخاب‌شده نبود) اضافه شده - نگاه کنید به getSelectedUserProxy/connectTCP.
+async function replaceBrokenProxy(username, env, oldProxy, expectedCountry = null) {
 	try {
 		if (GLOBAL_WRITE_LOCK.get(username + "_proxy_rotate")) return;
 		GLOBAL_WRITE_LOCK.set(username + "_proxy_rotate", true);
@@ -859,12 +872,22 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 			proxyList = [user.user_socks5];
 		}
 		
+		const expectedCC = expectedCountry ? String(expectedCountry).toUpperCase() : null;
 		let matchIndex = -1;
 		for (let i = 0; i < proxyList.length; i++) {
-			let itemStr = typeof proxyList[i] === "object" && proxyList[i] !== null ? proxyList[i].proxy : proxyList[i];
-			if (itemStr === oldProxy) {
-				matchIndex = i;
-				break;
+			const item = proxyList[i];
+			let itemStr = typeof item === "object" && item !== null ? item.proxy : item;
+			if (oldProxy) {
+				if (itemStr === oldProxy) {
+					matchIndex = i;
+					break;
+				}
+			} else if (expectedCC) {
+				const itemCountry = typeof item === "object" && item !== null ? String(item.country || "").toUpperCase() : "";
+				if (!itemStr && itemCountry === expectedCC) {
+					matchIndex = i;
+					break;
+				}
 			}
 		}
 		if (matchIndex === -1) {
@@ -979,15 +1002,14 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 						return [`socks5://${line}`, `http://${line}`];
 					});
 					
-					// کد-ریویو فیکس: قبلاً این تست فقط زنده‌بودن پروکسی را با یک GET خام به
-					// 1.1.1.1 چک می‌کرد - دقیقاً همان مشکلی که در testVipCountryProxy برطرف
-					// شده بود، اینجا (که healing واقعی را انجام می‌دهد) هنوز برطرف نشده بود.
-					// حالا دقیقاً همان الگو: مقصد تست ip-api.com است و کشور واقعی خروجی با
-					// upperCountry مقایسه می‌شود؛ کاندیدی که زنده است ولی از کشور اشتباه خارج
-					// می‌شود reject می‌شود تا Promise.any سراغ کاندید بعدی برود. اگر ip-api.com
-					// اصلاً جواب کشور نداد (تایم‌اوت/شبکه روی خودِ geo-lookup)، همچنان پذیرفته
-					// می‌شود - فقط «کشور اشتباهِ تاییدشده» رد می‌شود.
 					try {
+						// کد-ریویو فیکس ۲: این حلقه (که کاندیدِ جایگزین رو واقعاً تست می‌کند) هنوز با یک
+						// GET خام به 1.1.1.1 فقط «زنده بودن» رو چک می‌کرد، دقیقاً همان باگی که در
+						// testVipCountryProxy بالا رفع شده بود اما اینجا (که مسئول واقعیِ جایگزینی است)
+						// جا مانده بود - یعنی replaceBrokenProxy می‌توانست یک پروکسیِ زنده‌-ولی-کشور-اشتباه
+						// را به‌عنوان جایگزین بپذیرد. حالا دقیقاً مثل testVipCountryProxy از ip-api.com
+						// برای تایید کشور واقعی خروجی استفاده می‌شود؛ کاندیدی که کشورش با upperCountry
+						// نمی‌خواند رد می‌شود تا Promise.any سراغ کاندید بعدی برود.
 						newProxy = await Promise.any(
 							testBatch.map((p) => {
 								return new Promise(async (resolve, reject) => {
@@ -1013,7 +1035,7 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 										if (!resStr) { reject(new Error("empty")); return; }
 										const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
 										const gotCC = (jsonMatch && jsonMatch[1]) ? jsonMatch[1].toUpperCase() : "";
-										if (gotCC && src.country && gotCC !== src.country) reject(new Error("country-mismatch:" + gotCC));
+										if (gotCC && gotCC !== upperCountry) reject(new Error("country-mismatch:" + gotCC));
 										else resolve(p);
 									} catch (e) {
 										clearTimeout(timeoutId);
@@ -1063,93 +1085,6 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 	} finally {
 		GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
 	}
-}
-
-// از روی همان بخش آخر مسیر (path segment) که getSelectedUserProxy برای پیدا کردن
-// اسلات کشور مصرف می‌کند، فقط کد کشور درخواست‌شده را برمی‌گرداند - مستقل از این‌که
-// این کاربر خاص اسلاتی برای آن کشور دارد یا نه. برای فرمت‌های قدیمی (loc-N یا
-// ?loc=) که کد کشور در خودِ URL نیست، null برمی‌گرداند (چیزی برای healMissingCountrySlot
-// وجود ندارد چون معلوم نیست کدام کشور مقصود بوده).
-function getRequestedCountryCode(request) {
-	if (!request) return null;
-	try {
-		const url = new URL(request.url);
-		const segments = url.pathname.split("/").filter(Boolean);
-		const lastSeg = decodeURIComponent(segments[segments.length - 1] || "");
-		return getCountryForPathSegment(lastSeg);
-	} catch (e) {
-		return null;
-	}
-}
-
-// وقتی getSelectedUserProxy برای یک کشورِ قابل‌شناسایی در URL چیزی پیدا نکند (یا
-// چون اصلاً اسلاتی برای آن کشور در user_socks5 نیست - مثلاً تست اولیه‌ی ساخت کاربر
-// با محدودیت subrequest شکست خورده - یا چون اسلاتش هست ولی proxy آن از قبل خالی
-// مانده)، این اتصالِ فعلی همچنان طبق رفتار قبلی مستقیم/Cloudflare می‌رود (چیزی در
-// همین درخواست عوض نمی‌شود)، اما این تابع در پس‌زمینه (ctx.waitUntil) صدا زده
-// می‌شود تا با تست واقعی proxy_vip/<country>.txt (همان تابع geo-verified
-// testVipCountryProxy، با سقف تست بالاتر شبیه replaceBrokenProxy) آن اسلات را پر یا
-// اضافه کند تا اتصال‌های بعدی از همان کشور واقعاً پروکسی بگیرند. کول‌داون یک‌ساعته‌ی
-// per-(user,country) را با replaceBrokenProxy (همان ستون proxy_rotate_cooldowns)
-// مشترک است تا هرس شدن یک کشور و خالی‌ماندنش دو مسیر مستقل برای هجوم به لیست VIP
-// نسازند، و قفل GLOBAL_WRITE_LOCK هم با replaceBrokenProxy مشترک است تا دو نوشتنِ
-// هم‌زمان روی user_socks5 با هم تداخل نکنند.
-async function healMissingCountrySlot(username, env, countryCode) {
-	const cc = String(countryCode || "").trim().toUpperCase();
-	if (!cc) return;
-	const lockKey = username + "_proxy_rotate";
-	try {
-		if (GLOBAL_WRITE_LOCK.get(lockKey)) return;
-		GLOBAL_WRITE_LOCK.set(lockKey, true);
-		try {
-			const user = await env.DB.prepare("SELECT id, uuid, user_socks5, auto_rotate_user_proxy, proxy_rotate_cooldowns FROM users WHERE username = ?").bind(username).first();
-			if (!user || user.auto_rotate_user_proxy !== 1) return;
-
-			let cooldowns = {};
-			try {
-				cooldowns = user.proxy_rotate_cooldowns ? JSON.parse(user.proxy_rotate_cooldowns) : {};
-			} catch (e) {
-				cooldowns = {};
-			}
-			const COOLDOWN_MS = 3600000; // همان ۱ساعته‌ی replaceBrokenProxy - از همان ستون مشترک
-			const last = cooldowns[cc];
-			if (typeof last === "number" && (Date.now() - last) < COOLDOWN_MS) return;
-			cooldowns[cc] = Date.now();
-			try {
-				await env.DB.prepare("UPDATE users SET proxy_rotate_cooldowns = ? WHERE id = ?").bind(JSON.stringify(cooldowns), user.id).run();
-			} catch (e) { }
-
-			let list = [];
-			try {
-				const raw = String(user.user_socks5 || "").trim();
-				if (raw.startsWith("[")) list = JSON.parse(raw);
-				else if (raw) list = [raw];
-			} catch (e) {
-				list = user.user_socks5 ? [user.user_socks5] : [];
-			}
-			if (!Array.isArray(list)) list = [];
-
-			// همان تست geo-verified که برای کاربر تازه/merge استفاده می‌شود، با سقف بالاتر
-			// (۱۵ کاندید، مثل تلاش اصلیِ replaceBrokenProxy) چون این یک healing واقعی است،
-			// نه تست اولیه‌ی حجمی روی همه‌ی کشورها با هم.
-			const result = await testVipCountryProxy(cc, 15);
-			if (!result || !result.proxy) return; // چیزی برای این کشور پیدا نشد - دفعه‌ی بعد بعد از کول‌داون دوباره تلاش می‌شود
-
-			const idx = list.findIndex((p) => typeof p === "object" && p !== null && (p.country || "").toUpperCase() === cc);
-			if (idx === -1) {
-				list.push({ proxy: result.proxy, country: cc });
-			} else if (typeof list[idx] === "object" && list[idx] !== null) {
-				list[idx].proxy = result.proxy;
-			} else {
-				list[idx] = { proxy: result.proxy, country: cc };
-			}
-
-			await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE id = ?").bind(JSON.stringify(list), user.id).run();
-			await invalidateUserAuthCache(null, user.uuid);
-		} finally {
-			GLOBAL_WRITE_LOCK.delete(lockKey);
-		}
-	} catch (e) { }
 }
 const __WORKER_EXPORT__ = {
 	async fetch(request, env, ctx) {
@@ -3661,8 +3596,13 @@ function decodeInlinePanelIPs(segment) {
 		return null;
 	}
 }
+// خروجی این تابع قبلاً فقط رشته‌ی پروکسی بود؛ حالا { proxy, country } برمی‌گرداند
+// تا وقتی اسلاتِ انتخاب‌شده proxy خالی دارد (باگ دوم - نگاه کنید به یادداشت بالای
+// replaceBrokenProxy)، فراخواننده (connectTCP) بداند دقیقاً کدام کشور را باید در
+// پس‌زمینه ترمیم کند. تنها فراخواننده‌اش (در handlevIees/connectTCP) با همین شکل
+// جدید به‌روزرسانی شده - جای دیگری این تابع را صدا نمی‌زند.
 function getSelectedUserProxy(userSocks5, request) {
-	if (!userSocks5) return "";
+	if (!userSocks5) return { proxy: "", country: null };
 	let proxyList = [];
 	try {
 		if (userSocks5.trim().startsWith("[")) {
@@ -3673,7 +3613,7 @@ function getSelectedUserProxy(userSocks5, request) {
 	} catch (e) {
 		proxyList = [userSocks5];
 	}
-	if (!Array.isArray(proxyList) || proxyList.length === 0) return "";
+	if (!Array.isArray(proxyList) || proxyList.length === 0) return { proxy: "", country: null };
 	let idx = -1;
 	if (request) {
 		try {
@@ -3702,9 +3642,12 @@ function getSelectedUserProxy(userSocks5, request) {
 			}
 		} catch (e) { }
 	}
-	if (idx === -1) return "";
+	if (idx === -1) return { proxy: "", country: null };
 	const selected = proxyList[idx] || proxyList[0];
-	return typeof selected === "object" ? selected.proxy || "" : String(selected || "");
+	if (typeof selected === "object" && selected !== null) {
+		return { proxy: selected.proxy || "", country: selected.country || null };
+	}
+	return { proxy: String(selected || ""), country: null };
 }
 async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	let rawClientIP = request ? request.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
@@ -4428,7 +4371,8 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					}
 					const task = (async () => {
 						let s = null;
-						const socks5 = getSelectedUserProxy(user?.user_socks5, request);
+						const selectedSlot = getSelectedUserProxy(user?.user_socks5, request);
+						const socks5 = selectedSlot.proxy;
 						if (socks5) {
 							try {
 								s = await connectProxy(socks5, addr, port, dataPayload);
@@ -4441,13 +4385,17 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 								throw proxyErr;
 							}
 						} else {
-							if (user.auto_rotate_user_proxy === 1) {
-								const wantedCountry = getRequestedCountryCode(request);
-								if (wantedCountry) {
-									const healTask = healMissingCountrySlot(user.username, env, wantedCountry);
-									if (ctx) ctx.waitUntil(healTask);
-									else healTask.catch(() => { });
-								}
+							// باگ دوم: این اسلات از همون اول proxy خالی داشته (مثلاً موقع ساخت کاربر
+							// هیچ خط زنده‌ای توی proxy_vip/<country>.txt پیدا نشده بود). قبلاً هیچ‌جا
+							// برای این حالت replaceBrokenProxy صدا زده نمی‌شد، پس این اسلات همیشه
+							// خالی می‌موند. حالا در پس‌زمینه (بدون تاخیر انداختن همین یک اتصال که
+							// طبق قبل به connectDirect می‌ره) یه تلاش ترمیمِ مخصوصِ همون کشور
+							// تریگر می‌شه؛ replaceBrokenProxy خودش کول‌داون ۱ ساعته‌ی هر کشور را
+							// رعایت می‌کند، پس این باعث درخواست اضافه‌ی مکرر نمی‌شود.
+							if (selectedSlot.country && user.auto_rotate_user_proxy === 1) {
+								const healTask = replaceBrokenProxy(user.username, env, "", selectedSlot.country);
+								if (ctx) ctx.waitUntil(healTask);
+								else healTask.catch(() => { });
 							}
 							try {
 								s = await connectDirect(addr, port, dataPayload, targetDoh);
