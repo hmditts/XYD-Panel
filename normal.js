@@ -1754,6 +1754,7 @@ const Router = {
 				let fingerprintApplied = false;
 				let connTypeApplied = false;
 				let cleanIpApplied = false;
+				let portApplied = false;
 				if (body.settings && typeof body.settings === "object") {
 					// «محدودیت کاربر» (user_limit): برخلاف بقیه‌ی تنظیمات global، این یکی روی ستون
 					// ip_limit/max_connections همه‌ی کاربرهای *موجود* هم override می‌شه (نه فقط پیش‌فرض
@@ -1769,7 +1770,9 @@ const Router = {
 					// «پورت»: مثل بالا، این یکی هم - برخلاف بقیه‌ی تنظیمات global - روی ستون
 					// port همه‌ی کاربرهای *موجود* بازنویسی کامل می‌شه (نه فقط پیش‌فرض کاربر
 					// تازه‌ساز؛ نگاه کنید به getDefaultPortSetting() برای اون بخش). پورت(های)
-					// قبلی هر کاربر پاک و با همین یکی جایگزین می‌شه.
+					// قبلی هر کاربر پاک و با همین یکی جایگزین می‌شه. مثل user_limit/global_clean_ip
+					// بالا و پایین، موفقیتش با port_applied: true توی جواب گزارش می‌شه تا پنل
+					// مادر هم بتونه پنل‌های آپدیت‌نشده رو (که این کلید رو نادیده می‌گیرن) تشخیص بده.
 					let overrideDefaultPort = undefined;
 					if (Object.prototype.hasOwnProperty.call(body.settings, "default_port")) {
 						const parsedPort = parseInt(body.settings.default_port);
@@ -1867,6 +1870,7 @@ const Router = {
 					}
 					if (overrideDefaultPort !== undefined) {
 						await env.DB.prepare("UPDATE users SET port = ?").bind(overrideDefaultPort).run();
+						portApplied = true;
 					}
 					if (overrideGlobalCleanIp !== undefined) {
 						await env.DB.prepare("UPDATE users SET ips = ?").bind(overrideGlobalCleanIp).run();
@@ -1892,7 +1896,7 @@ const Router = {
 						} catch (e) { /* best-effort: the cache expires by itself within seconds */ }
 					}
 				}
-				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/proxy-ip") {
