@@ -835,20 +835,7 @@ async function removeUnpinnedCountriesFromAllUsers(env, ctx, keepCountries) {
 	return { countries: Array.from(removedCountries), usersUpdated: changedUsers.length };
 }
 
-// علت دوم (باگ دوم) که «لیست کشورها خالی می‌مونه»: اگه یه اسلاتِ کشور از همون اول
-// (موقع ساخت کاربر یا merge کردن پین‌ها) proxy خالی داشته باشه، هیچ‌وقت از این تابع
-// با oldProxy واقعی صدا زده نمی‌شد - چون این تابع فقط از مسیر «پروکسی موجود fail شد»
-// (خط connectProxy(...) catch در connectTCP) صدا زده می‌شد، و یه اسلاتِ از اول خالی
-// اصلاً وارد اون مسیر نمی‌شه (مستقیم می‌ره سراغ connectDirect). یعنی اون اسلات برای
-// همیشه بدون تلاش برای ترمیم می‌مونْد. حالا این تابع یک پارامتر چهارم اختیاری
-// expectedCountry هم می‌گیرد: وقتی oldProxy خالی/نامعتبر است ولی expectedCountry
-// پر شده (یعنی «این کشور مشخص را ترمیم کن»، نه «این پروکسی مشخص را عوض کن»)، اسلاتِ
-// هدف با تطبیقِ country (نه با تطبیق رشته‌ی پروکسی) پیدا می‌شود - دقیقاً همان اسلاتی
-// که proxy آن هنوز خالی است و country آن با expectedCountry یکی است. بقیه‌ی منطق
-// (cooldown، جست‌وجو در proxy_vip/<country>.txt، تایید کشور واقعی) بدون تغییر باقی
-// می‌ماند. صدا زدنش از داخل connectTCP (شاخه‌ی connectDirect، وقتی هیچ پروکسی‌ای برای
-// اسلاتِ انتخاب‌شده نبود) اضافه شده - نگاه کنید به getSelectedUserProxy/connectTCP.
-async function replaceBrokenProxy(username, env, oldProxy, expectedCountry = null) {
+async function replaceBrokenProxy(username, env, oldProxy) {
 	try {
 		if (GLOBAL_WRITE_LOCK.get(username + "_proxy_rotate")) return;
 		GLOBAL_WRITE_LOCK.set(username + "_proxy_rotate", true);
@@ -872,22 +859,12 @@ async function replaceBrokenProxy(username, env, oldProxy, expectedCountry = nul
 			proxyList = [user.user_socks5];
 		}
 		
-		const expectedCC = expectedCountry ? String(expectedCountry).toUpperCase() : null;
 		let matchIndex = -1;
 		for (let i = 0; i < proxyList.length; i++) {
-			const item = proxyList[i];
-			let itemStr = typeof item === "object" && item !== null ? item.proxy : item;
-			if (oldProxy) {
-				if (itemStr === oldProxy) {
-					matchIndex = i;
-					break;
-				}
-			} else if (expectedCC) {
-				const itemCountry = typeof item === "object" && item !== null ? String(item.country || "").toUpperCase() : "";
-				if (!itemStr && itemCountry === expectedCC) {
-					matchIndex = i;
-					break;
-				}
+			let itemStr = typeof proxyList[i] === "object" && proxyList[i] !== null ? proxyList[i].proxy : proxyList[i];
+			if (itemStr === oldProxy) {
+				matchIndex = i;
+				break;
 			}
 		}
 		if (matchIndex === -1) {
@@ -1003,13 +980,6 @@ async function replaceBrokenProxy(username, env, oldProxy, expectedCountry = nul
 					});
 					
 					try {
-						// کد-ریویو فیکس ۲: این حلقه (که کاندیدِ جایگزین رو واقعاً تست می‌کند) هنوز با یک
-						// GET خام به 1.1.1.1 فقط «زنده بودن» رو چک می‌کرد، دقیقاً همان باگی که در
-						// testVipCountryProxy بالا رفع شده بود اما اینجا (که مسئول واقعیِ جایگزینی است)
-						// جا مانده بود - یعنی replaceBrokenProxy می‌توانست یک پروکسیِ زنده‌-ولی-کشور-اشتباه
-						// را به‌عنوان جایگزین بپذیرد. حالا دقیقاً مثل testVipCountryProxy از ip-api.com
-						// برای تایید کشور واقعی خروجی استفاده می‌شود؛ کاندیدی که کشورش با upperCountry
-						// نمی‌خواند رد می‌شود تا Promise.any سراغ کاندید بعدی برود.
 						newProxy = await Promise.any(
 							testBatch.map((p) => {
 								return new Promise(async (resolve, reject) => {
@@ -1019,23 +989,13 @@ async function replaceBrokenProxy(username, env, oldProxy, expectedCountry = nul
 										reject(new Error("timeout"));
 									}, 4000); 
 									try {
-										const payload = TEXT_ENCODER.encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
-										sock = await connectProxy(p, "ip-api.com", 80, payload);
+										const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+										sock = await connectProxy(p, "1.1.1.1", 80, payload);
 										const reader = sock.readable.getReader();
-										const dec = new TextDecoder();
-										let resStr = "";
-										while (true) {
-											const readRes = await reader.read();
-											if (readRes.done || !readRes.value) break;
-											resStr += dec.decode(readRes.value, { stream: true });
-											if (resStr.includes("countryCode")) break;
-										}
+										const res = await reader.read();
 										clearTimeout(timeoutId);
 										try { sock.close(); } catch (e) { }
-										if (!resStr) { reject(new Error("empty")); return; }
-										const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
-										const gotCC = (jsonMatch && jsonMatch[1]) ? jsonMatch[1].toUpperCase() : "";
-										if (gotCC && gotCC !== upperCountry) reject(new Error("country-mismatch:" + gotCC));
+										if (res.done || !res.value) reject(new Error("empty"));
 										else resolve(p);
 									} catch (e) {
 										clearTimeout(timeoutId);
@@ -3596,13 +3556,8 @@ function decodeInlinePanelIPs(segment) {
 		return null;
 	}
 }
-// خروجی این تابع قبلاً فقط رشته‌ی پروکسی بود؛ حالا { proxy, country } برمی‌گرداند
-// تا وقتی اسلاتِ انتخاب‌شده proxy خالی دارد (باگ دوم - نگاه کنید به یادداشت بالای
-// replaceBrokenProxy)، فراخواننده (connectTCP) بداند دقیقاً کدام کشور را باید در
-// پس‌زمینه ترمیم کند. تنها فراخواننده‌اش (در handlevIees/connectTCP) با همین شکل
-// جدید به‌روزرسانی شده - جای دیگری این تابع را صدا نمی‌زند.
 function getSelectedUserProxy(userSocks5, request) {
-	if (!userSocks5) return { proxy: "", country: null };
+	if (!userSocks5) return "";
 	let proxyList = [];
 	try {
 		if (userSocks5.trim().startsWith("[")) {
@@ -3613,7 +3568,7 @@ function getSelectedUserProxy(userSocks5, request) {
 	} catch (e) {
 		proxyList = [userSocks5];
 	}
-	if (!Array.isArray(proxyList) || proxyList.length === 0) return { proxy: "", country: null };
+	if (!Array.isArray(proxyList) || proxyList.length === 0) return "";
 	let idx = -1;
 	if (request) {
 		try {
@@ -3642,12 +3597,9 @@ function getSelectedUserProxy(userSocks5, request) {
 			}
 		} catch (e) { }
 	}
-	if (idx === -1) return { proxy: "", country: null };
+	if (idx === -1) return "";
 	const selected = proxyList[idx] || proxyList[0];
-	if (typeof selected === "object" && selected !== null) {
-		return { proxy: selected.proxy || "", country: selected.country || null };
-	}
-	return { proxy: String(selected || ""), country: null };
+	return typeof selected === "object" ? selected.proxy || "" : String(selected || "");
 }
 async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	let rawClientIP = request ? request.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
@@ -4371,8 +4323,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					}
 					const task = (async () => {
 						let s = null;
-						const selectedSlot = getSelectedUserProxy(user?.user_socks5, request);
-						const socks5 = selectedSlot.proxy;
+						const socks5 = getSelectedUserProxy(user?.user_socks5, request);
 						if (socks5) {
 							try {
 								s = await connectProxy(socks5, addr, port, dataPayload);
@@ -4385,18 +4336,6 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 								throw proxyErr;
 							}
 						} else {
-							// باگ دوم: این اسلات از همون اول proxy خالی داشته (مثلاً موقع ساخت کاربر
-							// هیچ خط زنده‌ای توی proxy_vip/<country>.txt پیدا نشده بود). قبلاً هیچ‌جا
-							// برای این حالت replaceBrokenProxy صدا زده نمی‌شد، پس این اسلات همیشه
-							// خالی می‌موند. حالا در پس‌زمینه (بدون تاخیر انداختن همین یک اتصال که
-							// طبق قبل به connectDirect می‌ره) یه تلاش ترمیمِ مخصوصِ همون کشور
-							// تریگر می‌شه؛ replaceBrokenProxy خودش کول‌داون ۱ ساعته‌ی هر کشور را
-							// رعایت می‌کند، پس این باعث درخواست اضافه‌ی مکرر نمی‌شود.
-							if (selectedSlot.country && user.auto_rotate_user_proxy === 1) {
-								const healTask = replaceBrokenProxy(user.username, env, "", selectedSlot.country);
-								if (ctx) ctx.waitUntil(healTask);
-								else healTask.catch(() => { });
-							}
 							try {
 								s = await connectDirect(addr, port, dataPayload, targetDoh);
 							} catch (directErr) {
@@ -8245,6 +8184,7 @@ let activeRocketBtn = null;
 			const enableDirectCheck = document.getElementById('input-enable-direct');
 			if (enableDirectCheck) enableDirectCheck.checked = nud.enable_direct;
 			window.proxyFieldsData = [""];
+			window.proxyFieldsCountries = [""];
 			window.activeProxyIndex = 0;
 			if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
 			const autoRotateIpToggle = document.getElementById('input-auto-rotate-ip-toggle');
@@ -9119,10 +9059,22 @@ let activeRocketBtn = null;
 			const userProxyMode = document.getElementById('user-proxy-mode-toggle') ? document.getElementById('user-proxy-mode-toggle').checked : false;
 			let userSocks5 = null;
 			if (userProxyMode && window.proxyFieldsData && window.proxyFieldsData.length > 0) {
-				const cleanProxies = window.proxyFieldsData.map(p => p ? p.trim() : "").filter(p => p !== "");
-				if (cleanProxies.length === 1) {
+				// Re-attach each slot's country tag (if any) when building the payload, so a save
+				// no longer wipes proxyFieldsCountries on the server side - preserveProxyCountryTags()
+				// there is still a fallback, but it can only guess by matching the proxy string, which
+				// silently failed for any slot with an empty/untested proxy (a common case - see
+				// buildPinnedDefaultProxyList). Sending the tag directly here fixes that for good.
+				const proxyTags = Array.isArray(window.proxyFieldsCountries) ? window.proxyFieldsCountries : [];
+				const cleanProxies = [];
+				window.proxyFieldsData.forEach((p, i) => {
+					const val = p ? String(p).trim() : "";
+					if (val === "") return;
+					const cc = proxyTags[i] ? String(proxyTags[i]).trim().toUpperCase() : "";
+					cleanProxies.push(cc ? { proxy: val, country: cc } : val);
+				});
+				if (cleanProxies.length === 1 && typeof cleanProxies[0] === "string") {
 					userSocks5 = cleanProxies[0];
-				} else if (cleanProxies.length > 1) {
+				} else if (cleanProxies.length > 0) {
 					userSocks5 = JSON.stringify(cleanProxies);
 				}
 			}
@@ -9179,6 +9131,12 @@ let activeRocketBtn = null;
 		}
 window.activeProxyIndex = 0;
 window.proxyFieldsData = [""];
+// Parallel array (same length/order as proxyFieldsData): the pinned country code (e.g. "UZ")
+// each slot is tagged with, or "" when the slot has no country (a manually-added extra proxy).
+// Kept only for display + resubmitting the tag - see populateUserFormFields() and the submit
+// handler for why this exists (renderProxyFieldsUI reads it, addProxyFieldUI/removeProxyFieldUI
+// keep it in sync with proxyFieldsData).
+window.proxyFieldsCountries = [""];
 window.clearProxyFieldUI = function(idx) {
 	window.proxyFieldsData[idx] = "";
 	if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
@@ -9199,13 +9157,24 @@ window.renderProxyFieldsUI = function() {
 		const pingObj = proxyStr ? (window.proxyPingMap && window.proxyPingMap[proxyStr]) : null;
 		const pingClass = pingObj ? pingObj.className : "text-[10px] font-bold text-center block min-h-[18px] mt-0.5 transition-colors";
 		const pingText = pingObj ? pingObj.text : "";
-		let countryCode = "UN";
-		if (proxyStr && proxyFlagCache[proxyStr]) {
+		// The pinned country this slot is tagged with (from user_socks5's {proxy,country} - see
+		// populateUserFormFields()), if any. Takes priority over the ping-test flag guess below,
+		// since the tag is the real, saved location for this slot even when the proxy field is
+		// still empty or has never been tested.
+		const tagCountry = (Array.isArray(window.proxyFieldsCountries) && window.proxyFieldsCountries[idx]) ? String(window.proxyFieldsCountries[idx]).toUpperCase() : "";
+		let countryCode = tagCountry || "UN";
+		if (!tagCountry && proxyStr && proxyFlagCache[proxyStr]) {
 			countryCode = proxyFlagCache[proxyStr].toUpperCase();
 		}
 		const isVip = proxyStr.length > 0 && (proxyStr.includes('@') || proxyStr.includes('pass=') || proxyStr.includes('t.me/'));
+		let countryBadgeHtml = '';
+		if (tagCountry) {
+			const badgeFlag = typeof getFlagEmoji === 'function' ? getFlagEmoji(tagCountry) : '🌐';
+			countryBadgeHtml = '<span class="w-7 h-7 flex-shrink-0 flex items-center justify-center rounded bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-amoled-border" title="لوکیشن پین‌شده: ' + tagCountry + '"><span class="text-sm leading-none">' + badgeFlag + '</span></span>';
+		}
 		let inputRow = '<div class="flex items-center gap-1 w-full">' +
-			'<button type="button" onclick="swapProxyFieldUI(' + idx + ')" class="w-7 h-7 flex-shrink-0 bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white rounded flex items-center justify-center font-bold text-xs shadow-sm transition-all" title="جا به جایی پروکسی"><svg id="swap-icon-' + idx + '" class="w-3.5 h-3.5 transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg></button>';
+			'<button type="button" onclick="swapProxyFieldUI(' + idx + ')" class="w-7 h-7 flex-shrink-0 bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white rounded flex items-center justify-center font-bold text-xs shadow-sm transition-all" title="جا به جایی پروکسی"><svg id="swap-icon-' + idx + '" class="w-3.5 h-3.5 transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg></button>' +
+			countryBadgeHtml;
 		const vipBorderClass = isFocused ? "ring-2 ring-blue-500 border-blue-500" : "border-green-400 dark:border-green-600";
 		if (isVip) {
 			let flagHtml = typeof getFlagEmoji === 'function' ? getFlagEmoji(countryCode) : '🌐';
@@ -9222,7 +9191,7 @@ window.renderProxyFieldsUI = function() {
 							'</div>' +
 						'</div>';
 		} else {
-			inputRow += '<input type="text" id="proxy-field-box-' + idx + '" value="' + proxyStr + '" onfocus="setActiveProxyField(' + idx + ')" onclick="setActiveProxyField(' + idx + ')" oninput="updateProxyFieldData(' + idx + ', this.value)" placeholder="socks5:// یا http:// (کشور ' + (idx + 1) + ')" dir="ltr" class="flex-1 px-2 py-1.5 bg-gray-50 dark:bg-slate-900 border ' + borderClass + ' rounded text-xs font-mono focus:outline-none text-gray-800 dark:text-zinc-100 transition">';
+			inputRow += '<input type="text" id="proxy-field-box-' + idx + '" value="' + proxyStr + '" onfocus="setActiveProxyField(' + idx + ')" onclick="setActiveProxyField(' + idx + ')" oninput="updateProxyFieldData(' + idx + ', this.value)" placeholder="socks5:// یا http:// (کشور ' + (tagCountry || (idx + 1)) + ')" dir="ltr" class="flex-1 px-2 py-1.5 bg-gray-50 dark:bg-slate-900 border ' + borderClass + ' rounded text-xs font-mono focus:outline-none text-gray-800 dark:text-zinc-100 transition">';
 		}
 		if (idx > 0) {
 			inputRow += '<button type="button" onclick="removeProxyFieldUI(' + idx + ')" class="w-7 h-7 flex-shrink-0 bg-red-700 hover:bg-red-800 dark:bg-red-600 dark:hover:bg-red-700 text-white rounded flex items-center justify-center font-bold text-xs shadow-sm" title="حذف کامل فیلد"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>';
@@ -9309,6 +9278,8 @@ window.updateProxyFieldData = function(idx, val) {
 window.addProxyFieldUI = function() {
 	if (window.proxyFieldsData.length < 15) {
 		window.proxyFieldsData.push("");
+		if (!Array.isArray(window.proxyFieldsCountries)) window.proxyFieldsCountries = [];
+		window.proxyFieldsCountries.push(""); // a manually-added slot has no pinned country
 		window.activeProxyIndex = window.proxyFieldsData.length - 1;
 		window.renderProxyFieldsUI();
 		setTimeout(() => {
@@ -9324,6 +9295,7 @@ window.addProxyFieldUI = function() {
 window.removeProxyFieldUI = function(idx) {
 	if (window.proxyFieldsData.length > 1) {
 		window.proxyFieldsData.splice(idx, 1);
+		if (Array.isArray(window.proxyFieldsCountries)) window.proxyFieldsCountries.splice(idx, 1);
 		if (window.activeProxyIndex >= window.proxyFieldsData.length) {
 			window.activeProxyIndex = window.proxyFieldsData.length - 1;
 		}
@@ -10086,6 +10058,7 @@ function populateUserFormFields(user) {
 	const userProxyToggle = document.getElementById('user-proxy-mode-toggle');
 	const targetProxy = user.user_socks5 || user.user_proxy_ip;
 	window.proxyFieldsData = [""];
+	window.proxyFieldsCountries = [""];
 	window.activeProxyIndex = 0;
 	if (user.user_socks5) {
 		if (userProxyToggle) userProxyToggle.checked = true;
@@ -10093,12 +10066,21 @@ function populateUserFormFields(user) {
 		try {
 			if (user.user_socks5.trim().startsWith("[")) {
 				const arr = JSON.parse(user.user_socks5);
-				window.proxyFieldsData = arr.map(x => typeof x === "object" && x !== null ? x.proxy : x);
+				// Keep each slot's {proxy, country} pair together - proxyFieldsData gets the bare
+				// proxy string (used everywhere else exactly like before) while proxyFieldsCountries
+				// gets the matching country tag, so renderProxyFieldsUI() can show which pinned
+				// location each slot is (even when proxy is still "" and untested). Previously this
+				// line kept only x.proxy, so every slot's country tag was thrown away the moment the
+				// edit-user modal opened - see preserveProxyCountryTags() for the related save-side fix.
+				window.proxyFieldsData = arr.map(x => (typeof x === "object" && x !== null) ? (x.proxy || "") : (x || ""));
+				window.proxyFieldsCountries = arr.map(x => (typeof x === "object" && x !== null && x.country) ? String(x.country).toUpperCase() : "");
 			} else {
 				window.proxyFieldsData = [user.user_socks5];
+				window.proxyFieldsCountries = [""];
 			}
 		} catch(e) {
 			window.proxyFieldsData = [user.user_socks5];
+			window.proxyFieldsCountries = [""];
 		}
 	} else {
 		if (userProxyToggle) userProxyToggle.checked = false;
