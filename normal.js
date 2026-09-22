@@ -563,6 +563,22 @@ const PINNED_PROVISION_TEST_LIMIT = 3;
 // slot still carries the right country tag (replaceBrokenProxy's same-country
 // cooldown/heal logic will keep retrying later). Returns null only if the
 // country's VIP list itself is missing or empty.
+// کد-ریویو فیکس: قبل از این، هر کاندید فقط با یک GET خام به 1.1.1.1 تست
+// می‌شد - یعنی فقط «زنده بودن» پروکسی چک می‌شد، نه این‌که واقعاً از همان
+// کشوری که proxy_vip/<country>.txt ادعا می‌کند exit می‌کند یا نه. برخلاف
+// replaceBrokenProxy (که برای countryCode="all"/"UN" از ip-api.com برای
+// تشخیص کشور واقعی استفاده می‌کند)، اینجا هیچ geo-check ای نبود، پس یک خط
+// که در US.txt هست ولی واقعاً IP اون کشور رو نشون نمی‌ده هم قبول می‌شد.
+// راه‌حل: مقصد تست از 1.1.1.1 به ip-api.com عوض شده (دقیقاً همان الگوی
+// replaceBrokenProxy/تست دستی پروکسی) تا در همان یک subrequest هم زنده‌بودن
+// و هم کشور واقعی خروجی چک شود؛ اگر کشور برگشتی با country ورودی نخواند،
+// آن کاندید reject می‌شود تا Promise.any سراغ کاندید بعدی برود. اگر
+// ip-api.com اصلاً جواب کشور نداد (شبکه/timeout روی خودِ geo-lookup)، برای
+// جلوگیری از رد کردن بی‌دلیل کل استخر، همچنان پذیرفته می‌شود - فقط «کشور
+// اشتباهِ تاییدشده» رد می‌شود، نه «کشورِ تاییدنشده». هزینه‌ی subrequest به
+// ازای هر کاندید دقیقاً همان یکی قبلی می‌ماند (نگاه کنید به یادداشت بودجه‌ی
+// subrequest بالای PINNED_PROVISION_TEST_LIMIT) - فقط مقصد و مسیر HTTP عوض
+// شده، نه تعداد اتصال‌ها.
 async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LIMIT) {
 	try {
 		const res = await fetchWithFallback(`proxy_vip/${country}.txt`);
@@ -578,6 +594,7 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 			if (line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks")) return [line];
 			return [`socks5://${line}`, `http://${line}`];
 		});
+		const expectedCC = String(country || "").trim().toUpperCase();
 		try {
 			const working = await Promise.any(
 				testBatch.map((p) => {
@@ -588,13 +605,23 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 							reject(new Error("timeout"));
 						}, 4000);
 						try {
-							const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-							sock = await connectProxy(p, "1.1.1.1", 80, payload);
+							const payload = TEXT_ENCODER.encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
+							sock = await connectProxy(p, "ip-api.com", 80, payload);
 							const reader = sock.readable.getReader();
-							const readRes = await reader.read();
+							const dec = new TextDecoder();
+							let resStr = "";
+							while (true) {
+								const readRes = await reader.read();
+								if (readRes.done || !readRes.value) break;
+								resStr += dec.decode(readRes.value, { stream: true });
+								if (resStr.includes("countryCode")) break;
+							}
 							clearTimeout(timeoutId);
 							try { sock.close(); } catch (e) { }
-							if (readRes.done || !readRes.value) reject(new Error("empty"));
+							if (!resStr) { reject(new Error("empty")); return; }
+							const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
+							const gotCC = (jsonMatch && jsonMatch[1]) ? jsonMatch[1].toUpperCase() : "";
+							if (gotCC && expectedCC && gotCC !== expectedCC) reject(new Error("country-mismatch:" + gotCC));
 							else resolve(p);
 						} catch (e) {
 							clearTimeout(timeoutId);
@@ -606,7 +633,7 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 			);
 			return { proxy: working, country };
 		} catch (e) {
-			// Nothing answered in time - keep the country tag, use an untested line.
+			// Nothing answered in time / matched the country - keep the country tag, use an untested line.
 			return { proxy: lines[0], country };
 		}
 	} catch (e) {
