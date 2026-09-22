@@ -835,7 +835,7 @@ async function removeUnpinnedCountriesFromAllUsers(env, ctx, keepCountries) {
 	return { countries: Array.from(removedCountries), usersUpdated: changedUsers.length };
 }
 
-async function replaceBrokenProxy(username, env, oldProxy) {
+async function replaceBrokenProxy(username, env, oldProxy, forceCountry = null) {
 	try {
 		if (GLOBAL_WRITE_LOCK.get(username + "_proxy_rotate")) return;
 		GLOBAL_WRITE_LOCK.set(username + "_proxy_rotate", true);
@@ -860,11 +860,21 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 		}
 		
 		let matchIndex = -1;
-		for (let i = 0; i < proxyList.length; i++) {
-			let itemStr = typeof proxyList[i] === "object" && proxyList[i] !== null ? proxyList[i].proxy : proxyList[i];
-			if (itemStr === oldProxy) {
-				matchIndex = i;
-				break;
+		if (forceCountry) {
+			// Targeted heal for a currently-empty country slot (called from the
+			// connectTCP direct-fallback branch when getSelectedUserProxy() returned ""):
+			// match by the slot's own country tag instead of by proxy string, since
+			// oldProxy is "" here and would otherwise match the FIRST empty slot in the
+			// list - not necessarily the country the client actually requested.
+			const targetCC = String(forceCountry).toUpperCase();
+			matchIndex = proxyList.findIndex((p) => typeof p === "object" && p !== null && String(p.country || "").toUpperCase() === targetCC);
+		} else {
+			for (let i = 0; i < proxyList.length; i++) {
+				let itemStr = typeof proxyList[i] === "object" && proxyList[i] !== null ? proxyList[i].proxy : proxyList[i];
+				if (itemStr === oldProxy) {
+					matchIndex = i;
+					break;
+				}
 			}
 		}
 		if (matchIndex === -1) {
@@ -970,6 +980,7 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 					
 					const testLimit = (src.country === upperCountry) ? 15 : 3;
 					
+					const expectedCC = String(src.country || "").toUpperCase();
 					const testBatch = lines.slice(0, testLimit).flatMap((line) => {
 						if (line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks")) {
 							return [line];
@@ -980,6 +991,19 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 					});
 					
 					try {
+						// Same fix as testVipCountryProxy() above (see the کد-ریویو فیکس comment on
+						// that function): a raw GET to 1.1.1.1 only proves a candidate is ALIVE, not
+						// that it actually exits through the country its proxy_vip/<country>.txt file
+						// claims. That gap was closed in testVipCountryProxy but left open here - so a
+						// stale/mislabeled line could still get accepted as the healed replacement and
+						// saved to this user's VIP slot for that country, with nothing to ever catch
+						// it afterwards (checkAutoRotates() is a no-op, and this only runs again on
+						// the next real connection failure). Test destination is now ip-api.com so the
+						// same request that proves liveness also reports the exit country; a candidate
+						// whose reported country doesn't match is rejected so Promise.any moves on to
+						// the next one. A candidate ip-api.com couldn't verify in time is still
+						// accepted (only a CONFIRMED wrong country is rejected, not an unconfirmed
+						// one), matching testVipCountryProxy's fallback behavior.
 						newProxy = await Promise.any(
 							testBatch.map((p) => {
 								return new Promise(async (resolve, reject) => {
@@ -989,13 +1013,23 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 										reject(new Error("timeout"));
 									}, 4000); 
 									try {
-										const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-										sock = await connectProxy(p, "1.1.1.1", 80, payload);
+										const payload = TEXT_ENCODER.encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
+										sock = await connectProxy(p, "ip-api.com", 80, payload);
 										const reader = sock.readable.getReader();
-										const res = await reader.read();
+										const dec = new TextDecoder();
+										let resStr = "";
+										while (true) {
+											const readRes = await reader.read();
+											if (readRes.done || !readRes.value) break;
+											resStr += dec.decode(readRes.value, { stream: true });
+											if (resStr.includes("countryCode")) break;
+										}
 										clearTimeout(timeoutId);
 										try { sock.close(); } catch (e) { }
-										if (res.done || !res.value) reject(new Error("empty"));
+										if (!resStr) { reject(new Error("empty")); return; }
+										const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
+										const gotCC = (jsonMatch && jsonMatch[1]) ? jsonMatch[1].toUpperCase() : "";
+										if (gotCC && expectedCC && gotCC !== expectedCC) reject(new Error("country-mismatch:" + gotCC));
 										else resolve(p);
 									} catch (e) {
 										clearTimeout(timeoutId);
@@ -4336,6 +4370,33 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 								throw proxyErr;
 							}
 						} else {
+							// Bug fix: a VIP-country slot whose proxy field is still "" (initial
+							// provisioning never found/verified a working line for it, or a past
+							// heal attempt came up empty) used to fall back to connectDirect()
+							// FOREVER with no way to self-heal - replaceBrokenProxy() only ever ran
+							// from the catch{} above, which never executes when there's no proxy to
+							// call connectProxy() with in the first place. That's why picking a VIP
+							// country could silently keep giving out the panel's own/clean IP
+							// instead of that country's IP. If the request's path names a real ISO
+							// country, kick off the same healing flow in the background - targeted
+							// at that country's slot directly (see the forceCountry param on
+							// replaceBrokenProxy) instead of matching by proxy string, since "" would
+							// otherwise match the first empty slot in the list, not necessarily the
+							// one actually requested. This connection still falls back to
+							// direct/clean-IP below exactly as before; the fix is for the NEXT
+							// connection through this country's path to get a real proxy.
+							if (user.auto_rotate_user_proxy === 1) {
+								try {
+									const segments = new URL(request.url).pathname.split("/").filter(Boolean);
+									const lastSeg = decodeURIComponent(segments[segments.length - 1] || "");
+									const requestedCountry = getCountryForPathSegment(lastSeg);
+									if (requestedCountry) {
+										const healTask = replaceBrokenProxy(user.username, env, "", requestedCountry);
+										if (ctx) ctx.waitUntil(healTask);
+										else healTask.catch(() => { });
+									}
+								} catch (e) { }
+							}
 							try {
 								s = await connectDirect(addr, port, dataPayload, targetDoh);
 							} catch (directErr) {
