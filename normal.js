@@ -719,12 +719,7 @@ function preserveProxyCountryTags(incomingRaw, existingRaw) {
 	}
 	const tagPool = new Map();
 	for (const slot of existingList) {
-		// NOTE: no longer requires slot.proxy to be non-empty - a still-healing VIP slot
-		// ({proxy:"", country:"TR"}) needs its tag preserved too, or every admin save of
-		// this user's edit-modal would permanently strip the country off any not-yet-healed
-		// slot (the modal reduces objects back to bare strings before posting), leaving it
-		// both empty AND untagged - unfixable by the country-targeted healing above.
-		if (typeof slot === "object" && slot !== null && slot.country && typeof slot.proxy === "string") {
+		if (typeof slot === "object" && slot !== null && slot.country && typeof slot.proxy === "string" && slot.proxy.trim()) {
 			const key = slot.proxy.trim();
 			if (!tagPool.has(key)) tagPool.set(key, []);
 			tagPool.get(key).push(String(slot.country));
@@ -840,7 +835,7 @@ async function removeUnpinnedCountriesFromAllUsers(env, ctx, keepCountries) {
 	return { countries: Array.from(removedCountries), usersUpdated: changedUsers.length };
 }
 
-async function replaceBrokenProxy(username, env, oldProxy, forceCountry) {
+async function replaceBrokenProxy(username, env, oldProxy) {
 	try {
 		if (GLOBAL_WRITE_LOCK.get(username + "_proxy_rotate")) return;
 		GLOBAL_WRITE_LOCK.set(username + "_proxy_rotate", true);
@@ -865,31 +860,11 @@ async function replaceBrokenProxy(username, env, oldProxy, forceCountry) {
 		}
 		
 		let matchIndex = -1;
-		if (forceCountry) {
-			// Healing an EMPTY slot (called from connectTCP's direct-fallback branch when
-			// getSelectedUserProxySlot resolved a country but the stored slot has no proxy
-			// yet - e.g. the VIP pool had nothing testable when the slot was first created).
-			// There's no oldProxy string to match by content here, so locate the slot by its
-			// country tag instead - and only ever target one that is STILL actually empty,
-			// so this background attempt can't clobber a slot a concurrent heal (or a manual
-			// admin edit) already filled in the meantime.
-			const wantCC = String(forceCountry).trim().toUpperCase();
-			for (let i = 0; i < proxyList.length; i++) {
-				const item = proxyList[i];
-				const itemCC = typeof item === "object" && item !== null && item.country ? String(item.country).toUpperCase() : null;
-				const itemProxy = typeof item === "object" && item !== null ? (item.proxy || "") : String(item || "");
-				if (itemCC === wantCC && !itemProxy) {
-					matchIndex = i;
-					break;
-				}
-			}
-		} else {
-			for (let i = 0; i < proxyList.length; i++) {
-				let itemStr = typeof proxyList[i] === "object" && proxyList[i] !== null ? proxyList[i].proxy : proxyList[i];
-				if (itemStr === oldProxy) {
-					matchIndex = i;
-					break;
-				}
+		for (let i = 0; i < proxyList.length; i++) {
+			let itemStr = typeof proxyList[i] === "object" && proxyList[i] !== null ? proxyList[i].proxy : proxyList[i];
+			if (itemStr === oldProxy) {
+				matchIndex = i;
+				break;
 			}
 		}
 		if (matchIndex === -1) {
@@ -915,13 +890,9 @@ async function replaceBrokenProxy(username, env, oldProxy, forceCountry) {
 			} catch (e) { }
 		};
 		
-		let countryCode = forceCountry
-			? forceCountry
-			: (typeof proxyList[matchIndex] === "object" && proxyList[matchIndex] !== null && proxyList[matchIndex].country ? proxyList[matchIndex].country : "all");
+		let countryCode = typeof proxyList[matchIndex] === "object" && proxyList[matchIndex] !== null && proxyList[matchIndex].country ? proxyList[matchIndex].country : "all";
 		
-		// forceCountry already tells us exactly which country this slot is - oldProxy is ""
-		// in that case (nothing to connect to for a geo-lookup), so skip this detection block.
-		if (!forceCountry && (countryCode === "all" || countryCode === "UN")) {
+		if (countryCode === "all" || countryCode === "UN") {
 			try {
 				const payload = new TextEncoder().encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
 				const s = await connectProxy(oldProxy, "ip-api.com", 80, payload);
@@ -1009,11 +980,6 @@ async function replaceBrokenProxy(username, env, oldProxy, forceCountry) {
 					});
 					
 					try {
-						// Same geo-verification pattern as testVipCountryProxy: a raw TCP-alive
-						// check isn't enough - a proxy can be perfectly "alive" while exiting from
-						// the wrong country (that was cause #1 of the original VIP-IP bug, and this
-						// loop is the one place it had NOT actually been applied yet), so every
-						// candidate here must also report back the expected countryCode.
 						newProxy = await Promise.any(
 							testBatch.map((p) => {
 								return new Promise(async (resolve, reject) => {
@@ -1023,23 +989,13 @@ async function replaceBrokenProxy(username, env, oldProxy, forceCountry) {
 										reject(new Error("timeout"));
 									}, 4000); 
 									try {
-										const payload = TEXT_ENCODER.encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
-										sock = await connectProxy(p, "ip-api.com", 80, payload);
+										const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+										sock = await connectProxy(p, "1.1.1.1", 80, payload);
 										const reader = sock.readable.getReader();
-										const dec = new TextDecoder();
-										let resStr = "";
-										while (true) {
-											const readRes = await reader.read();
-											if (readRes.done || !readRes.value) break;
-											resStr += dec.decode(readRes.value, { stream: true });
-											if (resStr.includes("countryCode")) break;
-										}
+										const res = await reader.read();
 										clearTimeout(timeoutId);
 										try { sock.close(); } catch (e) { }
-										if (!resStr) { reject(new Error("empty")); return; }
-										const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
-										const gotCC = (jsonMatch && jsonMatch[1]) ? jsonMatch[1].toUpperCase() : "";
-										if (gotCC && gotCC !== upperCountry) reject(new Error("country-mismatch:" + gotCC));
+										if (res.done || !res.value) reject(new Error("empty"));
 										else resolve(p);
 									} catch (e) {
 										clearTimeout(timeoutId);
@@ -3600,14 +3556,8 @@ function decodeInlinePanelIPs(segment) {
 		return null;
 	}
 }
-// Same lookup as before, but also returns which country the request actually asked for -
-// even when that slot's proxy comes back empty ("" - meaning still un-healed) or the slot
-// lost its own country tag (see preserveProxyCountryTags). The country-code path segment
-// (new-format links) tells us the intended country directly from the URL, independent of
-// what's currently stored in user_socks5, so callers can trigger a targeted heal for exactly
-// that country even when the array itself has nothing usable for it yet.
-function getSelectedUserProxySlot(userSocks5, request) {
-	if (!userSocks5) return { proxy: "", country: null };
+function getSelectedUserProxy(userSocks5, request) {
+	if (!userSocks5) return "";
 	let proxyList = [];
 	try {
 		if (userSocks5.trim().startsWith("[")) {
@@ -3618,9 +3568,8 @@ function getSelectedUserProxySlot(userSocks5, request) {
 	} catch (e) {
 		proxyList = [userSocks5];
 	}
-	if (!Array.isArray(proxyList) || proxyList.length === 0) return { proxy: "", country: null };
+	if (!Array.isArray(proxyList) || proxyList.length === 0) return "";
 	let idx = -1;
-	let requestedCountry = null;
 	if (request) {
 		try {
 			const url = new URL(request.url);
@@ -3634,7 +3583,6 @@ function getSelectedUserProxySlot(userSocks5, request) {
 			const lastSeg = decodeURIComponent(segments[segments.length - 1] || "");
 			const countryForCode = getCountryForPathSegment(lastSeg);
 			if (countryForCode) {
-				requestedCountry = countryForCode;
 				idx = proxyList.findIndex((p) => typeof p === "object" && p !== null && (p.country || "").toUpperCase() === countryForCode);
 			} else {
 				const pathMatch = url.pathname.match(/\/loc-(\d+)/);
@@ -3649,17 +3597,9 @@ function getSelectedUserProxySlot(userSocks5, request) {
 			}
 		} catch (e) { }
 	}
-	if (idx === -1) return { proxy: "", country: requestedCountry };
+	if (idx === -1) return "";
 	const selected = proxyList[idx] || proxyList[0];
-	const proxy = typeof selected === "object" ? selected.proxy || "" : String(selected || "");
-	// Legacy /loc-N links don't tell us the country from the URL, so fall back to whatever
-	// tag the slot itself still carries (requestedCountry stays null for those unless the
-	// new-format path matched above).
-	const country = requestedCountry || (typeof selected === "object" && selected !== null ? selected.country || null : null);
-	return { proxy, country };
-}
-function getSelectedUserProxy(userSocks5, request) {
-	return getSelectedUserProxySlot(userSocks5, request).proxy;
+	return typeof selected === "object" ? selected.proxy || "" : String(selected || "");
 }
 async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	let rawClientIP = request ? request.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
@@ -4383,7 +4323,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					}
 					const task = (async () => {
 						let s = null;
-						const { proxy: socks5, country: selectedCountry } = getSelectedUserProxySlot(user?.user_socks5, request);
+						const socks5 = getSelectedUserProxy(user?.user_socks5, request);
 						if (socks5) {
 							try {
 								s = await connectProxy(socks5, addr, port, dataPayload);
@@ -4396,19 +4336,6 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 								throw proxyErr;
 							}
 						} else {
-							// The requested country resolved to a slot with no proxy yet (e.g. the
-							// VIP pool had nothing testable when this slot was first created/merged -
-							// see buildPinnedDefaultProxyList/mergePinnedLocationsForUser). Nothing here
-							// ever called replaceBrokenProxy for this case before, so a slot like this
-							// stayed empty - and this config kept showing the Cloudflare/direct IP -
-							// forever. Kick off a targeted background heal for just this one country;
-							// it can't fix *this* connection (nothing to wait on mid-handshake), but the
-							// next connection to this same country will get a real VIP proxy once it lands.
-							if (selectedCountry && user.auto_rotate_user_proxy === 1) {
-								const healTask = replaceBrokenProxy(user.username, env, "", selectedCountry);
-								if (ctx) ctx.waitUntil(healTask);
-								else healTask.catch(() => { });
-							}
 							try {
 								s = await connectDirect(addr, port, dataPayload, targetDoh);
 							} catch (directErr) {
