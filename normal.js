@@ -54,6 +54,74 @@ async function fetchWithFallback(path, options = {}) {
 	}
 	return new Response(null, { status: 500 });
 }
+
+// --- منبع یکپارچه‌ی فایل‌های مخزن (proxy_vip/<CC>.txt و ...) ---
+// همه‌ی جاهایی که به یک فایل کشور خاص نیاز دارند، به‌جای فراخوانی مستقیم
+// fetchWithFallback از این تابع عبور می‌کنند. نتیجه‌ی هر مسیر، به همراه
+// زمان دریافتش، در همین یک Map نگه داشته می‌شود - یعنی «یک جا».
+// اگر داخل TTL باشیم، از کش برمی‌گردد و هیچ درخواستی به لینک‌ها زده نمی‌شود؛
+// در غیر این صورت دوباره از لینک‌ها (fetchWithFallback) گرفته و کش می‌شود.
+// اگر گرفتن نسخه‌ی تازه شکست بخورد ولی نسخه‌ی قدیمی در کش باشد، همان نسخه‌ی
+// قدیمی برگردانده می‌شود (به‌جای null) تا یک قطعی موقت لینک‌ها باعث از کار
+// افتادن کامل روتیشن/تست پروکسی نشود.
+const REPO_FILE_CACHE = new Map();
+async function getCachedRepoFile(path, ttl = 900000) { // پیش‌فرض: ۱۵ دقیقه
+	const now = Date.now();
+	const cached = REPO_FILE_CACHE.get(path);
+	if (cached && (now - cached.timestamp < ttl)) {
+		return cached.data;
+	}
+	try {
+		const res = await fetchWithFallback(path);
+		if (res.ok) {
+			const text = await res.text();
+			REPO_FILE_CACHE.set(path, { data: text, timestamp: now });
+			return text;
+		}
+	} catch (e) { }
+	return cached ? cached.data : null;
+}
+
+// برای دکمه‌ی «دریافت کامل لیست پروکسی‌های VIP» توی Settings: لیست کشورهای
+// مخزن VIP (vip-list) رو تازه می‌گیره و بعد تک‌تک اون‌ها (proxy_vip/<CC>.txt)
+// رو هم تازه می‌گیره - نه از کش قدیمی، چون این یه درخواست صریح برای بروزرسانیه.
+// نتیجه‌ی هر کشور توی همون REPO_FILE_CACHE مشترک می‌شینه (همون «یک جا»یی که
+// getCachedRepoFile هم ازش می‌خونه)، پس بعد از این تابع، تست/رول‌آور پروکسی
+// دیگه تا پایان TTL نیازی به فچ دوباره از لینک‌ها نداره.
+// فقط مسیر proxy_vip/ (اختصاصی/VIP) - نه proxy/ عمومی که صدها خط داره.
+async function syncAllVipProxies() {
+	const now = Date.now();
+	const listRes = await fetchWithFallback("vip-list");
+	if (!listRes.ok) throw new Error("لیست کشورهای VIP در حال حاضر در دسترس نیست");
+	const files = await listRes.json();
+	const countries = (Array.isArray(files) ? files : [])
+		.filter((f) => f && f.name && f.name.endsWith(".txt"))
+		.map((f) => f.name.replace(".txt", "").toUpperCase());
+	if (countries.length === 0) throw new Error("هیچ کشوری در مخزن VIP یافت نشد");
+
+	const perCountry = {};
+	let totalProxies = 0;
+	await Promise.all(
+		countries.map(async (cc) => {
+			try {
+				const res = await fetchWithFallback(`proxy_vip/${cc}.txt`);
+				if (!res.ok) {
+					perCountry[cc] = 0;
+					return;
+				}
+				const text = await res.text();
+				const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+				REPO_FILE_CACHE.set(`proxy_vip/${cc}.txt`, { data: text, timestamp: now });
+				perCountry[cc] = lines.length;
+				totalProxies += lines.length;
+			} catch (e) {
+				perCountry[cc] = 0;
+			}
+		}),
+	);
+
+	return { countries, perCountry, totalCountries: countries.length, totalProxies, fetchedAt: now };
+}
 let localLastAutoResetCheck = 0;
 async function checkAutoResets(env, ctx) {
 	const now = Date.now();
@@ -516,9 +584,8 @@ const PINNED_PROVISION_TEST_LIMIT = 3;
 // country's VIP list itself is missing or empty.
 async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LIMIT) {
 	try {
-		const res = await fetchWithFallback(`proxy_vip/${country}.txt`);
-		if (!res.ok) return null;
-		const text = await res.text();
+		const text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
+		if (!text) return null;
 		const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
 		if (lines.length === 0) return null;
 		for (let i = lines.length - 1; i > 0; i--) {
@@ -878,9 +945,8 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 		
 		for (const src of sources) {
 			try {
-				const res = await fetchWithFallback(src.url);
-				if (!res.ok) continue;
-				const text = await res.text();
+				const text = await getCachedRepoFile(src.url);
+				if (!text) continue;
 				const lines = text
 					.split("\n")
 					.map((l) => l.trim())
@@ -1772,6 +1838,17 @@ const Router = {
 					}
 				}
 				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied }), { headers: { "Content-Type": "application/json" } });
+			}
+		}
+		// دکمه‌ی «دریافت کامل لیست پروکسی‌های VIP» توی Settings. فقط مخزن VIP
+		// (proxy_vip/*.txt) رو به‌تفکیک هر کشور تازه می‌گیره و کش می‌کنه؛ به لیست
+		// عمومی proxy/ کاری نداره.
+		if (url.pathname === "/api/settings/sync-vip-proxies" && request.method === "POST") {
+			try {
+				const result = await syncAllVipProxies();
+				return new Response(JSON.stringify({ success: true, ...result }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ error: e.message || "خطا در دریافت مخزن VIP" }), { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } });
 			}
 		}
 		if (url.pathname === "/api/proxy-ip") {
@@ -6991,6 +7068,12 @@ Commercial support is available at
 					</div>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🌍 مخزن پروکسی‌های VIP</h5>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mb-2">تک‌تک کشورهای مخزن VIP (نه لیست عمومی که چندصد خط دارد) را می‌گیرد و در کش سرور ذخیره می‌کند تا تعویض/رول‌آور پروکسی کاربرها سریع‌تر انجام شود.</p>
+					<button type="button" onclick="syncVipProxies()" id="sync-vip-proxies-btn" class="w-full py-2 bg-teal-700 hover:bg-teal-800 dark:bg-teal-600 dark:hover:bg-teal-700 text-white font-bold rounded-md text-xs transition shadow-sm disabled:opacity-50 disabled:cursor-not-allowed">دریافت کامل لیست پروکسی‌های VIP (همه‌ی کشورها)</button>
+					<p id="vip-sync-result" class="text-[10px] text-gray-500 dark:text-zinc-400 mt-2"></p>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
 						پورت
@@ -10301,6 +10384,32 @@ window.saveSettings = async function() {
 		showToast('❌ ذخیره‌سازی تنظیمات ناموفق بود.');
 	} finally {
 		buttons.forEach(function(b) { b.disabled = false; });
+	}
+};
+// دکمه‌ی «دریافت کامل لیست پروکسی‌های VIP» توی Settings: لیست کشورهای مخزن VIP
+// (vip-list) رو می‌گیره و تک‌تک اون‌ها رو (proxy_vip/<CC>.txt) از سرور می‌خواد؛
+// سرور همه‌شون رو تازه می‌کنه و توی REPO_FILE_CACHE نگه می‌داره تا رول‌آور/تعویض
+// پروکسی کاربرها دیگه لازم نباشه هر بار دوباره از لینک‌ها بگیره. فقط مخزن VIP -
+// نه لیست عمومی proxy/ که تعدادش به صدها می‌رسه.
+window.syncVipProxies = async function() {
+	const btn = document.getElementById('sync-vip-proxies-btn');
+	const resultEl = document.getElementById('vip-sync-result');
+	const originalLabel = 'دریافت کامل لیست پروکسی‌های VIP (همه‌ی کشورها)';
+	if (btn) { btn.disabled = true; btn.innerText = 'در حال دریافت از مخزن...'; }
+	if (resultEl) resultEl.innerText = '';
+	try {
+		const res = await fetch('/api/settings/sync-vip-proxies', { method: 'POST' });
+		const data = await res.json();
+		if (!res.ok || data.error) throw new Error(data.error || 'خطای نامشخص');
+		if (resultEl) {
+			resultEl.innerText = '✅ ' + data.totalCountries + ' کشور - مجموعاً ' + data.totalProxies + ' پروکسی VIP دریافت و در سرور کش شد.';
+		}
+		showToast('✅ مخزن VIP به‌روزرسانی شد (' + data.totalCountries + ' کشور).');
+	} catch (e) {
+		if (resultEl) resultEl.innerText = '❌ ' + (e.message || 'دریافت مخزن VIP ناموفق بود.');
+		showToast('❌ دریافت مخزن VIP ناموفق بود.', 'error');
+	} finally {
+		if (btn) { btn.disabled = false; btn.innerText = originalLabel; }
 	}
 };
 window.resetUserToDefaultPending = false;
