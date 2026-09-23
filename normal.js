@@ -61,6 +61,53 @@ async function fetchWithFallback(path, options = {}) {
 	}
 	return new Response(null, { status: 500 });
 }
+// کش مشترک فایل‌های مخزن (proxy_vip/*.txt و غیره) — به‌جای فراخوانی مستقیم fetchWithFallback در
+// هر جا، این تابع یک بار فچ می‌کند و تا پایان TTL از حافظه برمی‌گرداند. در حافظه‌ی ایزوله‌ی Worker
+// است (نه D1/KV)، پس با هر cold start خالی می‌شود.
+const REPO_FILE_CACHE = new Map();
+async function getCachedRepoFile(path, ttl = 900000) { // پیش‌فرض: ۱۵ دقیقه
+	const now = Date.now();
+	const cached = REPO_FILE_CACHE.get(path);
+	if (cached && (now - cached.timestamp < ttl)) return cached.data;
+	try {
+		const res = await fetchWithFallback(path);
+		if (res.ok) {
+			const text = await res.text();
+			REPO_FILE_CACHE.set(path, { data: text, timestamp: now });
+			return text;
+		}
+	} catch (e) { }
+	return cached ? cached.data : null; // اگه فچ تازه خراب شد، نسخه‌ی قدیمی رو بده نه خالی
+}
+// همیشه تازه می‌گیرد (نه از کش) چون فراخوانی‌اش یعنی کاربر صریحاً خواسته بروزرسانی شود؛ ولی نتیجه
+// را در REPO_FILE_CACHE می‌نویسد تا بعد از آن getCachedRepoFile (testVipCountryProxy/replaceBrokenProxy)
+// تا پایان TTL از همین نسخه‌ی تازه استفاده کنند. فقط proxy_vip/*.txt — به فایل‌های عمومی کاری ندارد.
+async function syncAllVipProxies() {
+	const now = Date.now();
+	const listRes = await fetchWithFallback("vip-list");
+	if (!listRes.ok) throw new Error("لیست کشورهای VIP در حال حاضر در دسترس نیست");
+	const files = await listRes.json();
+	const countries = (Array.isArray(files) ? files : [])
+		.filter((f) => f && f.name && f.name.endsWith(".txt"))
+		.map((f) => f.name.replace(".txt", "").toUpperCase());
+	if (countries.length === 0) throw new Error("هیچ کشوری در مخزن VIP یافت نشد");
+
+	const perCountry = {};
+	let totalProxies = 0;
+	await Promise.all(countries.map(async (cc) => {
+		try {
+			const res = await fetchWithFallback(`proxy_vip/${cc}.txt`);
+			if (!res.ok) { perCountry[cc] = 0; return; }
+			const text = await res.text();
+			const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+			REPO_FILE_CACHE.set(`proxy_vip/${cc}.txt`, { data: text, timestamp: now });
+			perCountry[cc] = lines.length;
+			totalProxies += lines.length;
+		} catch (e) { perCountry[cc] = 0; }
+	}));
+
+	return { countries, perCountry, totalCountries: countries.length, totalProxies, fetchedAt: now };
+}
 // Both update endpoints (/api/update-panel, /api/update-panel-github) upload the fetched file to
 // Cloudflare unchanged, as an ES module (main_module: "zeus.js"). The plain decoded source (vX_Y.js)
 // is only a function BODY that ends with a top-level "return" of the worker object - it is not a
@@ -573,9 +620,8 @@ const PINNED_PROVISION_TEST_LIMIT = 3;
 // country's VIP list itself is missing or empty.
 async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LIMIT) {
 	try {
-		const res = await fetchWithFallback(`proxy_vip/${country}.txt`);
-		if (!res.ok) return null;
-		const text = await res.text();
+		const text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
+		if (!text) return null;
 		const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
 		if (lines.length === 0) return null;
 		for (let i = lines.length - 1; i > 0; i--) {
@@ -935,9 +981,8 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 		
 		for (const src of sources) {
 			try {
-				const res = await fetchWithFallback(src.url);
-				if (!res.ok) continue;
-				const text = await res.text();
+				const text = await getCachedRepoFile(src.url);
+				if (!text) continue;
 				const lines = text
 					.split("\n")
 					.map((l) => l.trim())
@@ -1905,6 +1950,32 @@ const Router = {
 					}
 				}
 				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
+			}
+		}
+		if (url.pathname === "/api/settings/sync-vip-proxies") {
+			if (request.method === "POST") {
+				try {
+					const result = await syncAllVipProxies();
+					return new Response(JSON.stringify({ success: true, ...result }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+				} catch (e) {
+					return new Response(JSON.stringify({ error: e.message || "خطا در دریافت مخزن VIP" }), { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+			}
+			// GET: بدون فچ تازه، همون چیزی که الان توی REPO_FILE_CACHE هست را (فقط کلیدهای proxy_vip/*)
+			// به تفکیک کشور برمی‌گرداند — برای پاپ‌آپ «مشاهده لیست کش‌شده» در Settings.
+			if (request.method === "GET") {
+				const perCountry = {};
+				let fetchedAt = null;
+				for (const [key, entry] of REPO_FILE_CACHE) {
+					const m = key.match(/^proxy_vip\/([A-Za-z0-9]+)\.txt$/);
+					if (!m) continue;
+					const cc = m[1].toUpperCase();
+					const lines = (entry.data || "").split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+					if (lines.length === 0) continue;
+					perCountry[cc] = lines;
+					if (fetchedAt === null || entry.timestamp > fetchedAt) fetchedAt = entry.timestamp;
+				}
+				return new Response(JSON.stringify({ success: true, perCountry, totalCountries: Object.keys(perCountry).length, fetchedAt }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
 			}
 		}
 		if (url.pathname === "/api/proxy-ip") {
@@ -7293,6 +7364,17 @@ Commercial support is available at
 					</div>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🌍 مخزن پروکسی‌های VIP</h5>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mb-2">تک‌تک کشورهای مخزن VIP (نه لیست عمومی که چندصد خط دارد) را می‌گیرد و در کش سرور ذخیره می‌کند...</p>
+					<div class="flex items-center gap-2">
+						<button type="button" onclick="syncVipProxies()" id="sync-vip-proxies-btn" class="flex-1 py-2 bg-emerald-700 hover:bg-emerald-800 dark:bg-emerald-600 dark:hover:bg-emerald-700 text-white rounded-md text-xs font-bold transition shadow-sm">دریافت کامل لیست پروکسی‌های VIP (همه‌ی کشورها)</button>
+						<button type="button" onclick="showVipProxiesCache()" id="view-vip-proxies-cache-btn" title="مشاهده لیست کش‌شده" class="px-3 py-2 bg-gray-600 hover:bg-gray-700 dark:bg-zinc-600 dark:hover:bg-zinc-700 text-white rounded-md text-xs font-bold transition shadow-sm">
+							<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>
+						</button>
+					</div>
+					<p id="vip-sync-result" class="text-[10px] text-gray-500 dark:text-zinc-400 mt-2"></p>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
 						پورت
@@ -7505,6 +7587,29 @@ Commercial support is available at
 			</button>
 		</div>
 	</div>
+<div id="vip-proxies-cache-modal" class="fixed inset-0 z-[95] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300 ease-out">
+	<div class="w-full max-w-lg bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh]">
+		<div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50 flex-shrink-0">
+			<h3 class="font-bold text-gray-900 dark:text-zinc-100 text-sm flex items-center gap-2">
+				<svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 001-9.9V8a5 5 0 00-9.3-2.5A4 4 0 003 8.5"></path></svg>
+				مخزن VIP کش‌شده
+				<span id="vip-cache-total-badge" class="text-[10px] font-normal text-gray-400 dark:text-zinc-500"></span>
+			</h3>
+			<button type="button" onclick="toggleVipProxiesCacheModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
+				<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+			</button>
+		</div>
+		<div class="px-5 pt-3 flex-shrink-0">
+			<input type="text" id="vip-cache-filter-input" oninput="renderVipProxiesCache()" placeholder="فیلتر بر اساس کد کشور..." dir="ltr" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+		</div>
+		<div id="vip-cache-list" class="p-5 space-y-2 overflow-y-auto flex-1">
+			<p class="text-xs text-gray-400 dark:text-zinc-500 text-center py-6">در حال بارگذاری...</p>
+		</div>
+		<div class="p-4 border-t border-gray-150 dark:border-amoled-border bg-gray-50 dark:bg-zinc-900/50 flex-shrink-0">
+			<button type="button" onclick="toggleVipProxiesCacheModal(false)" class="w-full py-2.5 bg-gray-600 hover:bg-gray-700 dark:bg-zinc-600 dark:hover:bg-zinc-700 text-white font-bold rounded-md text-xs transition shadow-sm">بستن</button>
+		</div>
+	</div>
+</div>
 <div id="update-modal" class="fixed inset-0 z-[90] flex items-center justify-center p-4 bg-black/60  opacity-0 pointer-events-none transition-all duration-300 ease-out">
 	<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
 		<div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-500 mb-4 shadow-inner">
@@ -10642,6 +10747,104 @@ window.saveSettings = async function() {
 		buttons.forEach(function(b) { b.disabled = false; });
 	}
 };
+window.syncVipProxies = async function() {
+	const btn = document.getElementById('sync-vip-proxies-btn');
+	const resultEl = document.getElementById('vip-sync-result');
+	const originalLabel = 'دریافت کامل لیست پروکسی‌های VIP (همه‌ی کشورها)';
+	if (btn) { btn.disabled = true; btn.innerText = 'در حال دریافت از مخزن...'; }
+	if (resultEl) resultEl.innerText = '';
+	try {
+		const res = await fetch('/api/settings/sync-vip-proxies', { method: 'POST' });
+		const data = await res.json();
+		if (!res.ok || data.error) throw new Error(data.error || 'خطای نامشخص');
+		if (resultEl) resultEl.innerText = '✅ ' + data.totalCountries + ' کشور - مجموعاً ' + data.totalProxies + ' پروکسی VIP دریافت و در سرور کش شد.';
+		showToast('✅ مخزن VIP به‌روزرسانی شد (' + data.totalCountries + ' کشور).');
+		// کش تازه شد؛ طبق درخواست، پاپ‌آپ لیست کش‌شده رو خودکار باز می‌کنیم.
+		showVipProxiesCache();
+	} catch (e) {
+		if (resultEl) resultEl.innerText = '❌ ' + (e.message || 'دریافت مخزن VIP ناموفق بود.');
+		showToast('❌ دریافت مخزن VIP ناموفق بود.', 'error');
+	} finally {
+		if (btn) { btn.disabled = false; btn.innerText = originalLabel; }
+	}
+};
+// --- پاپ‌آپ «مشاهده لیست کش‌شده»: هر بار که باز می‌شود، وضعیت فعلی REPO_FILE_CACHE (سمت سرور) را
+// از GET /api/settings/sync-vip-proxies می‌خواند و به تفکیک کشور (آکاردئون قابل باز/بسته‌شدن) نشان
+// می‌دهد. با کلیک روی «دریافت کامل لیست» هم خودکار باز می‌شود (بالا).
+let VIP_CACHE_DATA = {};
+function toggleVipProxiesCacheModal(show) { setModalState('vip-proxies-cache-modal', show); }
+window.showVipProxiesCache = async function() {
+	toggleVipProxiesCacheModal(true);
+	const listEl = document.getElementById('vip-cache-list');
+	if (listEl) listEl.innerHTML = '<p class="text-xs text-gray-400 dark:text-zinc-500 text-center py-6">در حال بارگذاری...</p>';
+	try {
+		const res = await fetch('/api/settings/sync-vip-proxies', { method: 'GET' });
+		const data = await res.json();
+		if (!res.ok || data.error) throw new Error(data.error || 'خطای نامشخص');
+		VIP_CACHE_DATA = data.perCountry || {};
+		renderVipProxiesCache();
+	} catch (e) {
+		if (listEl) listEl.innerHTML = '<p class="text-xs text-red-500 text-center py-6">❌ ' + (e.message || 'خطا در خواندن کش') + '</p>';
+	}
+};
+function escVipCacheText(s) {
+	return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function renderVipProxiesCache() {
+	const listEl = document.getElementById('vip-cache-list');
+	const badgeEl = document.getElementById('vip-cache-total-badge');
+	if (!listEl) return;
+	const filterInput = document.getElementById('vip-cache-filter-input');
+	const filterVal = filterInput ? filterInput.value.trim().toUpperCase() : '';
+	const countries = Object.keys(VIP_CACHE_DATA).sort();
+	const filtered = filterVal ? countries.filter(function(cc) { return cc.indexOf(filterVal) !== -1; }) : countries;
+	const totalProxies = countries.reduce(function(sum, cc) { return sum + (VIP_CACHE_DATA[cc] || []).length; }, 0);
+	if (badgeEl) badgeEl.innerText = countries.length ? ('(' + countries.length + ' کشور - ' + totalProxies + ' پروکسی)') : '';
+	if (countries.length === 0) {
+		listEl.innerHTML = '<p class="text-xs text-gray-400 dark:text-zinc-500 text-center py-6">چیزی کش نشده. اول از دکمه‌ی «دریافت کامل لیست پروکسی‌های VIP» استفاده کنید.</p>';
+		return;
+	}
+	if (filtered.length === 0) {
+		listEl.innerHTML = '<p class="text-xs text-gray-400 dark:text-zinc-500 text-center py-6">نتیجه‌ای برای این فیلتر نیست.</p>';
+		return;
+	}
+	listEl.innerHTML = filtered.map(function(cc) {
+		const proxies = VIP_CACHE_DATA[cc] || [];
+		const flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(cc) : '🌐';
+		return '<div class="border border-gray-200 dark:border-amoled-border rounded-md overflow-hidden">' +
+			'<button type="button" onclick="toggleVipCacheCountry(\'' + cc + '\')" class="w-full flex items-center justify-between px-3 py-2 bg-gray-50 dark:bg-zinc-900/40 hover:bg-gray-100 dark:hover:bg-zinc-800 transition text-xs font-bold text-gray-700 dark:text-zinc-200">' +
+				'<span class="flex items-center gap-2">' + flag + ' ' + cc + '</span>' +
+				'<span class="flex items-center gap-2 text-[10px] font-normal text-gray-400 dark:text-zinc-500">' + proxies.length + ' پروکسی' +
+					'<svg id="vip-cache-chevron-' + cc + '" class="w-3.5 h-3.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>' +
+				'</span>' +
+			'</button>' +
+			'<div id="vip-cache-country-' + cc + '" class="hidden px-3 py-2 border-t border-gray-200 dark:border-amoled-border bg-white dark:bg-amoled-input">' +
+				'<textarea readonly dir="ltr" class="w-full text-[10px] font-mono text-left text-gray-700 dark:text-zinc-300 bg-transparent resize-none focus:outline-none" rows="' + Math.min(10, Math.max(2, proxies.length)) + '">' + escVipCacheText(proxies.join('\n')) + '</textarea>' +
+				'<button type="button" onclick="copyVipCacheCountry(\'' + cc + '\')" class="mt-1 w-full flex items-center justify-center gap-1.5 py-1.5 bg-gray-100 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-gray-600 dark:text-zinc-300 hover:bg-gray-200 dark:hover:bg-zinc-700/80 rounded text-[10px] font-bold transition">کپی همه‌ی پروکسی‌های ' + cc + '</button>' +
+			'</div>' +
+		'</div>';
+	}).join('');
+}
+function toggleVipCacheCountry(cc) {
+	const el = document.getElementById('vip-cache-country-' + cc);
+	const chevron = document.getElementById('vip-cache-chevron-' + cc);
+	if (!el) return;
+	el.classList.toggle('hidden');
+	if (chevron) chevron.classList.toggle('rotate-180');
+}
+function copyVipCacheCountry(cc) {
+	const proxies = VIP_CACHE_DATA[cc] || [];
+	const text = proxies.join('\n');
+	if (navigator.clipboard && navigator.clipboard.writeText) {
+		navigator.clipboard.writeText(text).then(function() {
+			showToast('✅ لیست ' + cc + ' کپی شد.');
+		}).catch(function() {
+			showToast('❌ کپی ناموفق بود.', 'error');
+		});
+	} else {
+		showToast('❌ کپی خودکار در این مرورگر پشتیبانی نمی‌شود.', 'error');
+	}
+}
 window.resetUserToDefaultPending = false;
 window.syncResetUserUi = function(showBtn) {
 	window.resetUserToDefaultPending = false;
@@ -11573,6 +11776,7 @@ function applySelectedIps() {
 					const cancelBtn = document.getElementById('custom-confirm-cancel');
 					if (cancelBtn) cancelBtn.click();
 				}
+				if (e.target.id === 'vip-proxies-cache-modal') toggleVipProxiesCacheModal(false);
 			});
 		});
 function toggleProxySelectorModal(show) { setModalState('proxy-selector-modal', show); }
