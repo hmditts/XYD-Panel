@@ -8184,7 +8184,6 @@ let activeRocketBtn = null;
 			const enableDirectCheck = document.getElementById('input-enable-direct');
 			if (enableDirectCheck) enableDirectCheck.checked = nud.enable_direct;
 			window.proxyFieldsData = [""];
-			window.proxyFieldsCountries = [""];
 			window.activeProxyIndex = 0;
 			if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
 			const autoRotateIpToggle = document.getElementById('input-auto-rotate-ip-toggle');
@@ -9059,22 +9058,10 @@ let activeRocketBtn = null;
 			const userProxyMode = document.getElementById('user-proxy-mode-toggle') ? document.getElementById('user-proxy-mode-toggle').checked : false;
 			let userSocks5 = null;
 			if (userProxyMode && window.proxyFieldsData && window.proxyFieldsData.length > 0) {
-				// Re-attach each slot's country tag (if any) when building the payload, so a save
-				// no longer wipes proxyFieldsCountries on the server side - preserveProxyCountryTags()
-				// there is still a fallback, but it can only guess by matching the proxy string, which
-				// silently failed for any slot with an empty/untested proxy (a common case - see
-				// buildPinnedDefaultProxyList). Sending the tag directly here fixes that for good.
-				const proxyTags = Array.isArray(window.proxyFieldsCountries) ? window.proxyFieldsCountries : [];
-				const cleanProxies = [];
-				window.proxyFieldsData.forEach((p, i) => {
-					const val = p ? String(p).trim() : "";
-					if (val === "") return;
-					const cc = proxyTags[i] ? String(proxyTags[i]).trim().toUpperCase() : "";
-					cleanProxies.push(cc ? { proxy: val, country: cc } : val);
-				});
-				if (cleanProxies.length === 1 && typeof cleanProxies[0] === "string") {
+				const cleanProxies = window.proxyFieldsData.map(p => p ? p.trim() : "").filter(p => p !== "");
+				if (cleanProxies.length === 1) {
 					userSocks5 = cleanProxies[0];
-				} else if (cleanProxies.length > 0) {
+				} else if (cleanProxies.length > 1) {
 					userSocks5 = JSON.stringify(cleanProxies);
 				}
 			}
@@ -9131,12 +9118,6 @@ let activeRocketBtn = null;
 		}
 window.activeProxyIndex = 0;
 window.proxyFieldsData = [""];
-// Parallel array (same length/order as proxyFieldsData): the pinned country code (e.g. "UZ")
-// each slot is tagged with, or "" when the slot has no country (a manually-added extra proxy).
-// Kept only for display + resubmitting the tag - see populateUserFormFields() and the submit
-// handler for why this exists (renderProxyFieldsUI reads it, addProxyFieldUI/removeProxyFieldUI
-// keep it in sync with proxyFieldsData).
-window.proxyFieldsCountries = [""];
 window.clearProxyFieldUI = function(idx) {
 	window.proxyFieldsData[idx] = "";
 	if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
@@ -9157,24 +9138,13 @@ window.renderProxyFieldsUI = function() {
 		const pingObj = proxyStr ? (window.proxyPingMap && window.proxyPingMap[proxyStr]) : null;
 		const pingClass = pingObj ? pingObj.className : "text-[10px] font-bold text-center block min-h-[18px] mt-0.5 transition-colors";
 		const pingText = pingObj ? pingObj.text : "";
-		// The pinned country this slot is tagged with (from user_socks5's {proxy,country} - see
-		// populateUserFormFields()), if any. Takes priority over the ping-test flag guess below,
-		// since the tag is the real, saved location for this slot even when the proxy field is
-		// still empty or has never been tested.
-		const tagCountry = (Array.isArray(window.proxyFieldsCountries) && window.proxyFieldsCountries[idx]) ? String(window.proxyFieldsCountries[idx]).toUpperCase() : "";
-		let countryCode = tagCountry || "UN";
-		if (!tagCountry && proxyStr && proxyFlagCache[proxyStr]) {
+		let countryCode = "UN";
+		if (proxyStr && proxyFlagCache[proxyStr]) {
 			countryCode = proxyFlagCache[proxyStr].toUpperCase();
 		}
 		const isVip = proxyStr.length > 0 && (proxyStr.includes('@') || proxyStr.includes('pass=') || proxyStr.includes('t.me/'));
-		let countryBadgeHtml = '';
-		if (tagCountry) {
-			const badgeFlag = typeof getFlagEmoji === 'function' ? getFlagEmoji(tagCountry) : '🌐';
-			countryBadgeHtml = '<span class="w-7 h-7 flex-shrink-0 flex items-center justify-center rounded bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-amoled-border" title="لوکیشن پین‌شده: ' + tagCountry + '"><span class="text-sm leading-none">' + badgeFlag + '</span></span>';
-		}
 		let inputRow = '<div class="flex items-center gap-1 w-full">' +
-			'<button type="button" onclick="swapProxyFieldUI(' + idx + ')" class="w-7 h-7 flex-shrink-0 bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white rounded flex items-center justify-center font-bold text-xs shadow-sm transition-all" title="جا به جایی پروکسی"><svg id="swap-icon-' + idx + '" class="w-3.5 h-3.5 transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg></button>' +
-			countryBadgeHtml;
+			'<button type="button" onclick="swapProxyFieldUI(' + idx + ')" class="w-7 h-7 flex-shrink-0 bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white rounded flex items-center justify-center font-bold text-xs shadow-sm transition-all" title="جا به جایی پروکسی"><svg id="swap-icon-' + idx + '" class="w-3.5 h-3.5 transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg></button>';
 		const vipBorderClass = isFocused ? "ring-2 ring-blue-500 border-blue-500" : "border-green-400 dark:border-green-600";
 		if (isVip) {
 			let flagHtml = typeof getFlagEmoji === 'function' ? getFlagEmoji(countryCode) : '🌐';
@@ -9191,7 +9161,7 @@ window.renderProxyFieldsUI = function() {
 							'</div>' +
 						'</div>';
 		} else {
-			inputRow += '<input type="text" id="proxy-field-box-' + idx + '" value="' + proxyStr + '" onfocus="setActiveProxyField(' + idx + ')" onclick="setActiveProxyField(' + idx + ')" oninput="updateProxyFieldData(' + idx + ', this.value)" placeholder="socks5:// یا http:// (کشور ' + (tagCountry || (idx + 1)) + ')" dir="ltr" class="flex-1 px-2 py-1.5 bg-gray-50 dark:bg-slate-900 border ' + borderClass + ' rounded text-xs font-mono focus:outline-none text-gray-800 dark:text-zinc-100 transition">';
+			inputRow += '<input type="text" id="proxy-field-box-' + idx + '" value="' + proxyStr + '" onfocus="setActiveProxyField(' + idx + ')" onclick="setActiveProxyField(' + idx + ')" oninput="updateProxyFieldData(' + idx + ', this.value)" placeholder="socks5:// یا http:// (کشور ' + (idx + 1) + ')" dir="ltr" class="flex-1 px-2 py-1.5 bg-gray-50 dark:bg-slate-900 border ' + borderClass + ' rounded text-xs font-mono focus:outline-none text-gray-800 dark:text-zinc-100 transition">';
 		}
 		if (idx > 0) {
 			inputRow += '<button type="button" onclick="removeProxyFieldUI(' + idx + ')" class="w-7 h-7 flex-shrink-0 bg-red-700 hover:bg-red-800 dark:bg-red-600 dark:hover:bg-red-700 text-white rounded flex items-center justify-center font-bold text-xs shadow-sm" title="حذف کامل فیلد"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>';
@@ -9278,8 +9248,6 @@ window.updateProxyFieldData = function(idx, val) {
 window.addProxyFieldUI = function() {
 	if (window.proxyFieldsData.length < 15) {
 		window.proxyFieldsData.push("");
-		if (!Array.isArray(window.proxyFieldsCountries)) window.proxyFieldsCountries = [];
-		window.proxyFieldsCountries.push(""); // a manually-added slot has no pinned country
 		window.activeProxyIndex = window.proxyFieldsData.length - 1;
 		window.renderProxyFieldsUI();
 		setTimeout(() => {
@@ -9295,7 +9263,6 @@ window.addProxyFieldUI = function() {
 window.removeProxyFieldUI = function(idx) {
 	if (window.proxyFieldsData.length > 1) {
 		window.proxyFieldsData.splice(idx, 1);
-		if (Array.isArray(window.proxyFieldsCountries)) window.proxyFieldsCountries.splice(idx, 1);
 		if (window.activeProxyIndex >= window.proxyFieldsData.length) {
 			window.activeProxyIndex = window.proxyFieldsData.length - 1;
 		}
@@ -10058,7 +10025,6 @@ function populateUserFormFields(user) {
 	const userProxyToggle = document.getElementById('user-proxy-mode-toggle');
 	const targetProxy = user.user_socks5 || user.user_proxy_ip;
 	window.proxyFieldsData = [""];
-	window.proxyFieldsCountries = [""];
 	window.activeProxyIndex = 0;
 	if (user.user_socks5) {
 		if (userProxyToggle) userProxyToggle.checked = true;
@@ -10066,21 +10032,12 @@ function populateUserFormFields(user) {
 		try {
 			if (user.user_socks5.trim().startsWith("[")) {
 				const arr = JSON.parse(user.user_socks5);
-				// Keep each slot's {proxy, country} pair together - proxyFieldsData gets the bare
-				// proxy string (used everywhere else exactly like before) while proxyFieldsCountries
-				// gets the matching country tag, so renderProxyFieldsUI() can show which pinned
-				// location each slot is (even when proxy is still "" and untested). Previously this
-				// line kept only x.proxy, so every slot's country tag was thrown away the moment the
-				// edit-user modal opened - see preserveProxyCountryTags() for the related save-side fix.
-				window.proxyFieldsData = arr.map(x => (typeof x === "object" && x !== null) ? (x.proxy || "") : (x || ""));
-				window.proxyFieldsCountries = arr.map(x => (typeof x === "object" && x !== null && x.country) ? String(x.country).toUpperCase() : "");
+				window.proxyFieldsData = arr.map(x => typeof x === "object" && x !== null ? x.proxy : x);
 			} else {
 				window.proxyFieldsData = [user.user_socks5];
-				window.proxyFieldsCountries = [""];
 			}
 		} catch(e) {
 			window.proxyFieldsData = [user.user_socks5];
-			window.proxyFieldsCountries = [""];
 		}
 	} else {
 		if (userProxyToggle) userProxyToggle.checked = false;
