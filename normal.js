@@ -10812,7 +10812,7 @@ function renderVipProxiesCache() {
 		const proxies = VIP_CACHE_DATA[cc] || [];
 		const flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(cc) : '🌐';
 		return '<div class="border border-gray-200 dark:border-amoled-border rounded-md overflow-hidden">' +
-			'<button type="button" onclick="toggleVipCacheCountry(\'' + cc + '\')" class="w-full flex items-center justify-between px-3 py-2 bg-gray-50 dark:bg-zinc-900/40 hover:bg-gray-100 dark:hover:bg-zinc-800 transition text-xs font-bold text-gray-700 dark:text-zinc-200">' +
+			'<button type="button" onclick="toggleVipCacheCountry(\\'' + cc + '\\')" class="w-full flex items-center justify-between px-3 py-2 bg-gray-50 dark:bg-zinc-900/40 hover:bg-gray-100 dark:hover:bg-zinc-800 transition text-xs font-bold text-gray-700 dark:text-zinc-200">' +
 				'<span class="flex items-center gap-2">' + flag + ' ' + cc + '</span>' +
 				'<span class="flex items-center gap-2 text-[10px] font-normal text-gray-400 dark:text-zinc-500">' + proxies.length + ' پروکسی' +
 					'<svg id="vip-cache-chevron-' + cc + '" class="w-3.5 h-3.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>' +
@@ -10820,7 +10820,7 @@ function renderVipProxiesCache() {
 			'</button>' +
 			'<div id="vip-cache-country-' + cc + '" class="hidden px-3 py-2 border-t border-gray-200 dark:border-amoled-border bg-white dark:bg-amoled-input">' +
 				'<textarea readonly dir="ltr" class="w-full text-[10px] font-mono text-left text-gray-700 dark:text-zinc-300 bg-transparent resize-none focus:outline-none" rows="' + Math.min(10, Math.max(2, proxies.length)) + '">' + escVipCacheText(proxies.join('\\n')) + '</textarea>' +
-				'<button type="button" onclick="copyVipCacheCountry(\'' + cc + '\')" class="mt-1 w-full flex items-center justify-center gap-1.5 py-1.5 bg-gray-100 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-gray-600 dark:text-zinc-300 hover:bg-gray-200 dark:hover:bg-zinc-700/80 rounded text-[10px] font-bold transition">کپی همه‌ی پروکسی‌های ' + cc + '</button>' +
+				'<button type="button" onclick="copyVipCacheCountry(\\'' + cc + '\\')" class="mt-1 w-full flex items-center justify-center gap-1.5 py-1.5 bg-gray-100 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-gray-600 dark:text-zinc-300 hover:bg-gray-200 dark:hover:bg-zinc-700/80 rounded text-[10px] font-bold transition">کپی همه‌ی پروکسی‌های ' + cc + '</button>' +
 			'</div>' +
 		'</div>';
 	}).join('');
