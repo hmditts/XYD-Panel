@@ -55,19 +55,34 @@ function getManualVipProxies(country) {
 	const list = MANUAL_VIP_PROXIES[String(country).toUpperCase()];
 	return Array.isArray(list) ? list : [];
 }
-// متن فچ‌شده از مخزن اصلی را با MANUAL_VIP_PROXIES همون کشور ترکیب و یکتا می‌کند.
-function mergeVipProxyText(country, fetchedText) {
+// متن فچ‌شده از مخزن اصلی را با متن مخزن شخصی (میرور ۴) و MANUAL_VIP_PROXIES همون کشور ترکیب و یکتا می‌کند.
+function mergeVipProxyText(country, fetchedText, personalText) {
 	const fetchedLines = (fetchedText || "").split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+	const personalLines = (personalText || "").split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
 	const manualLines = getManualVipProxies(country).map((l) => l.trim()).filter((l) => l.length > 5);
-	return [...new Set([...fetchedLines, ...manualLines])].join("\n");
+	return [...new Set([...fetchedLines, ...personalLines, ...manualLines])].join("\n");
+}
+// میرور ۴ - مخزن شخصی خودمون. این خط رو با آدرس raw واقعی ریپوی خودتون پر کنید (owner/repo/branch).
+// هم fetchWithFallback (به‌عنوان آخرین میرور توی زنجیره) و هم fetchPersonalRepoFile (که همیشه/بدون
+// شرط صداش می‌زنیم، مخصوص proxy_vip/*.txt) از همین یک آدرس استفاده می‌کنن.
+const PERSONAL_REPO_RAW_BASE = "https://raw.githubusercontent.com/hmditts/XYD-Panel/main/";
+// برخلاف fetchWithFallback (که با اولین جواب OK متوقف می‌شه)، این تابع مستقیم و همیشه از مخزن
+// شخصی می‌خونه - even اگه میرورهای ۱ تا ۳ هم OK برگردونده باشن - چون هدفش اینه که وقتی فایل رسمی
+// وجود داره ولی پروکسی‌هاش مرده‌ن، پروکسی‌های خودمون همچنان اضافه بشن نه این‌که نادیده گرفته بشن.
+async function fetchPersonalRepoFile(path) {
+	try {
+		const res = await fetch(`${PERSONAL_REPO_RAW_BASE}${path}`);
+		if (res.ok) return await res.text();
+	} catch (e) { }
+	return null;
 }
 async function fetchWithFallback(path, options = {}) {
 	const urls = [
 		`https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev/${path}`,
 		`https://testfnryjnrjrurjejne4r6uju.pages.dev/${path}`,
 		`https://hoplimit.shop/${path}`,
-		// میرور ۴ - مخزن خودمون (Gist/Repo شخصی). قبل از استفاده لینک raw واقعی خودتون رو اینجا بذارید.
-		`https://raw.githubusercontent.com/hmditts/XYD-Panel/main/${path}`
+		// میرور ۴ - مخزن شخصی خودمون
+		`${PERSONAL_REPO_RAW_BASE}${path}`
 	];
 	if (path.includes('zeus.obfuscated.js')) {
 		urls.push(`https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main/zeus.obfuscated.js` + (path.includes('?') ? path.substring(path.indexOf('?')) : ''));
@@ -88,12 +103,20 @@ async function getCachedRepoFile(path, ttl = 900000) { // پیش‌فرض: ۱۵ 
 	const now = Date.now();
 	const cached = REPO_FILE_CACHE.get(path);
 	if (cached && (now - cached.timestamp < ttl)) return cached.data;
+	// proxy_vip/<CC>.txt همیشه با مخزن شخصی (میرور ۴) ترکیب می‌شه - حتی اگه fetchWithFallback از
+	// میرور ۱ تا ۳ یه جواب OK بگیره (مثلاً فایل رسمی وجود داره ولی پروکسی‌هاش خراب/مرده‌ن)، چون
+	// fetchWithFallback با اولین OK متوقف می‌شه و میرور ۴ رو اصلاً چک نمی‌کنه.
+	const vipMatch = path.match(/^proxy_vip\/([A-Za-z0-9]+)\.txt$/);
 	try {
-		const res = await fetchWithFallback(path);
-		if (res.ok) {
-			const text = await res.text();
-			REPO_FILE_CACHE.set(path, { data: text, timestamp: now });
-			return text;
+		const [mainRes, personalText] = await Promise.all([
+			fetchWithFallback(path).catch(() => null),
+			vipMatch ? fetchPersonalRepoFile(path) : Promise.resolve(null),
+		]);
+		const mainText = mainRes && mainRes.ok ? await mainRes.text() : "";
+		if (mainText || personalText) {
+			const finalText = vipMatch ? mergeVipProxyText(vipMatch[1], mainText, personalText) : mainText;
+			REPO_FILE_CACHE.set(path, { data: finalText, timestamp: now });
+			return finalText;
 		}
 	} catch (e) { }
 	return cached ? cached.data : null; // اگه فچ تازه خراب شد، نسخه‌ی قدیمی رو بده نه خالی
@@ -128,11 +151,14 @@ async function syncAllVipProxies() {
 		} catch (e) { }
 		if (!fetchOk) {
 			// فچ ناموفق بود؛ به‌جای پاک کردن کش قبلی، همون نسخه‌ی قبلی (اگه بود) رو پایه می‌گیریم
-			// و فقط دوباره با MANUAL_VIP_PROXIES ترکیب می‌کنیم (idempotent - تکراری اضافه نمی‌شه).
+			// و فقط دوباره با مخزن شخصی/MANUAL_VIP_PROXIES ترکیب می‌کنیم (idempotent - تکراری اضافه نمی‌شه).
 			const prev = REPO_FILE_CACHE.get(key);
 			text = prev ? prev.data : "";
 		}
-		const merged = mergeVipProxyText(cc, text);
+		// مخزن شخصی (میرور ۴) همیشه چک می‌شه - حتی وقتی fetchOk true بوده - تا وقتی فایل رسمی وجود
+		// داره ولی پروکسی‌هاش خراب/مرده‌ن، پروکسی‌های خودمون همچنان اضافه بشن نه نادیده گرفته بشن.
+		const personalText = await fetchPersonalRepoFile(key);
+		const merged = mergeVipProxyText(cc, text, personalText);
 		const lines = merged.split("\n").filter((l) => l.length > 5);
 		REPO_FILE_CACHE.set(key, { data: merged, timestamp: now });
 		perCountry[cc] = lines.length;
