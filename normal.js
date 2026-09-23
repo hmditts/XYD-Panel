@@ -11292,7 +11292,11 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '3.32.0';
+// قانون ورژن‌گذاری: هر بار که تغییر/ادیتی روی این فایل اعمال می‌شود، رقم سوم (patch) یک عدد
+// افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
+// (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
+// vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
+const CURRENT_VERSION = '3.32.1';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
