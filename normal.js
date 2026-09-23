@@ -4,8 +4,17 @@ const GLOBAL_LAST_ACTIVE_WRITE = new Map();
 const GLOBAL_LAST_DB_WRITE = new Map();
 const GLOBAL_WRITE_LOCK = new Map();
 // Serializes read-merge-write cycles on `active_ips` per username within the same isolate
-// (promise-chaining mutex). See persistActiveIp() near getActiveIpCount() for why this exists.
+// (promise-chaining mutex). See persistActiveIp() near getActiveIpCount() for why this exists
+// (shared with confirmActiveIp() - see the «دیده‌شده/تأییدشده» device policy notes there).
 const GLOBAL_ACTIVE_IPS_WRITE_LOCK = new Map();
+// «سیاست ثبت دستگاه متصل» (device seen/confirmed policy - see DEVICE_CONFIRM_* below): best-effort,
+// per-isolate running total of bytes (both directions) moved by short-lived connections of the
+// same (username, clientIP) pair, within a rolling DEVICE_CONFIRM_BURST_WINDOW_MS window. Used to
+// confirm a device that never keeps a single connection open for DEVICE_CONFIRM_MIN_DURATION_MS,
+// but reconnects often with real usage each time (a chat/browser app is the common case). Not
+// shared across isolates and not persisted to D1 - approximate by design, see handlevIees().
+// Pruned opportunistically in flushExpiredTraffic().
+const IP_BURST_BYTES = new Map();
 const DNS_CACHE = new Map();
 const USER_REQ_CACHE = new Map();
 const LOGIN_ATTEMPTS = new Map();
@@ -16,9 +25,6 @@ const DOH_RESOLVER = "https://cloudflare-dns.com/dns-query";
 const UPSTREAM_BUNDLE_TARGET_BYTES = 128 * 1024;
 const UPSTREAM_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
 const UPSTREAM_QUEUE_MAX_ITEMS = 4096;
-const DOWNSTREAM_GRAIN_BYTES = 128 * 1024;
-const DOWNSTREAM_GRAIN_TAIL_THRESHOLD = 512;
-const DOWNSTREAM_GRAIN_SILENT_MS = 1;
 const DNS_CACHE_MAX_ENTRIES = 2048;
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
@@ -46,6 +52,18 @@ async function fetchWithFallback(path, options = {}) {
 		if (res.ok) return res;
 	} catch (e) { }
 	return await fetch(fallbackUrl, options);
+}
+// Both update endpoints (/api/update-panel, /api/update-panel-github) upload the fetched file to
+// Cloudflare unchanged, as an ES module (main_module: "zeus.js"). The plain decoded source (vX_Y.js)
+// is only a function BODY that ends with a top-level "return" of the worker object - it is not a
+// module (no default export, and a top-level return is illegal in a module), so Cloudflare refuses it.
+// Only the obfuscated stub (import ... + default export) or a real module can be deployed this way.
+// Fail early with a message that says so, instead of a bare Cloudflare syntax error. A valid module
+// can never end in a top-level return, so this can't block a good file; anything else is left to Cloudflare.
+function assertDeployableWorkerModule(code, sourceLabel) {
+	if (/return\s+__WORKER_EXPORT__\s*;?\s*$/.test(String(code).trim())) {
+		throw new Error("فایل «" + sourceLabel + "» نسخه‌ی decode‌شده (خوانا) است، نه فایل قابل‌دیپلوی: با «return __WORKER_EXPORT__» تمام می‌شود و export default ندارد، برای همین کلودفلر آن را رد می‌کند. نسخه‌ی obfuscated (stub دارای export default) را در گیت‌هاب بگذارید.");
+	}
 }
 let localLastAutoResetCheck = 0;
 async function checkAutoResets(env, ctx) {
@@ -181,6 +199,9 @@ function recordDailyTraffic(env, ctx, deltaGb) {
 	const hourKey = utcHourKey(Date.now());
 	const task = env.DB.prepare("INSERT INTO daily_traffic (date, gb) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET gb = gb + excluded.gb").bind(hourKey, deltaGb).run().catch(() => { });
 	if (ctx) ctx.waitUntil(task);
+	// خودِ promise برگردونده می‌شه تا صداکننده‌هایی که ctx ندارن (مثل flushExpiredTraffic) بتونن
+	// await کنن؛ وگرنه اون نوشتن یتیم می‌موند و ممکن بود با تموم شدن ریکوئست اصلاً اجرا نشه.
+	return task;
 }
 // ---- Per-connection user-auth cache (D1 read reduction) --------------------------------------
 // Same caches.default (edge Cache API) pattern as checkAutoResets() above, applied to the
@@ -323,13 +344,88 @@ const PINNED_DEFAULT_LOCATIONS_FALLBACK = ["UZ", "KZ", "TR", "LY", "NL", "AL", "
 const DEFAULT_GLOBAL_CLEAN_IP_FALLBACK = "104.20.25.138";
 const DEFAULT_OTHER_CLEAN_IPS_FALLBACK = ["104.26.1.116", "104.21.122.162", "185.162.228.105", "185.148.105.218", "104.18.39.219", "185.162.230.76"];
 const DEFAULT_INLINE_PROXY_IP_FALLBACK = "178.105.227.210";
-// «هشدار تعداد دستگاه» - آستانه‌ی پیش‌فرض سراسری که موقع ساخت کاربر جدید (اگه ادمین
-// دستی چیزی توی فیلد «محدودیت کاربر» وارد نکرده باشه) روی ستون ip_limit همون کاربر
-// ست می‌شه. توجه: این فقط برای هشداردهی در پنل ادمینه (device_warning_at / device_warning
-// - نزدیک persistActiveIp پایین‌تر)، هیچ enforcement/قطع اتصالی روش انجام نمی‌شه
-// (enforcement جدا و از قبل /* Bypassed */ شده). فقط وقتی استفاده می‌شه که تنظیم
-// 'device_warning_threshold' هیچ‌وقت توی settings ذخیره نشده باشه (نصب تازه).
+// «محدودیت کاربر» (user_limit) - سقف تعداد دستگاه هم‌زمان هر کاربر؛ همون فیلد «محدودیت
+// کاربر» توی فرم کاربر (ستون‌های ip_limit/max_connections). سه‌جا استفاده می‌شه: (۱) پیش‌فرض
+// کاربر جدید وقتی فرم/API چیزی توی این فیلد نفرستاده باشه (POST /api/users)، (۲) با «ذخیره‌ی
+// تنظیمات» یا Push پنل مادر روی ستون‌های ip_limit/max_connections همه‌ی کاربرهای *موجود* هم
+// اعمال می‌شه (POST /api/settings/bulk)، (۳) پیش‌فرض placeholder فرم. فقط وقتی مقدار
+// fallback استفاده می‌شه که تنظیم 'user_limit' هیچ‌وقت توی settings ذخیره نشده باشه (نصب تازه).
+const DEFAULT_USER_LIMIT_FALLBACK = 2;
+// «هشدار تعداد دستگاه» (device_warning_threshold) - آستانه‌ی سراسریِ *هشدار*: اگه تعداد
+// دستگاه‌های فعالِ یه کاربر از این عدد بیشتر بشه، device_warning_at ست می‌شه (persistActiveIp
+// پایین‌تر) و روی کارتش هشدار قرمز می‌آد. این عدد دیگه هیچ ربطی به ip_limit/max_connections
+// کاربرها نداره (اون‌ها با «محدودیت کاربر» بالا ست می‌شن) و هیچ اتصالی قطع نمی‌کنه.
+// 0 = هشدار خاموش. فقط وقتی fallback استفاده می‌شه که تنظیمش هیچ‌وقت ذخیره نشده باشه.
 const DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK = 4;
+// «سیاست ثبت دستگاه متصل» (device seen/confirmed policy). قبلاً همون لحظه‌ی اول پیام
+// VLESS/Trojan یه IP فوری «دستگاه» حساب می‌شد - بدون حداقل زمان یا حجم - برای همین یه
+// تست پینگِ چندثانیه‌ای (یا حتی یه هندشیکِ ناتمام) دقیقاً مثل یه دستگاه واقعی می‌شمرد.
+// حالا هر IPِ تازه اول فقط «دیده‌شده»ست (فقط توی حافظه‌ی خودِ همون اتصال - نه D1، نه
+// سقف ip_limit، نه شمارنده‌ی آنلاین) و با هر کدوم از این دو شرط «تأیید» می‌شه (نگاه
+// کنید به confirmActiveIp/checkDeviceConfirmation در handlevIees):
+//  (۱) اتصالِ پایدار: همون یک اتصال حداقل DEVICE_CONFIRM_MIN_DURATION_MS باز بمونه و
+//      حداقل DEVICE_CONFIRM_MIN_BYTES بایت (مجموع آپلود+دانلود، از addBytes) جابه‌جا کنه.
+//  (۲) اتصال‌های کوتاهِ زیاد: مجموع بایتِ همون (کاربر, IP) - نگاه کنید IP_BURST_BYTES -
+//      توی یه پنجره‌ی DEVICE_CONFIRM_BURST_WINDOW_MS به DEVICE_CONFIRM_BURST_BYTES برسه.
+// این عددها تخمینی‌ان (یه TLS handshake + یه پینگ معمولاً حدود ۵ تا ۸ کیلوبایته)، نه
+// اندازه‌گیری‌شده از داده‌ی واقعی - جایی برای تنظیم دقیق‌ترشون در آینده هست. سقفِ
+// «محدودیت کاربر»/ip_limit هم از همین نسخه به بعد فقط توی confirmActiveIp (لحظه‌ی
+// تأیید) اعمال می‌شه، نه موقع اولین هندشیک - یعنی یه تست پینگ همیشه رد می‌شه، ولی
+// استفاده‌ی واقعی‌ای که جا نداره بعد از چند ثانیه/چند KB قطع می‌شه. محدودیت‌های شناخته‌شده
+// (عمداً حل نشده): دستگاهی که همیشه خیلی کم‌حجمه اصلاً «تأیید» نمی‌شه (مصرفش همچنان
+// روی سهمیه‌ی حجم می‌ره)؛ IPِ قدیمیِ یه دستگاهی که شبکه عوض کرده تا ۱۸۰ ثانیه یه جای
+// سقف رو اشغال می‌کنه؛ IP_BURST_BYTES بین isolateها به اشتراک نیست (تقریبیه، نه دقیق).
+const DEVICE_CONFIRM_MIN_DURATION_MS = 10000;
+const DEVICE_CONFIRM_MIN_BYTES = 30 * 1024;
+const DEVICE_CONFIRM_BURST_WINDOW_MS = 5 * 60 * 1000;
+const DEVICE_CONFIRM_BURST_BYTES = 1024 * 1024;
+// «تأخیر هشدار تعداد دستگاه» - device_warning_at دیگه با همون اولین باری که تعداد
+// دستگاه‌های تأییدشده از آستانه (device_warning_threshold) رد می‌شه ست نمی‌شه؛ باید
+// این تعداد بار پشت‌سرهم (هر بار = یک تأیید دستگاه تازه یا یک رفرش هیت‌بیت - نگاه کنید
+// evaluateDeviceWarning) عبور از آستانه دیده بشه. برگشتن به زیر آستانه (حتی یه بار)
+// شمارش رو صفر می‌کنه. یه IP که با یه اتصال کوتاهِ لحظه‌ای از سقف رد بشه و توی همون
+// دور بعدی دیگه نباشه، هیچ‌وقت هشدار نمی‌سازه.
+const DEVICE_WARNING_CONFIRM_STREAK = 2;
+// «پورت» - پورتی که هم به‌عنوان مقدار پیش‌فرض چک‌باکس پورت توی فرم افزودن
+// کاربر جدید انتخاب می‌شه (renderPortCheckboxes سمت کلاینت)، و هم موقع «ذخیره
+// تنظیمات» به‌صورت override کامل روی ستون port همه‌ی کاربرهای *موجود* هم
+// اعمال می‌شه (پورت‌های قبلی‌شون پاک و با همین یکی جایگزین می‌شه - نگاه کنید
+// به POST /api/settings/bulk). این مقدار فقط به‌عنوان پیش‌فرضِ اولیه استفاده
+// می‌شه، برای وقتی تنظیم 'default_port' هیچ‌وقت توی settings ذخیره نشده باشه
+// (نصب تازه).
+const DEFAULT_PORT_FALLBACK = "2083";
+// «پیش‌فرض‌های کاربر جدید» - دقیقاً همان مقادیری که فرم دستی «ایجاد کاربر جدید»
+// (openCreateModal سمت کلاینت) از قبل hardcode می‌کرد، حالا به‌صورت Settings واقعی
+// (کلیدهای new_user_* در جدول settings) تا هم از مودال «تنظیمات پـنـل» قابل ویرایش
+// باشند و هم پنل مادر بتواند با POST /api/settings/bulk همه‌ی پنل‌ها را با هم
+// یکسان کند. سه جا از این‌ها می‌خوانند: (۱) ensureSchema() اگر کلیدی نبود
+// seed می‌کند، (۲) POST /api/users برای هر فیلدی که درخواست نفرستاده باشد (مثلاً
+// وقتی پنل مادر فقط username می‌فرستد)، (۳) فرم «ایجاد کاربر جدید» و Import Users
+// سمت کلاینت. همه‌ی مقدارها رشته‌اند (ستون value جدول settings TEXT است):
+// فلگ‌ها "1"/"0"، frag_len/frag_int خالی = فرگمنتیشن خاموش.
+const NEW_USER_DEFAULTS_FALLBACK = {
+	new_user_fingerprint: "ios",
+	new_user_auto_reset_vol_days: "1",
+	new_user_auto_reset_req_days: "1",
+	new_user_auto_rotate_user_proxy: "1",
+	new_user_enable_direct: "0",
+	new_user_block_porn: "0",
+	new_user_block_ads: "0",
+	new_user_frag_len: "",
+	new_user_frag_int: "",
+	new_user_ip_operator: "all",
+	new_user_ip_count: "999999", // no count cap — getRandomIps() returns every available Clean IP once count >= pool size
+	new_user_auto_rotate_ip: "0",
+	new_user_start_on_first_connect: "0",
+	new_user_connection_type: "vless",
+};
+// فقط این دو کلید مجازند خالی ذخیره شوند (خالی = فرگمنت خاموش)؛ برای بقیه، مقدار
+// خالی/نامعتبر یعنی «از NEW_USER_DEFAULTS_FALLBACK استفاده کن».
+const NEW_USER_DEFAULTS_EMPTY_OK = ["new_user_frag_len", "new_user_frag_int"];
+const NEW_USER_TLS_PORTS = ["443", "2053", "2083", "2087", "2096", "8443"];
+// Same list as the Fingerprint <select> of the panel (fingerprint-select / nud-fingerprint) — the only
+// values POST /api/settings/bulk accepts when it is asked to write a fingerprint onto existing users.
+const NEW_USER_FINGERPRINTS = ["chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized", "unsafe"];
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
 // runs automatically for every user right after the admin saves the pinned
@@ -337,7 +433,9 @@ const DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK = 4;
 // brand-new user is NOT capped by this (a new user always gets the full
 // current pinned list, even if that list itself has grown past this number).
 const MAX_LOCATIONS_PER_USER = 20;
-const MASTER_KEY_BLOCKED_PATHS = ["/api/change-password", "/api/auto-update-setup", "/api/update-panel", "/api/update-panel-github"];
+// /api/change-password was removed from this list: the mother panel's "Push to All Panels" now sets the
+// default admin password through it with X-Master-Key (see the handler below for the master-key branch).
+const MASTER_KEY_BLOCKED_PATHS = ["/api/auto-update-setup", "/api/update-panel", "/api/update-panel-github"];
 
 // Full ISO 3166-1 alpha-2 -> alpha-3 table (249 entries), used to compute a
 // permanent WS path segment for ANY country in the VIP proxy repository -
@@ -465,6 +563,22 @@ const PINNED_PROVISION_TEST_LIMIT = 3;
 // slot still carries the right country tag (replaceBrokenProxy's same-country
 // cooldown/heal logic will keep retrying later). Returns null only if the
 // country's VIP list itself is missing or empty.
+// کد-ریویو فیکس: قبل از این، هر کاندید فقط با یک GET خام به 1.1.1.1 تست
+// می‌شد - یعنی فقط «زنده بودن» پروکسی چک می‌شد، نه این‌که واقعاً از همان
+// کشوری که proxy_vip/<country>.txt ادعا می‌کند exit می‌کند یا نه. برخلاف
+// replaceBrokenProxy (که برای countryCode="all"/"UN" از ip-api.com برای
+// تشخیص کشور واقعی استفاده می‌کند)، اینجا هیچ geo-check ای نبود، پس یک خط
+// که در US.txt هست ولی واقعاً IP اون کشور رو نشون نمی‌ده هم قبول می‌شد.
+// راه‌حل: مقصد تست از 1.1.1.1 به ip-api.com عوض شده (دقیقاً همان الگوی
+// replaceBrokenProxy/تست دستی پروکسی) تا در همان یک subrequest هم زنده‌بودن
+// و هم کشور واقعی خروجی چک شود؛ اگر کشور برگشتی با country ورودی نخواند،
+// آن کاندید reject می‌شود تا Promise.any سراغ کاندید بعدی برود. اگر
+// ip-api.com اصلاً جواب کشور نداد (شبکه/timeout روی خودِ geo-lookup)، برای
+// جلوگیری از رد کردن بی‌دلیل کل استخر، همچنان پذیرفته می‌شود - فقط «کشور
+// اشتباهِ تاییدشده» رد می‌شود، نه «کشورِ تاییدنشده». هزینه‌ی subrequest به
+// ازای هر کاندید دقیقاً همان یکی قبلی می‌ماند (نگاه کنید به یادداشت بودجه‌ی
+// subrequest بالای PINNED_PROVISION_TEST_LIMIT) - فقط مقصد و مسیر HTTP عوض
+// شده، نه تعداد اتصال‌ها.
 async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LIMIT) {
 	try {
 		const res = await fetchWithFallback(`proxy_vip/${country}.txt`);
@@ -480,6 +594,7 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 			if (line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks")) return [line];
 			return [`socks5://${line}`, `http://${line}`];
 		});
+		const expectedCC = String(country || "").trim().toUpperCase();
 		try {
 			const working = await Promise.any(
 				testBatch.map((p) => {
@@ -490,13 +605,23 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 							reject(new Error("timeout"));
 						}, 4000);
 						try {
-							const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-							sock = await connectProxy(p, "1.1.1.1", 80, payload);
+							const payload = TEXT_ENCODER.encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
+							sock = await connectProxy(p, "ip-api.com", 80, payload);
 							const reader = sock.readable.getReader();
-							const readRes = await reader.read();
+							const dec = new TextDecoder();
+							let resStr = "";
+							while (true) {
+								const readRes = await reader.read();
+								if (readRes.done || !readRes.value) break;
+								resStr += dec.decode(readRes.value, { stream: true });
+								if (resStr.includes("countryCode")) break;
+							}
 							clearTimeout(timeoutId);
 							try { sock.close(); } catch (e) { }
-							if (readRes.done || !readRes.value) reject(new Error("empty"));
+							if (!resStr) { reject(new Error("empty")); return; }
+							const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
+							const gotCC = (jsonMatch && jsonMatch[1]) ? jsonMatch[1].toUpperCase() : "";
+							if (gotCC && expectedCC && gotCC !== expectedCC) reject(new Error("country-mismatch:" + gotCC));
 							else resolve(p);
 						} catch (e) {
 							clearTimeout(timeoutId);
@@ -508,7 +633,7 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 			);
 			return { proxy: working, country };
 		} catch (e) {
-			// Nothing answered in time - keep the country tag, use an untested line.
+			// Nothing answered in time / matched the country - keep the country tag, use an untested line.
 			return { proxy: lines[0], country };
 		}
 	} catch (e) {
@@ -540,9 +665,10 @@ async function buildPinnedDefaultProxyList(locations) {
 // each {proxy, country} slot); every slot already present - pinned or not -
 // is left completely untouched (not re-tested, not removed). This is what
 // makes changing the pinned_locations setting non-destructive: a country
-// that gets un-pinned later keeps working for anyone who already has it,
-// and replaceBrokenProxy() keeps auto-healing it forever regardless of its
-// current pinned status.
+// that was never pinned (or was added by hand) is never removed by this
+// function. NOTE: un-pinning a country in settings DOES now remove it from
+// every existing user - see removeCountriesFromAllUsers() and POST
+// /api/settings/bulk - but that is a separate step, not part of this merge.
 // Never grows a user past MAX_LOCATIONS_PER_USER. If there isn't room for
 // every missing pinned country, as many as fit are added and the rest are
 // returned in `cappedOut` so the caller can warn the admin (nothing is
@@ -567,6 +693,146 @@ async function mergePinnedLocationsForUser(existingProxyList, pinnedLocations) {
 		});
 	}
 	return { list, added: toAdd, cappedOut };
+}
+
+// Re-attaches the {proxy, country} tag to slots the admin did NOT touch when the edit-user
+// modal is saved. The modal only keeps the bare proxy string of each slot (populateUserFormFields
+// drops the `country` tag) and posts user_socks5 back as a plain string / array of strings, so
+// without this every "save" - whatever field was changed - wiped every country tag, and
+// getSelectedUserProxy() (which matches /XYZ/<country-code> against slot.country) then found
+// nothing and the config silently fell back to a direct/Cloudflare connection.
+// Every incoming string that is identical to a tagged slot already stored for this user gets that
+// slot's country back (each stored slot is consumed once, so duplicated proxy strings can't steal
+// each other's tag). A slot the admin really added/changed by hand stays untagged, exactly as before.
+// Objects already carrying a tag are left alone. Returns the original value when nothing matched.
+function preserveProxyCountryTags(incomingRaw, existingRaw) {
+	if (incomingRaw === undefined || incomingRaw === null || incomingRaw === "") return incomingRaw;
+	let existingList = [];
+	try {
+		const es = String(existingRaw || "").trim();
+		if (es.startsWith("[")) {
+			const parsed = JSON.parse(es);
+			if (Array.isArray(parsed)) existingList = parsed;
+		}
+	} catch (e) {
+		return incomingRaw;
+	}
+	const tagPool = new Map();
+	for (const slot of existingList) {
+		if (typeof slot === "object" && slot !== null && slot.country && typeof slot.proxy === "string" && slot.proxy.trim()) {
+			const key = slot.proxy.trim();
+			if (!tagPool.has(key)) tagPool.set(key, []);
+			tagPool.get(key).push(String(slot.country));
+		}
+	}
+	if (tagPool.size === 0) return incomingRaw;
+	let incomingList;
+	if (Array.isArray(incomingRaw)) {
+		incomingList = incomingRaw;
+	} else {
+		const is = String(incomingRaw).trim();
+		if (is.startsWith("[")) {
+			try {
+				incomingList = JSON.parse(is);
+			} catch (e) {
+				return incomingRaw;
+			}
+			if (!Array.isArray(incomingList)) return incomingRaw;
+		} else {
+			incomingList = [is];
+		}
+	}
+	let changed = false;
+	const out = incomingList.map((item) => {
+		if (typeof item !== "string") return item;
+		const key = item.trim();
+		const queue = tagPool.get(key);
+		if (queue && queue.length > 0) {
+			changed = true;
+			return { proxy: key, country: queue.shift() };
+		}
+		return item;
+	});
+	return changed ? JSON.stringify(out) : incomingRaw;
+}
+
+// Removes every slot tagged with one of `countries` (ISO alpha-2) from EVERY user's
+// user_socks5 list. Called from POST /api/settings/bulk when countries were just
+// un-pinned (pinned_locations shrank), so an un-pinned country actually disappears
+// from the users' configs instead of lingering forever. Only countries that were in
+// the previous pinned list and are not in the new one are passed in - a country the
+// admin never pinned (or a legacy non-object slot without a country tag) is never
+// touched here. Returns { countries, usersUpdated }.
+async function removeCountriesFromAllUsers(env, ctx, countries) {
+	const targets = new Set((countries || []).map((c) => String(c).trim().toUpperCase()).filter(Boolean));
+	if (targets.size === 0) return { countries: [], usersUpdated: 0 };
+	const { results } = await env.DB.prepare("SELECT username, uuid, trojan_hash, user_socks5 FROM users WHERE user_socks5 IS NOT NULL AND user_socks5 != ''").all();
+	const stmts = [];
+	const changedUsers = [];
+	for (const row of results || []) {
+		const raw = String(row.user_socks5 || "").trim();
+		if (!raw.startsWith("[")) continue;
+		let list;
+		try {
+			list = JSON.parse(raw);
+		} catch (e) {
+			continue;
+		}
+		if (!Array.isArray(list)) continue;
+		const kept = list.filter((p) => !(typeof p === "object" && p !== null && targets.has(String(p.country || "").trim().toUpperCase())));
+		if (kept.length === list.length) continue;
+		stmts.push(env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(kept), row.username));
+		changedUsers.push(row);
+	}
+	for (let i = 0; i < stmts.length; i += 50) {
+		await env.DB.batch(stmts.slice(i, i + 50));
+	}
+	await Promise.all(changedUsers.map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
+	return { countries: Array.from(targets), usersUpdated: changedUsers.length };
+}
+
+// "Mirror" variant of removeCountriesFromAllUsers(): instead of being told WHICH countries
+// to remove, it is told which to KEEP (`keepCountries` = the pinned list that was just
+// saved) and strips every country-tagged slot that is not in it from EVERY user's
+// user_socks5 list. Used by POST /api/settings/bulk when the caller (the mother panel's
+// "Push") sends prune_unpinned_locations: true. This is what actually cleans up panels
+// that already carry countries which are no longer pinned (e.g. the 15 built-in defaults
+// left over from before an empty list could be saved) - the "previous vs. now" comparison
+// alone can never find those. Slots WITHOUT a country tag (proxies added by hand as a raw
+// string, legacy non-object slots) are never touched. Returns { countries, usersUpdated }
+// where `countries` = the country codes that were really removed from at least one user.
+async function removeUnpinnedCountriesFromAllUsers(env, ctx, keepCountries) {
+	const keep = new Set((keepCountries || []).map((c) => String(c).trim().toUpperCase()).filter(Boolean));
+	const { results } = await env.DB.prepare("SELECT username, uuid, trojan_hash, user_socks5 FROM users WHERE user_socks5 IS NOT NULL AND user_socks5 != ''").all();
+	const stmts = [];
+	const changedUsers = [];
+	const removedCountries = new Set();
+	for (const row of results || []) {
+		const raw = String(row.user_socks5 || "").trim();
+		if (!raw.startsWith("[")) continue;
+		let list;
+		try {
+			list = JSON.parse(raw);
+		} catch (e) {
+			continue;
+		}
+		if (!Array.isArray(list)) continue;
+		const kept = list.filter((p) => {
+			if (typeof p !== "object" || p === null) return true;
+			const cc = String(p.country || "").trim().toUpperCase();
+			if (!cc || keep.has(cc)) return true;
+			removedCountries.add(cc);
+			return false;
+		});
+		if (kept.length === list.length) continue;
+		stmts.push(env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(kept), row.username));
+		changedUsers.push(row);
+	}
+	for (let i = 0; i < stmts.length; i += 50) {
+		await env.DB.batch(stmts.slice(i, i + 50));
+	}
+	await Promise.all(changedUsers.map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
+	return { countries: Array.from(removedCountries), usersUpdated: changedUsers.length };
 }
 
 async function replaceBrokenProxy(username, env, oldProxy) {
@@ -713,6 +979,14 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 						return [`socks5://${line}`, `http://${line}`];
 					});
 					
+					// کد-ریویو فیکس: قبلاً این تست فقط زنده‌بودن پروکسی را با یک GET خام به
+					// 1.1.1.1 چک می‌کرد - دقیقاً همان مشکلی که در testVipCountryProxy برطرف
+					// شده بود، اینجا (که healing واقعی را انجام می‌دهد) هنوز برطرف نشده بود.
+					// حالا دقیقاً همان الگو: مقصد تست ip-api.com است و کشور واقعی خروجی با
+					// upperCountry مقایسه می‌شود؛ کاندیدی که زنده است ولی از کشور اشتباه خارج
+					// می‌شود reject می‌شود تا Promise.any سراغ کاندید بعدی برود. اگر ip-api.com
+					// اصلاً جواب کشور نداد (تایم‌اوت/شبکه روی خودِ geo-lookup)، همچنان پذیرفته
+					// می‌شود - فقط «کشور اشتباهِ تاییدشده» رد می‌شود.
 					try {
 						newProxy = await Promise.any(
 							testBatch.map((p) => {
@@ -723,13 +997,23 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 										reject(new Error("timeout"));
 									}, 4000); 
 									try {
-										const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-										sock = await connectProxy(p, "1.1.1.1", 80, payload);
+										const payload = TEXT_ENCODER.encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
+										sock = await connectProxy(p, "ip-api.com", 80, payload);
 										const reader = sock.readable.getReader();
-										const res = await reader.read();
+										const dec = new TextDecoder();
+										let resStr = "";
+										while (true) {
+											const readRes = await reader.read();
+											if (readRes.done || !readRes.value) break;
+											resStr += dec.decode(readRes.value, { stream: true });
+											if (resStr.includes("countryCode")) break;
+										}
 										clearTimeout(timeoutId);
 										try { sock.close(); } catch (e) { }
-										if (res.done || !res.value) reject(new Error("empty"));
+										if (!resStr) { reject(new Error("empty")); return; }
+										const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
+										const gotCC = (jsonMatch && jsonMatch[1]) ? jsonMatch[1].toUpperCase() : "";
+										if (gotCC && src.country && gotCC !== src.country) reject(new Error("country-mismatch:" + gotCC));
 										else resolve(p);
 									} catch (e) {
 										clearTimeout(timeoutId);
@@ -779,6 +1063,93 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 	} finally {
 		GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
 	}
+}
+
+// از روی همان بخش آخر مسیر (path segment) که getSelectedUserProxy برای پیدا کردن
+// اسلات کشور مصرف می‌کند، فقط کد کشور درخواست‌شده را برمی‌گرداند - مستقل از این‌که
+// این کاربر خاص اسلاتی برای آن کشور دارد یا نه. برای فرمت‌های قدیمی (loc-N یا
+// ?loc=) که کد کشور در خودِ URL نیست، null برمی‌گرداند (چیزی برای healMissingCountrySlot
+// وجود ندارد چون معلوم نیست کدام کشور مقصود بوده).
+function getRequestedCountryCode(request) {
+	if (!request) return null;
+	try {
+		const url = new URL(request.url);
+		const segments = url.pathname.split("/").filter(Boolean);
+		const lastSeg = decodeURIComponent(segments[segments.length - 1] || "");
+		return getCountryForPathSegment(lastSeg);
+	} catch (e) {
+		return null;
+	}
+}
+
+// وقتی getSelectedUserProxy برای یک کشورِ قابل‌شناسایی در URL چیزی پیدا نکند (یا
+// چون اصلاً اسلاتی برای آن کشور در user_socks5 نیست - مثلاً تست اولیه‌ی ساخت کاربر
+// با محدودیت subrequest شکست خورده - یا چون اسلاتش هست ولی proxy آن از قبل خالی
+// مانده)، این اتصالِ فعلی همچنان طبق رفتار قبلی مستقیم/Cloudflare می‌رود (چیزی در
+// همین درخواست عوض نمی‌شود)، اما این تابع در پس‌زمینه (ctx.waitUntil) صدا زده
+// می‌شود تا با تست واقعی proxy_vip/<country>.txt (همان تابع geo-verified
+// testVipCountryProxy، با سقف تست بالاتر شبیه replaceBrokenProxy) آن اسلات را پر یا
+// اضافه کند تا اتصال‌های بعدی از همان کشور واقعاً پروکسی بگیرند. کول‌داون یک‌ساعته‌ی
+// per-(user,country) را با replaceBrokenProxy (همان ستون proxy_rotate_cooldowns)
+// مشترک است تا هرس شدن یک کشور و خالی‌ماندنش دو مسیر مستقل برای هجوم به لیست VIP
+// نسازند، و قفل GLOBAL_WRITE_LOCK هم با replaceBrokenProxy مشترک است تا دو نوشتنِ
+// هم‌زمان روی user_socks5 با هم تداخل نکنند.
+async function healMissingCountrySlot(username, env, countryCode) {
+	const cc = String(countryCode || "").trim().toUpperCase();
+	if (!cc) return;
+	const lockKey = username + "_proxy_rotate";
+	try {
+		if (GLOBAL_WRITE_LOCK.get(lockKey)) return;
+		GLOBAL_WRITE_LOCK.set(lockKey, true);
+		try {
+			const user = await env.DB.prepare("SELECT id, uuid, user_socks5, auto_rotate_user_proxy, proxy_rotate_cooldowns FROM users WHERE username = ?").bind(username).first();
+			if (!user || user.auto_rotate_user_proxy !== 1) return;
+
+			let cooldowns = {};
+			try {
+				cooldowns = user.proxy_rotate_cooldowns ? JSON.parse(user.proxy_rotate_cooldowns) : {};
+			} catch (e) {
+				cooldowns = {};
+			}
+			const COOLDOWN_MS = 3600000; // همان ۱ساعته‌ی replaceBrokenProxy - از همان ستون مشترک
+			const last = cooldowns[cc];
+			if (typeof last === "number" && (Date.now() - last) < COOLDOWN_MS) return;
+			cooldowns[cc] = Date.now();
+			try {
+				await env.DB.prepare("UPDATE users SET proxy_rotate_cooldowns = ? WHERE id = ?").bind(JSON.stringify(cooldowns), user.id).run();
+			} catch (e) { }
+
+			let list = [];
+			try {
+				const raw = String(user.user_socks5 || "").trim();
+				if (raw.startsWith("[")) list = JSON.parse(raw);
+				else if (raw) list = [raw];
+			} catch (e) {
+				list = user.user_socks5 ? [user.user_socks5] : [];
+			}
+			if (!Array.isArray(list)) list = [];
+
+			// همان تست geo-verified که برای کاربر تازه/merge استفاده می‌شود، با سقف بالاتر
+			// (۱۵ کاندید، مثل تلاش اصلیِ replaceBrokenProxy) چون این یک healing واقعی است،
+			// نه تست اولیه‌ی حجمی روی همه‌ی کشورها با هم.
+			const result = await testVipCountryProxy(cc, 15);
+			if (!result || !result.proxy) return; // چیزی برای این کشور پیدا نشد - دفعه‌ی بعد بعد از کول‌داون دوباره تلاش می‌شود
+
+			const idx = list.findIndex((p) => typeof p === "object" && p !== null && (p.country || "").toUpperCase() === cc);
+			if (idx === -1) {
+				list.push({ proxy: result.proxy, country: cc });
+			} else if (typeof list[idx] === "object" && list[idx] !== null) {
+				list[idx].proxy = result.proxy;
+			} else {
+				list[idx] = { proxy: result.proxy, country: cc };
+			}
+
+			await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE id = ?").bind(JSON.stringify(list), user.id).run();
+			await invalidateUserAuthCache(null, user.uuid);
+		} finally {
+			GLOBAL_WRITE_LOCK.delete(lockKey);
+		}
+	} catch (e) { }
 }
 const __WORKER_EXPORT__ = {
 	async fetch(request, env, ctx) {
@@ -1026,11 +1397,12 @@ const Router = {
 			}
 			if (user.auto_rotate_ip === 1) {
 				const cachedIpsData = await getCachedIps();
-				const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 20);
+				const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
 				if (randomIps.length > 0) user.ips = randomIps.join("\n");
 			}
-			const inlineProxyIpForStatusPage = await getInlineProxyIpSetting(env);
-			const otherCleanIpsForStatusPage = await getOtherCleanIpsSetting(env);
+			const statusPageIpSettings = await getSubscriptionIpSettings(env);
+			const inlineProxyIpForStatusPage = statusPageIpSettings.inlineProxyIp;
+			const otherCleanIpsForStatusPage = statusPageIpSettings.otherCleanIps;
 			const userJson = JSON.stringify({
 				username: user.username,
 				uuid: user.uuid,
@@ -1308,11 +1680,16 @@ const Router = {
 				});
 				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
 				const newCode = await githubRes.text();
+				assertDeployableWorkerModule(newCode, "zeus.obfuscated.js");
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
 				});
-				if (!bindingsRes.ok) throw new Error("عدم دسترسی به تنظیمات ورکر. کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")");
+				if (!bindingsRes.ok) {
+					const bindingsErr = await bindingsRes.json().catch(() => ({}));
+					const bindingsErrMsg = bindingsErr && bindingsErr.errors && bindingsErr.errors[0] ? bindingsErr.errors[0].message : "";
+					throw new Error("عدم دسترسی به تنظیمات ورکر «" + scriptName + "». کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")" + (bindingsErrMsg ? ": " + bindingsErrMsg : ""));
+				}
 				const bindingsData = await bindingsRes.json().catch(() => ({}));
 				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
 				const newBindings = [];
@@ -1390,11 +1767,16 @@ const Router = {
 				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
 				const newCode = await githubRes.text();
 				if (!newCode || newCode.trim().length < 100) throw new Error("فایل دریافتی از گیت‌هاب خالی یا نامعتبر است.");
+				assertDeployableWorkerModule(newCode, "worker.js");
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
 				});
-				if (!bindingsRes.ok) throw new Error("عدم دسترسی به تنظیمات ورکر. کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")");
+				if (!bindingsRes.ok) {
+					const bindingsErr = await bindingsRes.json().catch(() => ({}));
+					const bindingsErrMsg = bindingsErr && bindingsErr.errors && bindingsErr.errors[0] ? bindingsErr.errors[0].message : "";
+					throw new Error("عدم دسترسی به تنظیمات ورکر «" + scriptName + "». کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")" + (bindingsErrMsg ? ": " + bindingsErrMsg : ""));
+				}
 				const bindingsData = await bindingsRes.json().catch(() => ({}));
 				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
 				const newBindings = [];
@@ -1441,23 +1823,30 @@ const Router = {
 			}
 		}
 		if (url.pathname === "/api/change-password" && request.method === "POST") {
-			const { current_password, new_password } = await readJsonBody(request);
+			const { current_password, new_password, password } = await readJsonBody(request);
+			// Master-key call (mother panel): the gate above already validated X-Master-Key against
+			// settings.master_api_key (verifyApiAuth uses ONLY the header when it is present), so the
+			// current password is not required. The mother sends the new password as `password`;
+			// the panel's own UI keeps sending current_password + new_password, unchanged.
+			const viaMasterKey = !!request.headers.get("X-Master-Key");
 			const cleanCurrent = (current_password || "").trim();
-			const cleanNew = (new_password || "").trim();
-			if (!cleanCurrent || !cleanNew) {
-				return new Response(JSON.stringify({ error: "رمز عبور فعلی و جدید الزامی هستند" }), {
+			const cleanNew = (new_password || password || "").trim();
+			if (!cleanNew || (!viaMasterKey && !cleanCurrent)) {
+				return new Response(JSON.stringify({ error: viaMasterKey ? "رمز عبور جدید الزامی است" : "رمز عبور فعلی و جدید الزامی هستند" }), {
 					status: 400,
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
 			}
-			const currentHash = await DbService.sha256(cleanCurrent);
-			const oldCurrentHash = await DbService.oldSha256(cleanCurrent);
-			const storedHash = await DbService.getPanelPassword(env.DB, true);
-			if (storedHash && storedHash !== currentHash && storedHash !== oldCurrentHash) {
-				return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), {
-					status: 401,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
+			if (!viaMasterKey) {
+				const currentHash = await DbService.sha256(cleanCurrent);
+				const oldCurrentHash = await DbService.oldSha256(cleanCurrent);
+				const storedHash = await DbService.getPanelPassword(env.DB, true);
+				if (storedHash && storedHash !== currentHash && storedHash !== oldCurrentHash) {
+					return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), {
+						status: 401,
+						headers: { "Content-Type": "application/json; charset=utf-8" },
+					});
+				}
 			}
 			if (cleanNew.length < 4) {
 				return new Response(JSON.stringify({ error: "رمز عبور جدید باید حداقل ۴ کاراکتر باشد" }), {
@@ -1491,12 +1880,155 @@ const Router = {
 			}
 			if (request.method === "POST") {
 				const body = await readJsonBody(request);
+				let unpinRemoval = { countries: [], usersUpdated: 0 };
+				let fragApplied = false;
+				let userLimitApplied = false;
+				let fingerprintApplied = false;
+				let connTypeApplied = false;
+				let cleanIpApplied = false;
+				let portApplied = false;
 				if (body.settings && typeof body.settings === "object") {
-					for (const [k, v] of Object.entries(body.settings)) {
-						await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v)).run();
+					// «محدودیت کاربر» (user_limit): برخلاف بقیه‌ی تنظیمات global، این یکی روی ستون
+					// ip_limit/max_connections همه‌ی کاربرهای *موجود* هم override می‌شه (نه فقط پیش‌فرض
+					// کاربر تازه‌ساز - نگاه کنید به POST /api/users). هم «ذخیره‌ی تنظیمات» همین پنل و
+					// هم «Push to Panels» پنل مادر از همین مسیر می‌رن. (تنظیم «هشدار تعداد دستگاه» -
+					// device_warning_threshold - فقط ذخیره می‌شه و آستانه‌ی هشدار رو تعیین می‌کنه؛
+					// دیگه روی ip_limit/max_connections کاربرها اثری نداره.)
+					let overrideUserLimit = undefined;
+					if (Object.prototype.hasOwnProperty.call(body.settings, "user_limit")) {
+						const parsedUserLimit = parseInt(body.settings.user_limit);
+						if (!isNaN(parsedUserLimit) && parsedUserLimit >= 0) overrideUserLimit = parsedUserLimit;
+					}
+					// «پورت»: مثل بالا، این یکی هم - برخلاف بقیه‌ی تنظیمات global - روی ستون
+					// port همه‌ی کاربرهای *موجود* بازنویسی کامل می‌شه (نه فقط پیش‌فرض کاربر
+					// تازه‌ساز؛ نگاه کنید به getDefaultPortSetting() برای اون بخش). پورت(های)
+					// قبلی هر کاربر پاک و با همین یکی جایگزین می‌شه. مثل user_limit/global_clean_ip
+					// بالا و پایین، موفقیتش با port_applied: true توی جواب گزارش می‌شه تا پنل
+					// مادر هم بتونه پنل‌های آپدیت‌نشده رو (که این کلید رو نادیده می‌گیرن) تشخیص بده.
+					let overrideDefaultPort = undefined;
+					if (Object.prototype.hasOwnProperty.call(body.settings, "default_port")) {
+						const parsedPort = parseInt(body.settings.default_port);
+						if (!isNaN(parsedPort) && parsedPort > 0 && parsedPort <= 65535) overrideDefaultPort = String(parsedPort);
+					}
+					// «آی‌پی تمیز سراسری» (global_clean_ip): مثل «پورت» و «محدودیت کاربر» بالا -
+					// برخلاف بقیه‌ی تنظیمات global - این یکی هم روی ستون ips همه‌ی کاربرهای
+					// *موجود* بازنویسی کامل می‌شود (نه فقط پیش‌فرض کاربر تازه‌ساز؛ نگاه کنید به
+					// POST /api/users که nud.global_clean_ip را فقط وقتی می‌خواند که خودِ کاربر
+					// در لحظه‌ی ساخت مقدار ips جدا نداشته باشد). قبل از این تغییر این کلید فقط
+					// در جدول settings ذخیره می‌شد و هیچ‌وقت به کارت‌های موجود نمی‌رسید — همین
+					// نبود override باعث می‌شد تغییر «Global Clean IP» در پنل مادر روی کارت
+					// کاربرهایی که از قبل ساخته شده بودند اثر نکند.
+					let overrideGlobalCleanIp = undefined;
+					if (Object.prototype.hasOwnProperty.call(body.settings, "global_clean_ip")) {
+						const cleanIpVal = String(body.settings.global_clean_ip == null ? "" : body.settings.global_clean_ip).trim();
+						if (cleanIpVal) overrideGlobalCleanIp = cleanIpVal;
+					}
+					// «فرگمنت» (new_user_frag_len / new_user_frag_int): کلیدهای new_user_* فقط
+					// پیش‌فرضِ کاربر *تازه‌ساز*ند. لینک‌ها از ستون‌های frag_len/frag_int خودِ هر
+					// کاربر ساخته می‌شوند (SubscriptionService.generateText)، نه از settings؛ پس
+					// ذخیره‌ی این دو کلید به‌تنهایی روی کانفیگ کاربرهای موجود هیچ اثری ندارد.
+					// فقط وقتی فراخواننده (Push پنل مادر) صریحاً apply_frag_to_existing_users: true
+					// بفرستد (فلگ بیرون از body.settings، مثل prune_unpinned_locations)، همین دو
+					// مقدار روی ستون frag_len/frag_int همه‌ی کاربرهای *موجود* هم نوشته می‌شود؛
+					// مقدار خالی = فرگمنتیشن خاموش. «ذخیره‌ی تنظیمات» خودِ همین پنل این فلگ را
+					// نمی‌فرستد، پس فقط برای کاربر بعدی اثر دارد. هر دو کلید باید در درخواست باشند.
+					let overrideFrag = undefined;
+					if (
+						body.apply_frag_to_existing_users === true &&
+						Object.prototype.hasOwnProperty.call(body.settings, "new_user_frag_len") &&
+						Object.prototype.hasOwnProperty.call(body.settings, "new_user_frag_int")
+					) {
+						overrideFrag = {
+							len: String(body.settings.new_user_frag_len == null ? "" : body.settings.new_user_frag_len).trim(),
+							int: String(body.settings.new_user_frag_int == null ? "" : body.settings.new_user_frag_int).trim(),
+						};
+					}
+					// «فینگرپرینت» (new_user_fingerprint) و «پروتکل» (new_user_connection_type): مثل فرگمنت،
+					// این دو کلید هم فقط پیش‌فرضِ کاربر *تازه‌ساز*ند؛ لینک‌ها از ستون‌های fingerprint/
+					// connection_type خودِ هر کاربر ساخته می‌شوند (SubscriptionService.generateText و
+					// چک پروتکل هنگام اتصال)، نه از settings؛ پس ذخیره‌ی کلید به‌تنهایی روی کانفیگ
+					// کاربرهای موجود اثری نداشت. فقط وقتی فراخواننده (Push پنل مادر) صریحاً
+					// apply_fingerprint_to_existing_users / apply_connection_type_to_existing_users: true
+					// بفرستد (فلگ بیرون از body.settings، مثل apply_frag_to_existing_users)، مقدار روی
+					// ستون همه‌ی کاربرهای *موجود* هم نوشته می‌شود. «ذخیره‌ی تنظیمات» خودِ همین پنل این
+					// فلگ‌ها را نمی‌فرستد، پس فقط برای کاربر بعدی اثر دارد. مقدار نامعتبر = نادیده گرفته
+					// می‌شود (و چون *_applied برنمی‌گردد، مادر آن را به‌عنوان خطا گزارش می‌کند).
+					let overrideFingerprint = undefined;
+					if (body.apply_fingerprint_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_fingerprint")) {
+						const fpVal = String(body.settings.new_user_fingerprint == null ? "" : body.settings.new_user_fingerprint).trim();
+						if (NEW_USER_FINGERPRINTS.includes(fpVal)) overrideFingerprint = fpVal;
+					}
+					let overrideConnType = undefined;
+					if (body.apply_connection_type_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_connection_type")) {
+						const ctParts = String(body.settings.new_user_connection_type == null ? "" : body.settings.new_user_connection_type)
+							.split(",")
+							.map((x) => x.trim().toLowerCase());
+						const ctFinal = ["vless", "trojan"].filter((x) => ctParts.includes(x));
+						if (ctFinal.length > 0) overrideConnType = ctFinal.join(",");
+					}
+					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
+					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
+					// «لیست لوکیشن‌های پین‌شده»: اگه این کلید توی همین درخواست هست، لیست قبلی رو
+					// قبل از نوشتن نگه می‌داریم تا بعدش بفهمیم کدوم کشورها آن‌پین شدن (چه از
+					// تنظیمات همین پنل، چه از «Push to All Panels» پنل مادر).
+					let previousPinnedLocations = null;
+					if (Object.prototype.hasOwnProperty.call(body.settings, "pinned_locations")) {
+						previousPinnedLocations = await getPinnedLocationsSetting(env);
+					}
+					const settingsStmts = Object.entries(body.settings).map(([k, v]) =>
+						env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v))
+					);
+					if (settingsStmts.length > 0) await env.DB.batch(settingsStmts);
+					// کشوری که از لیست پین‌شده‌ها حذف شده، از کانفیگ همه‌ی کاربرهای موجود هم
+					// پاک می‌شه (فقط کشورهایی که همین الان آن‌پین شدن - نه هر کشوری که پین نبوده).
+					// اگه فراخواننده (Push پنل مادر) فلگ prune_unpinned_locations رو هم فرستاده
+					// باشه، حالت «آینه‌ای» اجرا می‌شه: هر کشور تگ‌دار که توی لیست جدید نیست از
+					// همه‌ی کاربرها پاک می‌شه (نه فقط اونایی که همین الان آن‌پین شدن). فلگ باید
+					// بیرون از body.settings باشه، چون settings بدون whitelist ذخیره می‌شه.
+					if (previousPinnedLocations) {
+						const nowPinnedLocations = await getPinnedLocationsSetting(env);
+						if (body.prune_unpinned_locations === true) {
+							unpinRemoval = await removeUnpinnedCountriesFromAllUsers(env, ctx, nowPinnedLocations);
+						} else {
+							const unpinned = previousPinnedLocations.filter((cc) => !nowPinnedLocations.includes(cc));
+							if (unpinned.length > 0) {
+								unpinRemoval = await removeCountriesFromAllUsers(env, ctx, unpinned);
+							}
+						}
+					}
+					if (overrideUserLimit !== undefined) {
+						await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ?").bind(overrideUserLimit, overrideUserLimit).run();
+						userLimitApplied = true;
+					}
+					if (overrideDefaultPort !== undefined) {
+						await env.DB.prepare("UPDATE users SET port = ?").bind(overrideDefaultPort).run();
+						portApplied = true;
+					}
+					if (overrideGlobalCleanIp !== undefined) {
+						await env.DB.prepare("UPDATE users SET ips = ?").bind(overrideGlobalCleanIp).run();
+						cleanIpApplied = true;
+					}
+					if (overrideFrag !== undefined) {
+						await env.DB.prepare("UPDATE users SET frag_len = ?, frag_int = ?").bind(overrideFrag.len, overrideFrag.int).run();
+						fragApplied = true;
+					}
+					if (overrideFingerprint !== undefined) {
+						await env.DB.prepare("UPDATE users SET fingerprint = ?").bind(overrideFingerprint).run();
+						fingerprintApplied = true;
+					}
+					if (overrideConnType !== undefined) {
+						await env.DB.prepare("UPDATE users SET connection_type = ?").bind(overrideConnType).run();
+						connTypeApplied = true;
+						// connection_type is also checked on every incoming connection (VLESS/Trojan), and that
+						// lookup is cached for a few seconds — drop the cached entries so the new protocol
+						// takes effect immediately instead of after the TTL.
+						try {
+							const { results: ctUsers } = await env.DB.prepare("SELECT uuid, trojan_hash FROM users").all();
+							await Promise.all((ctUsers || []).map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
+						} catch (e) { /* best-effort: the cache expires by itself within seconds */ }
 					}
 				}
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/proxy-ip") {
@@ -1508,9 +2040,13 @@ const Router = {
 				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 			}
 			if (request.method === "GET") {
-				const rowIp = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
-				const rowIata = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_location_iata'").first();
-				const rowSocks = await env.DB.prepare("SELECT value FROM settings WHERE key = 'socks5'").first();
+				// سه کلید در یک کوئری (یک رفت‌وبرگشت D1 به‌جای سه‌تا) - خروجی بدون تغییر.
+				const proxyIpRows = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('proxy_ip','proxy_location_iata','socks5')").all();
+				const proxyIpMap = {};
+				(proxyIpRows.results || []).forEach((r) => { proxyIpMap[r.key] = r.value; });
+				const rowIp = proxyIpMap.proxy_ip !== undefined ? { value: proxyIpMap.proxy_ip } : null;
+				const rowIata = proxyIpMap.proxy_location_iata !== undefined ? { value: proxyIpMap.proxy_location_iata } : null;
+				const rowSocks = proxyIpMap.socks5 !== undefined ? { value: proxyIpMap.socks5 } : null;
 				return new Response(
 					JSON.stringify({
 						proxy_ip: rowIp ? rowIp.value : "",
@@ -1712,8 +2248,9 @@ const Router = {
 							// Manual cleanup: strips one specific country (body.country, e.g.
 							// "TR") out of this user's proxy list, if present. Independent of
 							// the additive "locations" action above - un-pinning a country in
-							// settings never does this automatically; the admin has to pick
-							// this action explicitly per country/user(s).
+							// settings now removes the country from all users automatically (see
+							// removeCountriesFromAllUsers()); this action is for removing a country
+							// from one specific user by hand.
 							const targetCountry = String(body.country || "").trim().toUpperCase();
 							if (!targetCountry) {
 								return new Response(JSON.stringify({ error: "Missing country" }), { status: 400, headers: { "Content-Type": "application/json" } });
@@ -1773,7 +2310,7 @@ const Router = {
 						} else if (connection_type) {
 							finalConnType = connection_type;
 						}
-						const existingUser = await env.DB.prepare("SELECT id, uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
+						const existingUser = await env.DB.prepare("SELECT id, uuid, trojan_hash, user_socks5 FROM users WHERE username = ?").bind(username).first();
 						let finalUuid = existingUser ? existingUser.uuid : null;
 						if (new_uuid !== undefined && new_uuid !== null && String(new_uuid).trim() !== "") {
 							const trimmedUuid = String(new_uuid).trim().toLowerCase();
@@ -1789,9 +2326,30 @@ const Router = {
 							finalUuid = trimmedUuid;
 						}
 						const trojanHash = finalUuid ? sha224Pure(finalUuid) : null;
+						// "Reset to Default" (edit-user modal): the form already carries every other field at its
+						// new-user default (the client did that), so the rest of this PUT just saves them; usage
+						// counters (used_gb, used_req, lifetime_used_gb, created_at, first_connection_time ...) are
+						// not in the UPDATE below and stay untouched. What only the server can do is throw the
+						// user's proxy list away and rebuild it from the pinned locations in Settings - the same
+						// list a brand-new user gets. Otherwise keep the country tag of every slot the admin left
+						// unchanged (see preserveProxyCountryTags() for why the form alone can't do it).
+						const resetProxyToDefault = body.reset_user_to_default === true;
+						let finalUserSocks5 = user_socks5;
+						if (resetProxyToDefault) {
+							const pinnedForReset = await getPinnedLocationsSetting(env);
+							const rebuiltList = await buildPinnedDefaultProxyList(pinnedForReset);
+							// Every VIP list unreachable/empty (e.g. the source is down right now) would turn a
+							// working-but-mistagged user into a direct-only one - refuse and leave the user untouched.
+							if (rebuiltList.length > 0 && rebuiltList.every((slot) => !slot.proxy)) {
+								return new Response(JSON.stringify({ error: "لیست پروکسی‌های VIP در حال حاضر در دسترس نیست؛ هیچ تغییری اعمال نشد. کمی بعد دوباره تلاش کنید." }), { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } });
+							}
+							finalUserSocks5 = JSON.stringify(rebuiltList);
+						} else {
+							finalUserSocks5 = preserveProxyCountryTags(user_socks5, existingUser ? existingUser.user_socks5 : null);
+						}
 						try {
 							await env.DB.prepare("UPDATE users SET username = ?, uuid = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, advanced_frag = ?, cipher_suites = ?, tls_mask = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ?, start_on_first_connect = ?, enable_direct = ?, connection_type = CASE WHEN ? IS NOT NULL THEN ? ELSE connection_type END, trojan_hash = ? WHERE username = ?")
-								.bind(new_username || username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
+								.bind(new_username || username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, finalUserSocks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 999999, (resetProxyToDefault || auto_rotate_user_proxy) ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
 								.run();
 						} catch (err) {
 							// اگه این خطا دقیقاً برخورد با ایندکس UNIQUE جدید uuid باشه (فقط در یک ریس-کاندیشن واقعی ممکنه، چون بالاتر همین uuid چک شده)، همون پیام دوستانه‌ی همیشگی رو برگردون؛ برای هر خطای دیگه‌ی دیتابیس هم به‌جای کرش کردن، خطای تمیز JSON برگردون
@@ -1800,6 +2358,14 @@ const Router = {
 								return new Response(JSON.stringify({ error: "این UUID قبلاً برای کاربر دیگری استفاده شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
 							}
 							return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
+						}
+						if (resetProxyToDefault) {
+							// fresh list => old per-country auto-heal cooldowns no longer apply. The auto-reset timers
+							// are restarted from today exactly like POST /api/users does for a new user: last_reset_*_time
+							// defaults to 0 for old rows, so once the defaults switch auto-reset on, checkAutoResets()
+							// would otherwise see a "period long overdue" and zero used_gb / used_req at its next run.
+							const resetTodayUtc = Math.floor(Date.now() / 86400000) * 86400000;
+							try { await env.DB.prepare("UPDATE users SET proxy_rotate_cooldowns = '{}', last_reset_vol_time = ?, last_reset_req_time = ? WHERE username = ?").bind(resetTodayUtc, resetTodayUtc, new_username || username).run(); } catch (e) { }
 						}
 						// Invalidate the old identity's cache entries (covers the common case where
 						// uuid didn't change too). If the admin also assigned a new uuid, invalidate
@@ -1837,7 +2403,7 @@ const Router = {
 						const enrichedUsers = (results || []).map((user) => {
 							let finalIps = user.ips;
 							if (user.auto_rotate_ip === 1) {
-								const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 20);
+								const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
 								if (randomIps.length > 0) finalIps = randomIps.join("\n");
 							}
 							const currentOnlineCount = Math.max((ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0), getActiveIpCount(user.active_ips));
@@ -1855,18 +2421,20 @@ const Router = {
 								device_warning: deviceWarning,
 							};
 						});
+						// چهار کلیدی که این endpoint از جدول settings لازم داره، به‌جای چهار SELECT جدا
+						// (چهار رفت‌وبرگشت D1 روی هر بار رفرش پنل) با یک کوئری IN (...) خونده می‌شن -
+						// همون الگوی isGlobalReqLimitReached. نتیجه دقیقاً یکیه، فقط ارزون‌تر.
+						const panelSettings = {};
+						try {
+							const settingsRes = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('req_last_date','req_total','req_today','deleted_users_gb')").all();
+							(settingsRes.results || []).forEach((r) => { panelSettings[r.key] = r.value; });
+						} catch (e) { }
 						let cfReqs = { today: 0, total: 0, d1Reads: 0, d1Writes: 0 };
 						try {
 							const liveCf = await getCfUsage(env);
 							const todayStr = new Date().toISOString().split("T")[0];
-							const dateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
-							const totalRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_total'").first();
-							let dbTotal = totalRow ? parseInt(totalRow.value) || 0 : 0;
-							let dbToday = 0;
-							if (dateRow && dateRow.value === todayStr) {
-								const todayRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_today'").first();
-								dbToday = todayRow ? parseInt(todayRow.value) || 0 : 0;
-							}
+							let dbTotal = parseInt(panelSettings.req_total) || 0;
+							let dbToday = panelSettings.req_last_date === todayStr ? parseInt(panelSettings.req_today) || 0 : 0;
 							if (liveCf.today > dbToday) {
 								dbToday = liveCf.today;
 								await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbToday), String(dbToday)).run();
@@ -1881,11 +2449,8 @@ const Router = {
 							cfReqs.d1Reads = liveCf.d1Reads;
 							cfReqs.d1Writes = liveCf.d1Writes;
 						} catch (e) { }
-						let deletedGb = 0;
-						try {
-							const delRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'deleted_users_gb'").first();
-							if (delRow) deletedGb = parseFloat(delRow.value) || 0;
-						} catch (e) {}
+						// از همون panelSettings بالا (بدون SELECT جداگانه).
+						const deletedGb = parseFloat(panelSettings.deleted_users_gb) || 0;
 						// آمار ترافیک روزانه / 7 روز گذشته / 30 روز گذشته از جدول daily_traffic - حالا که ذخیره‌سازی
 						// ساعتی‌ست، این‌ها بازه‌ی رولینگ واقعی‌اند (دقیقاً 24/7×24/30×24 ساعت گذشته از همین لحظه،
 						// با دقت ~۱ ساعت)، نه از نیمه‌شب UTC. حداکثر 24/168/720 ردیف اسکن می‌شه، هنوز ارزان.
@@ -2007,14 +2572,30 @@ const Router = {
 							finalConnType = connection_type;
 						}
 						const trojanHash = sha224Pure(finalUuid);
-						// «هشدار تعداد دستگاه»: اگه ادمین دستی چیزی توی فیلد «محدودیت کاربر» وارد
-						// نکرده باشه (ip_limit خالی/نال)، به‌جای نال، آستانه‌ی سراسری تنظیم‌شده
-						// (device_warning_threshold - پیش‌فرض ۴) روی ip_limit این کاربر جدید ست
-						// می‌شه. این فقط مبنای هشدار پنل ادمینه (persistActiveIp/device_warning_at
-						// پایین‌تر)، enforcement/قطع اتصال جدا و از قبل Bypass شده و دست‌نخورده
-						// می‌مونه. اگه ادمین عدد دیگه‌ای (حتی ۰) وارد کرده باشه، همون عدد ادمین
-						// برنده‌ست، نه پیش‌فرض سراسری.
-						const finalIpLimit = ip_limit !== undefined && ip_limit !== null && String(ip_limit).trim() !== "" ? parseInt(ip_limit) : await getDeviceWarningThresholdSetting(env);
+						// «محدودیت کاربر»: اگه ادمین/فرم/API چیزی توی این فیلد نفرستاده باشه (ip_limit
+						// خالی/نال)، به‌جای نال، عدد سراسریِ تنظیم‌شده (user_limit - پیش‌فرض ۲) روی
+						// ip_limit و max_connections این کاربر جدید ست می‌شه. اگه عدد دیگه‌ای (حتی ۰)
+						// فرستاده شده باشه، همون عدد برنده‌ست، نه پیش‌فرض سراسری. (تنظیم جدای «هشدار
+						// تعداد دستگاه» - device_warning_threshold - دیگه اینجا هیچ نقشی نداره.)
+						const finalIpLimit = ip_limit !== undefined && ip_limit !== null && String(ip_limit).trim() !== "" ? parseInt(ip_limit) : await getUserLimitSetting(env);
+						// «پورت»: اگه ادمین/فرم چیزی برای port نفرستاده باشه (خالی/نال)، به‌جای
+						// نال، پورت پیش‌فرض سراسری تنظیم‌شده (default_port - پیش‌فرض ۲۰۸۳) روی
+						// این کاربر تازه ست می‌شه. اگه مقداری فرستاده شده باشه (مثلاً از چک‌باکس‌های
+						// فرم افزودن کاربر)، همون مقدار برنده‌ست.
+						const finalPort = port !== undefined && port !== null && String(port).trim() !== "" ? port : await getDefaultPortSetting(env);
+						// «پیش‌فرض‌های کاربر جدید» (Settings → new_user_*): هر فیلدی که درخواست
+						// اصلاً نفرستاده باشد (undefined/null) از این‌جا پر می‌شود، تا کاربری که با API
+						// ساخته می‌شود (مثلاً از پنل مادر) دقیقاً همان مقادیری را بگیرد که فرم دستی
+						// «ایجاد کاربر جدید» پیش‌فرض می‌کند. فرم دستی همه‌ی این فیلدها را صریح
+						// می‌فرستد، پس رفتار آن عوض نمی‌شود - مقدار صریح همیشه برنده است.
+						const nud = await getNewUserDefaults(env);
+						const given = (v) => v !== undefined && v !== null;
+						const flagOf = (v, dfltStr) => (given(v) ? (v && v !== "0" && v !== "false" ? 1 : 0) : dfltStr === "1" ? 1 : 0);
+						const intOf = (v, dfltStr) => (given(v) ? parseInt(v) || 0 : parseInt(dfltStr) || 0);
+						const finalFingerprint = fingerprint || nud.new_user_fingerprint;
+						const finalIps = ips !== undefined ? ips : nud.global_clean_ip;
+						const finalTls = given(tls) && String(tls).trim() !== "" ? tls : String(finalPort).split(",").some((p) => NEW_USER_TLS_PORTS.includes(p.trim())) ? "on" : "off";
+						if (!(protocols && Array.isArray(protocols) && protocols.length > 0) && !connection_type) finalConnType = nud.new_user_connection_type;
 						// Every new user is always pinned to whatever the current
 						// pinned_locations setting holds (see getPinnedLocationsSetting();
 						// falls back to the built-in 15-country default if that setting
@@ -2024,7 +2605,7 @@ const Router = {
 						// this request doesn't have to wait on a full round of live
 						// proxy testing.
 						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, port, fingerprint || "chrome", finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, 1, start_on_first_connect ? 1 : 0, null, trojanHash, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1)
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct))
 							.run();
 						// Clears any stale negative-cache ("no such user") entry that might exist for
 						// this uuid/hash from an earlier probe or connection attempt with this UUID.
@@ -2079,6 +2660,10 @@ const DbService = {
 				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_clean_ip', ?)").bind(DEFAULT_GLOBAL_CLEAN_IP_FALLBACK).run();
 				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('other_clean_ips', ?)").bind(DEFAULT_OTHER_CLEAN_IPS_FALLBACK.join("\n")).run();
 				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('inline_proxy_ip', ?)").bind(DEFAULT_INLINE_PROXY_IP_FALLBACK).run();
+				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_port', ?)").bind(DEFAULT_PORT_FALLBACK).run();
+				// پیش‌فرض‌های کاربر جدید (new_user_*) - یک batch، INSERT OR IGNORE: کلیدی که
+				// ادمین/پنل مادر قبلاً ذخیره کرده دست‌نخورده می‌ماند.
+				await db.batch(Object.entries(NEW_USER_DEFAULTS_FALLBACK).map(([k, v]) => db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").bind(k, v)));
 			} catch (e) { }
 			try {
 				// جدول ترافیک، به تفکیک ساعت UTC (ستون "date" همچنان TEXT PRIMARY KEY است، فقط از این پس
@@ -2132,7 +2717,7 @@ const DbService = {
 					{ name: "auto_rotate_ip", def: "INTEGER DEFAULT 1" },
 					{ name: "rotate_time", def: "INTEGER DEFAULT 0" },
 					{ name: "ip_operator", def: "TEXT DEFAULT 'all'" },
-					{ name: "ip_count", def: "INTEGER DEFAULT 15" },
+					{ name: "ip_count", def: "INTEGER DEFAULT 999999" },
 					{ name: "last_rotate_time", def: "INTEGER DEFAULT 0" },
 					{ name: "auto_rotate_user_proxy", def: "INTEGER DEFAULT 0" },
 					{ name: "start_on_first_connect", def: "INTEGER DEFAULT 0" },
@@ -2141,6 +2726,8 @@ const DbService = {
 					{ name: "enable_direct", def: "INTEGER DEFAULT 1" },
 					{ name: "proxy_rotate_cooldowns", def: "TEXT DEFAULT '{}'" },
 					{ name: "device_warning_at", def: "INTEGER DEFAULT NULL" },
+					{ name: "device_warning_peak_count", def: "INTEGER DEFAULT NULL" },
+					{ name: "device_warning_streak", def: "INTEGER DEFAULT 0" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
@@ -2227,18 +2814,49 @@ const DbService = {
 // instead of every connection/heartbeat. A per-username promise-chain lock serializes this
 // within the same isolate so two near-simultaneous writes for the same user can't still race
 // each other on the read step.
+//
+// «تأخیر هشدار تعداد دستگاه» (device_warning_at delay/streak - نگاه کنید DEVICE_WARNING_CONFIRM_STREAK
+// بالای فایل): به‌جای ثبتِ فوریِ هشدار همون اولین باری که activeDeviceCount از آستانه رد
+// می‌شه، device_warning_at فقط وقتی واقعاً ست می‌شه که این تعداد بار پشت‌سرهم عبور از
+// آستانه دیده شده باشه. persistActiveIp (رفرش IP از قبل تأییدشده) و confirmActiveIp (تأیید
+// IP تازه) هر دو از همین یه تابع استفاده می‌کنن تا این حساب یه‌جا بمونه و دوبار نوشته نشه.
+function evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now) {
+	const overThreshold = !!(warnThreshold && warnThreshold > 0 && activeDeviceCount > warnThreshold);
+	// برگشتن به زیر آستانه (حتی یه بار) شمارش رو صفر می‌کنه - یعنی نوسانِ کوتاه دور
+	// آستانه هیچ‌وقت به تنهایی هشدار نمی‌سازه، باید واقعاً پشت‌سرهم بمونه.
+	const newStreak = overThreshold ? (prevStreak || 0) + 1 : 0;
+	const shouldWarn = newStreak >= DEVICE_WARNING_CONFIRM_STREAK;
+	// «بیشترین تعداد دستگاه» (device_warning_peak_count): همون منطق قبلی، دست‌نخورده -
+	// فقط وقتی چرخه‌ی هشدارِ قبلی هنوز منقضی نشده (کمتر از ۲۴ ساعت) بیشینه نگه داشته
+	// می‌شه؛ وگرنه یه چرخه‌ی تازه از همین عدد فعلی شروع می‌شه.
+	const warningStillFresh = !!(prevWarningAt && now - prevWarningAt < 24 * 60 * 60 * 1000);
+	const newPeakCount = warningStillFresh ? Math.max(prevPeakCount || 0, activeDeviceCount) : activeDeviceCount;
+	return { shouldWarn, newStreak, newPeakCount };
+}
 async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 	const run = async () => {
 		let freshIps = {};
-		let ipLimit = null;
+		let warnThreshold = DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		let prevWarningAt = null;
+		let prevPeakCount = null;
+		let prevStreak = 0;
 		try {
-			const row = await env.DB.prepare("SELECT active_ips, ip_limit FROM users WHERE uuid = ?").bind(uuid).first();
+			// آستانه‌ی سراسری «هشدار تعداد دستگاه» (settings.device_warning_threshold) با همون کوئری
+			// ردیف کاربر و به‌صورت subselect خونده می‌شه - بدون رفت‌وبرگشت اضافه‌ی D1.
+			const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, device_warning_streak, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
 			freshIps = JSON.parse((row && row.active_ips) || "{}");
-			ipLimit = row ? row.ip_limit : null;
+			warnThreshold = parseDeviceWarningThreshold(row ? row.dw_threshold : null);
+			prevWarningAt = row ? row.device_warning_at : null;
+			prevPeakCount = row ? row.device_warning_peak_count : null;
+			prevStreak = (row && row.device_warning_streak) || 0;
 		} catch (e) { }
 		for (const [ip, data] of Object.entries(freshIps)) {
 			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-			if (now - lastSeen > 180000 && ip !== clientIP) delete freshIps[ip];
+			const lastSeenNum = typeof lastSeen === "number" ? lastSeen : Number(lastSeen);
+			// مقدار خراب/غیرعددی (undefined، null، رشته‌ی نامعتبر) هم «کهنه» حساب می‌شه: قبلاً
+			// now - lastSeen برای این‌ها NaN می‌شد، مقایسه false برمی‌گشت و اون IP هیچ‌وقت
+			// prune نمی‌شد - یعنی برای همیشه توی شمارنده‌ی دستگاه‌های آنلاین می‌موند.
+			if (ip !== clientIP && (!isFinite(lastSeenNum) || now - lastSeenNum > 180000)) delete freshIps[ip];
 		}
 		if (freshIps[clientIP] && typeof freshIps[clientIP] === "object") {
 			freshIps[clientIP].timestamp = now;
@@ -2246,19 +2864,17 @@ async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 		} else {
 			freshIps[clientIP] = { timestamp: now, count: 1 };
 		}
-		// «هشدار تعداد دستگاه» (admin-facing only - NOT enforcement, enforcement stays
-		// /* Bypassed */ elsewhere): همین‌جا، دقیقاً روی همون snapshot تازه‌ای که بالا
-		// merge شد (نه یک کپی جدا)، اگه تعداد دستگاه‌های فعال از ip_limit این کاربر
-		// بیشتر شده باشه، device_warning_at با زمان الان ست می‌شه. پنل/API با
-		// `(now - device_warning_at) < 24h` این رو به‌صورت یک هشدار روی کارت کاربر
-		// نشون می‌ده (نگاه کنید به GET /api/users و رندر کارت کاربر در پنل).
+		// «هشدار تعداد دستگاه» (admin-facing only - NOT enforcement, enforcement moved to
+		// confirmActiveIp() - نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): همین‌جا، دقیقاً
+		// روی همون snapshot تازه‌ای که بالا merge شد (نه یک کپی جدا)، evaluateDeviceWarning
+		// تصمیم می‌گیره که آیا device_warning_at واقعاً ست بشه یا فقط شمارش (streak) جلو بره.
 		const activeDeviceCount = Object.keys(freshIps).length;
-		const exceededLimit = ipLimit && ipLimit > 0 && activeDeviceCount > ipLimit;
+		const { shouldWarn, newStreak, newPeakCount } = evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now);
 		try {
-			if (exceededLimit) {
-				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, uuid).run();
+			if (shouldWarn) {
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, newStreak, uuid).run();
 			} else {
-				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, uuid).run();
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, newStreak, uuid).run();
 			}
 		} catch (e) { }
 	};
@@ -2267,6 +2883,90 @@ async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 	GLOBAL_ACTIVE_IPS_WRITE_LOCK.set(username, chained);
 	if (ctx) ctx.waitUntil(chained);
 	else await chained;
+}
+// «تأیید دستگاه» (confirmActiveIp) - طبق سیاستِ «دیده‌شده/تأییدشده» (نگاه کنید توضیح
+// DEVICE_CONFIRM_* بالای فایل)، این تنها جاییه که یک IPِ *تازه* واقعاً «تأییدشده» می‌شه:
+// توی active_ips نوشته می‌شه، جزو تعداد دستگاه‌ها حساب می‌شه، و به سقف «محدودیت
+// کاربر»/ip_limit می‌خوره - این سقف هم از همین نسخه به بعد فقط همین‌جا (لحظه‌ی تأیید)
+// چک می‌شه، نه موقع هندشیک اولیه‌ی اتصال. فقط از checkDeviceConfirmation() توی
+// handlevIees صدا زده می‌شه، وقتی شرطِ «اتصال پایدار» یا «اتصال‌های کوتاهِ زیاد» رد شده
+// باشه. با persistActiveIp() روی همون قفلِ per-username (GLOBAL_ACTIVE_IPS_WRITE_LOCK)
+// مشترکه تا این دوتا هیچ‌وقت رو نوشتنِ همدیگه روی ستون active_ips مسابقه ندن. خروجی:
+// true = تأیید شد/جا بود، false = سقف پر بود (تماس‌گیرنده باید همین اتصال رو ببنده).
+async function confirmActiveIp(env, ctx, uuid, username, clientIP, now) {
+	let admitted = true;
+	const run = async () => {
+		let freshIps = {};
+		let warnThreshold = DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		let prevWarningAt = null;
+		let prevPeakCount = null;
+		let prevStreak = 0;
+		let ipLimit = null;
+		try {
+			const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, device_warning_streak, ip_limit, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
+			freshIps = JSON.parse((row && row.active_ips) || "{}");
+			warnThreshold = parseDeviceWarningThreshold(row ? row.dw_threshold : null);
+			prevWarningAt = row ? row.device_warning_at : null;
+			prevPeakCount = row ? row.device_warning_peak_count : null;
+			prevStreak = (row && row.device_warning_streak) || 0;
+			ipLimit = row ? row.ip_limit : null;
+		} catch (e) { }
+		for (const [ip, data] of Object.entries(freshIps)) {
+			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+			const lastSeenNum = typeof lastSeen === "number" ? lastSeen : Number(lastSeen);
+			if (ip !== clientIP && (!isFinite(lastSeenNum) || now - lastSeenNum > 180000)) delete freshIps[ip];
+		}
+		if (!freshIps[clientIP]) {
+			// «سقف در لحظه‌ی تأیید، نه هندشیک»: دقیقاً همون مقایسه‌ای که قبلاً موقع هندشیک
+			// انجام می‌شد (>= ip_limit یعنی جا نیست)، فقط حالا اینجا و روی دیتای تازه.
+			const confirmedCount = Object.keys(freshIps).length;
+			if (ipLimit && ipLimit > 0 && confirmedCount >= ipLimit) {
+				admitted = false;
+				return;
+			}
+			freshIps[clientIP] = { timestamp: now, count: 1 };
+		} else {
+			// یه اتصال دیگه از همین (کاربر, IP) زودتر (مثلاً هم‌زمان) تأیید کرده بوده - فقط رفرش.
+			if (typeof freshIps[clientIP] === "object") {
+				freshIps[clientIP].timestamp = now;
+				freshIps[clientIP].count = (freshIps[clientIP].count || 0) + 1;
+			} else {
+				freshIps[clientIP] = { timestamp: now, count: 1 };
+			}
+		}
+		const activeDeviceCount = Object.keys(freshIps).length;
+		const { shouldWarn, newStreak, newPeakCount } = evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now);
+		try {
+			if (shouldWarn) {
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, newStreak, uuid).run();
+			} else {
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, newStreak, uuid).run();
+			}
+		} catch (e) { }
+	};
+	const prior = GLOBAL_ACTIVE_IPS_WRITE_LOCK.get(username) || Promise.resolve();
+	const chained = prior.then(run, run);
+	GLOBAL_ACTIVE_IPS_WRITE_LOCK.set(username, chained);
+	if (ctx) ctx.waitUntil(chained);
+	await chained;
+	return admitted;
+}
+// «دیده‌شده/تأییدشده» - کمک‌تابع‌های DEVICE_CONFIRM_BURST_* (شرط «اتصال‌های کوتاهِ زیاد»):
+// recordBurstBytes روی هر addBytes صدا زده می‌شه (فقط تا وقتی همون اتصال تأیید نشده)،
+// getBurstBytes فقط می‌خونه (از checkDeviceConfirmation/هیت‌بیت). کلید همیشه
+// `${username}|${clientIP}` است - نگاه کنید توضیح IP_BURST_BYTES بالای فایل.
+function recordBurstBytes(key, bytes, now) {
+	let entry = IP_BURST_BYTES.get(key);
+	if (!entry || now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) {
+		entry = { bytes: 0, windowStart: now };
+	}
+	entry.bytes += bytes;
+	IP_BURST_BYTES.set(key, entry);
+}
+function getBurstBytes(key, now) {
+	const entry = IP_BURST_BYTES.get(key);
+	if (!entry || now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) return 0;
+	return entry.bytes;
 }
 function getActiveIpCount(activeIpsJson) {
 	if (!activeIpsJson) return 0;
@@ -2304,14 +3004,32 @@ function buildInlineProxyIpSegment(ip) {
 		return "";
 	}
 }
-async function getInlineProxyIpSetting(env) {
-	if (!env || !env.DB) return DEFAULT_INLINE_PROXY_IP_FALLBACK;
+// «Proxy IP» (inline_proxy_ip) و «آیپی‌های تمیز دیگر» (other_clean_ips) همیشه با هم و در
+// همون یک درخواست لازم می‌شن (ساب متنی، ساب Singbox، و رندر صفحه‌ی status). قبلاً هرکدوم
+// یک SELECT جدا بودن، یعنی دو رفت‌وبرگشت D1 روی هر فچ ساب؛ حالا هر دو کلید با یک کوئری
+// IN (...) خونده می‌شن - همون الگوی isGlobalReqLimitReached و GET /api/users.
+// فالبک‌ها عیناً همون رفتار قبلیِ دو getter جدا هستن: «کلید اصلاً ذخیره نشده» (نصب تازه)
+// فالبک می‌گیره، ولی «کلیدِ ذخیره‌شده‌ی خالی» عمداً خالی می‌مونه و فیچر خاموش می‌شه -
+// به همین خاطر نبودِ ردیف با مقدارِ خالی تفکیک می‌شه، نه فقط falsy بودن مقدار.
+async function getSubscriptionIpSettings(env) {
+	const fallback = { inlineProxyIp: DEFAULT_INLINE_PROXY_IP_FALLBACK, otherCleanIps: DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice() };
+	if (!env || !env.DB) return fallback;
 	try {
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'inline_proxy_ip'").first();
-		if (!row) return DEFAULT_INLINE_PROXY_IP_FALLBACK; // never configured (fresh install/DB) -> app default
-		return row.value ? String(row.value).trim() : ""; // explicitly saved empty -> respect it, feature stays off
+		const res = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('inline_proxy_ip','other_clean_ips')").all();
+		const map = {};
+		(res.results || []).forEach((r) => { map[r.key] = r.value; });
+		const hasInline = Object.prototype.hasOwnProperty.call(map, "inline_proxy_ip");
+		const hasOther = Object.prototype.hasOwnProperty.call(map, "other_clean_ips");
+		return {
+			inlineProxyIp: !hasInline ? DEFAULT_INLINE_PROXY_IP_FALLBACK : (map.inline_proxy_ip ? String(map.inline_proxy_ip).trim() : ""),
+			otherCleanIps: !hasOther
+				? DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice()
+				: !map.other_clean_ips
+					? []
+					: String(map.other_clean_ips).split("\n").map((ip) => ip.trim()).filter((ip) => ip.length > 0),
+		};
 	} catch (e) {
-		return DEFAULT_INLINE_PROXY_IP_FALLBACK;
+		return fallback;
 	}
 }
 // Extra always-on clean-IP addresses ("آیپی های تمیز دیگر" panel setting).
@@ -2319,25 +3037,17 @@ async function getInlineProxyIpSetting(env) {
 // configs, addressed at that IP, using the same Path as the admin-configured
 // "Proxy IP" inline segment (see buildInlineProxyIpSegment above), and
 // named with a German flag + zero-padded index (see call sites).
-async function getOtherCleanIpsSetting(env) {
-	if (!env || !env.DB) return DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice();
-	try {
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'other_clean_ips'").first();
-		if (!row) return DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice(); // never configured (fresh install/DB) -> app default
-		if (!row.value) return []; // explicitly saved empty -> respect it, no extra clean IPs
-		return String(row.value)
-			.split("\n")
-			.map((ip) => ip.trim())
-			.filter((ip) => ip.length > 0);
-	} catch (e) {
-		return DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice();
-	}
-}
 // Reads the admin-editable pinned-locations list from the settings table
 // (see the "لوکیشن‌ها" section of the settings modal / saveLocations() on
-// the client side). Falls back to PINNED_DEFAULT_LOCATIONS_FALLBACK if the
-// setting was never saved, is malformed, or ends up empty after validation -
-// so a fresh install (or a corrupted value) never breaks user provisioning.
+// the client side). Falls back to PINNED_DEFAULT_LOCATIONS_FALLBACK ONLY if the
+// setting was never saved (no row / empty string) or is malformed (not valid
+// JSON, or not an array) - so a fresh install (or a corrupted value) never
+// breaks user provisioning.
+// An EXPLICITLY saved empty list ("[]", i.e. the admin removed every pinned
+// country) is respected and returned as [] - it is NOT turned back into the
+// 15-country default. (Before, an empty list silently came back as the
+// defaults, so "remove all countries" never actually removed anything: the
+// "which countries were un-pinned" comparison saw the defaults on both sides.)
 // Only valid ISO 3166-1 alpha-2 codes are kept; duplicates are dropped,
 // order is preserved (this order becomes loc-0..loc-N for new users).
 async function getPinnedLocationsSetting(env) {
@@ -2353,36 +3063,82 @@ async function getPinnedLocationsSetting(env) {
 			const cc = raw.trim().toUpperCase();
 			if (cc && ISO_ALPHA3_MAP[cc] && !cleaned.includes(cc)) cleaned.push(cc);
 		}
-		return cleaned.length > 0 ? cleaned : PINNED_DEFAULT_LOCATIONS_FALLBACK;
+		return cleaned;
 	} catch (e) {
 		return PINNED_DEFAULT_LOCATIONS_FALLBACK;
 	}
 }
-// Reads the admin-editable "هشدار تعداد دستگاه" (device-count warning) global
-// threshold from settings (key 'device_warning_threshold'). Used only as the
-// value auto-filled into a brand-new user's `ip_limit` column at creation time
-// (see the POST /api/users handler) - never for enforcement. Falls back to
-// DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK if never configured (fresh install)
-// or malformed; an explicitly-saved value of 0 is respected as-is (no warning
-// ever auto-set for new users, since 0/() falsy ip_limit skips the exceeded-check
-// in persistActiveIp too).
-async function getDeviceWarningThresholdSetting(env) {
-	if (!env || !env.DB) return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+// Reads the admin-editable «محدودیت کاربر» (user limit) global from settings (key
+// 'user_limit'). Used as the value auto-filled into a brand-new user's ip_limit and
+// max_connections columns at creation time when the request didn't carry one (see the
+// POST /api/users handler). The same setting is also written onto every EXISTING user by
+// POST /api/settings/bulk. Falls back to DEFAULT_USER_LIMIT_FALLBACK if never configured
+// (fresh install) or malformed; an explicitly-saved 0 is respected as-is (0 = no limit,
+// exactly like an empty per-user field).
+async function getUserLimitSetting(env) {
+	if (!env || !env.DB) return DEFAULT_USER_LIMIT_FALLBACK;
 	try {
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'device_warning_threshold'").first();
-		if (!row || row.value === null || row.value === undefined || String(row.value).trim() === "") return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'user_limit'").first();
+		if (!row || row.value === null || row.value === undefined || String(row.value).trim() === "") return DEFAULT_USER_LIMIT_FALLBACK;
 		const parsed = parseInt(row.value);
-		return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_USER_LIMIT_FALLBACK;
 	} catch (e) {
-		return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		return DEFAULT_USER_LIMIT_FALLBACK;
 	}
+}
+// Parses the raw value of the admin-editable «هشدار تعداد دستگاه» (device-count warning)
+// global threshold (settings key 'device_warning_threshold') - persistActiveIp reads it
+// together with the user row in one query and passes the raw text here. Missing/empty/
+// malformed => DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK; an explicitly-saved 0 is respected
+// (0 = the warning is off, since persistActiveIp skips the exceeded-check for a falsy value).
+function parseDeviceWarningThreshold(raw) {
+	if (raw === null || raw === undefined || String(raw).trim() === "") return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+	const parsed = parseInt(raw);
+	return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+}
+// Reads the admin-editable «پورت» global default from settings (key
+// 'default_port'). Used only to pre-fill a brand-new user's `port` column at
+// creation time when the request didn't explicitly include one (see POST
+// /api/users) - the *existing*-user override on save is handled separately
+// in POST /api/settings/bulk. Falls back to DEFAULT_PORT_FALLBACK if never
+// configured or malformed/empty.
+async function getDefaultPortSetting(env) {
+	if (!env || !env.DB) return DEFAULT_PORT_FALLBACK;
+	try {
+		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'default_port'").first();
+		if (!row || row.value === null || row.value === undefined || String(row.value).trim() === "") return DEFAULT_PORT_FALLBACK;
+		return String(row.value).trim();
+	} catch (e) {
+		return DEFAULT_PORT_FALLBACK;
+	}
+}
+// «پیش‌فرض‌های کاربر جدید»: همه‌ی کلیدهای new_user_* (+ global_clean_ip برای ستون
+// ips) در یک کوئری. برای هر کلیدی که نبود/خالی بود (به‌جز frag_len/frag_int که
+// خالی معنی‌دار دارد) مقدار NEW_USER_DEFAULTS_FALLBACK برمی‌گردد. فقط وقتی
+// global_clean_ip اصلاً در settings نیست، DEFAULT_GLOBAL_CLEAN_IP_FALLBACK؛ اگر
+// ادمین عمداً خالی ذخیره کرده باشد همان خالی رعایت می‌شود.
+async function getNewUserDefaults(env) {
+	const out = Object.assign({}, NEW_USER_DEFAULTS_FALLBACK, { global_clean_ip: DEFAULT_GLOBAL_CLEAN_IP_FALLBACK });
+	if (!env || !env.DB) return out;
+	try {
+		const { results } = await env.DB.prepare("SELECT key, value FROM settings WHERE key LIKE 'new_user_%' OR key = 'global_clean_ip'").all();
+		(results || []).forEach((r) => {
+			if (r.value === null || r.value === undefined) return;
+			const v = String(r.value);
+			if (r.key === "global_clean_ip") { out.global_clean_ip = v; return; }
+			if (!Object.prototype.hasOwnProperty.call(NEW_USER_DEFAULTS_FALLBACK, r.key)) return;
+			if (v.trim() === "" && !NEW_USER_DEFAULTS_EMPTY_OK.includes(r.key)) return;
+			out[r.key] = v.trim();
+		});
+	} catch (e) { }
+	return out;
 }
 const SubscriptionService = {
 	async generateText(user, host, env) {
 		let ips = [host];
 		if (user.auto_rotate_ip === 1) {
 			const cachedIpsData = await getCachedIps();
-			const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 20);
+			const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
 			if (randomIps.length > 0) ips = randomIps;
 		}
 		if (ips.length === 1 && ips[0] === host && user.ips) {
@@ -2428,7 +3184,8 @@ const SubscriptionService = {
 			remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
 		}
 		const rawPath = "/XYZ";
-		const inlineProxySegment = buildInlineProxyIpSegment(await getInlineProxyIpSetting(env));
+		const subIpSettings = await getSubscriptionIpSettings(env);
+		const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
 		let proxyList = [];
 		try {
 			if (user.user_socks5 && user.user_socks5.trim().startsWith("[")) {
@@ -2544,7 +3301,7 @@ const SubscriptionService = {
 				});
 			});
 		});
-		const otherCleanIps = await getOtherCleanIpsSetting(env);
+		const otherCleanIps = subIpSettings.otherCleanIps;
 		if (otherCleanIps.length > 0) {
 			const otherPortStr = ports[0] || "443";
 			const isTlsPort = TLS_PORTS.has(otherPortStr);
@@ -2597,7 +3354,7 @@ const SubscriptionService = {
 		let ips = [host];
 		if (user.auto_rotate_ip === 1) {
 			const cachedIpsData = await getCachedIps();
-			const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 20);
+			const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
 			if (randomIps.length > 0) ips = randomIps;
 		}
 		if (ips.length === 1 && ips[0] === host && user.ips) {
@@ -2607,7 +3364,8 @@ const SubscriptionService = {
 		const ports = String(user.port || "443").split(",").map((p) => p.trim()).filter((p) => p.length > 0);
 		const fp = user.fingerprint || "chrome";
 		const rawPath = "/XYZ";
-		const inlineProxySegment = buildInlineProxyIpSegment(await getInlineProxyIpSetting(env));
+		const subIpSettings = await getSubscriptionIpSettings(env);
+		const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
 
 		let proxyList = [];
 		try {
@@ -2700,7 +3458,7 @@ const SubscriptionService = {
 			locIdx++;
 		}
 
-		const otherCleanIps = await getOtherCleanIpsSetting(env);
+		const otherCleanIps = subIpSettings.otherCleanIps;
 		if (otherCleanIps.length > 0) {
 			const otherPortStr = ports[0] || "443";
 			const isTlsPort = TLS_PORTS.has(otherPortStr);
@@ -2817,7 +3575,17 @@ async function flushExpiredTraffic(env) {
 	for (const [ip, record] of LOGIN_ATTEMPTS.entries()) {
 		if (now - record.lastAttempt > 900000) LOGIN_ATTEMPTS.delete(ip);
 	}
+	for (const [key, entry] of IP_BURST_BYTES.entries()) {
+		if (now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) IP_BURST_BYTES.delete(key);
+	}
 	const allUsers = new Set([...GLOBAL_TRAFFIC_CACHE.keys(), ...USER_REQ_CACHE.keys()]);
+	// قبلاً به ازای هر کاربر یک UPDATE جدا + یک UPSERT جدای daily_traffic زده می‌شد، یعنی برای N
+	// کاربرِ در انتظار، 2N رفت‌وبرگشت پشت‌سرهم به D1. حالا همه‌ی UPDATE ها جمع می‌شن و با یک
+	// db.batch() در یک رفت‌وبرگشت اجرا می‌شن و مجموع مصرف با یک UPSERT واحد ثبت می‌شه.
+	// تعداد ردیف‌های نوشته‌شده (هزینه‌ی write در D1) دقیقاً مثل قبله، فقط round-trip ها کم شده.
+	const pendingFlush = [];
+	const flushStmts = [];
+	let batchDeltaGb = 0;
 	for (const uname of allUsers) {
 		const cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
 		const cachedReqs = USER_REQ_CACHE.get(uname) || 0;
@@ -2838,17 +3606,31 @@ async function flushExpiredTraffic(env) {
 			GLOBAL_TRAFFIC_CACHE.set(uname, 0);
 			USER_REQ_CACHE.set(uname, 0);
 			const deltaGb = cachedBytes / (1024 * 1024 * 1024);
-			try {
-				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, now, uname).run();
-				await recordDailyTraffic(env, null, deltaGb);
-			} catch (e) {
-				console.error(e.message);
-			} finally {
-				GLOBAL_WRITE_LOCK.delete(uname);
-				if (activeCount <= 0) {
-					GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-					GLOBAL_LAST_ACTIVE_WRITE.delete(uname + "_hb");
-				}
+			batchDeltaGb += deltaGb;
+			pendingFlush.push({ uname, cachedBytes, cachedReqs, activeCount });
+			flushStmts.push(env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, now, uname));
+		}
+	}
+	if (flushStmts.length === 0) return;
+	try {
+		await env.DB.batch(flushStmts);
+		await recordDailyTraffic(env, null, batchDeltaGb);
+	} catch (e) {
+		console.error(e.message);
+		// برگردوندن مقدارهای commit-نشده به کش - دقیقاً همون کاری که مسیر اصلی نوشتن ترافیک
+		// (writeTask داخل handlevIees) از قبل می‌کرد. بدون این، اگر نوشتن شکست می‌خورد (مثلاً
+		// اتمام سهمیه‌ی روزانه‌ی D1) مصرفِ همون بازه برای همیشه پاک می‌شد، چون کش قبل از
+		// نوشتن صفر شده بود.
+		for (const p of pendingFlush) {
+			GLOBAL_TRAFFIC_CACHE.set(p.uname, (GLOBAL_TRAFFIC_CACHE.get(p.uname) || 0) + p.cachedBytes);
+			USER_REQ_CACHE.set(p.uname, (USER_REQ_CACHE.get(p.uname) || 0) + p.cachedReqs);
+		}
+	} finally {
+		for (const p of pendingFlush) {
+			GLOBAL_WRITE_LOCK.delete(p.uname);
+			if (p.activeCount <= 0) {
+				GLOBAL_LAST_ACTIVE_WRITE.delete(p.uname);
+				GLOBAL_LAST_ACTIVE_WRITE.delete(p.uname + "_hb");
 			}
 		}
 	}
@@ -2948,6 +3730,13 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	let validUUID = null;
 	let targetDns = "8.8.4.4";
 	let targetDoh = "https://cloudflare-dns.com/dns-query";
+	// «دیده‌شده/تأییدشده» (device seen/confirmed - نگاه کنید توضیح DEVICE_CONFIRM_* بالای
+	// فایل): وضعیتِ محلیِ همین یک اتصال، بین addBytes/هیت‌بیت/بلاکِ پارسِ هدر مشترکه.
+	// connectionStartTime همون لحظه‌ی accept شدنِ سوکته - معیار «حداقل ۱۰ ثانیه باز بمونه».
+	const connectionStartTime = Date.now();
+	let connectionBytesSoFar = 0;
+	let deviceConfirmed = false;
+	let deviceConfirmInFlight = false;
 	function addBytes(bytes) {
 		if (bytes <= 0) return;
 		if (!username) {
@@ -2957,6 +3746,11 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 		if (uncountedBytes > 0) {
 			bytes += uncountedBytes;
 			uncountedBytes = 0;
+		}
+		connectionBytesSoFar += bytes;
+		if (!deviceConfirmed && clientIP && clientIP !== "unknown") {
+			recordBurstBytes(username + "|" + clientIP, bytes, Date.now());
+			checkDeviceConfirmation();
 		}
 		let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
 		GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
@@ -3042,6 +3836,47 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			ACTIVE_CONNECTIONS_COUNT.set(uname, activeCount);
 		}
 	};
+	// «دیده‌شده/تأییدشده» (نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): فقط تصمیم
+	// می‌گیره که آیا شرایط تأیید (اتصال پایدار یا اتصال‌های کوتاهِ زیاد) رسیده یا نه -
+	// از addBytes (هر بار دیتا رد بشه) و از هیت‌بیت (هر ~۲۰-۲۵ ثانیه، برای اتصال‌های
+	// کم‌حجمی که addBytes به تنهایی زود بهشون نمی‌رسه) صدا زده می‌شه. تا وقتی شرط رد
+	// نشده کاملاً بی‌اثره - نه D1 می‌خونه/می‌نویسه، نه چیزی رو کند می‌کنه. فقط وقتی
+	// واقعاً رد بشه یک بار confirmActiveIp (تنها جایی که الان سقف ip_limit رو واقعاً
+	// اعمال می‌کنه) صدا زده می‌شه.
+	const checkDeviceConfirmation = () => {
+		if (deviceConfirmed || deviceConfirmInFlight) return;
+		if (!username || !validUUID || !clientIP || clientIP === "unknown") return;
+		const nowT = Date.now();
+		const stableOk = (nowT - connectionStartTime >= DEVICE_CONFIRM_MIN_DURATION_MS) && (connectionBytesSoFar >= DEVICE_CONFIRM_MIN_BYTES);
+		const burstOk = getBurstBytes(username + "|" + clientIP, nowT) >= DEVICE_CONFIRM_BURST_BYTES;
+		if (!stableOk && !burstOk) return;
+		deviceConfirmInFlight = true;
+		const task = (async () => {
+			try {
+				const admitted = await confirmActiveIp(env, ctx, validUUID, username, clientIP, nowT);
+				if (admitted) {
+					deviceConfirmed = true;
+					// اگه تا وقتی D1 round-trip بالا تموم بشه همین اتصال از قبل بسته شده باشه
+					// (setOffline زودتر اجرا شده)، شمارنده‌ی سوکت‌های زنده رو دست نمی‌زنیم -
+					// وگرنه یه شمارشِ اضافه‌ی «شبح» می‌مونه که هیچ‌وقت کم نمی‌شه.
+					if (!hasCountedAsActive && !isOfflineSet) {
+						let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+						ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+						hasCountedAsActive = true;
+					}
+				} else {
+					// سقف «محدودیت کاربر» پره - طبق سیاست، دقیقاً همین‌جا (لحظه‌ی تأیید) اعمال
+					// می‌شه، نه موقع هندشیک؛ نتیجه: تست‌های پینگِ کوتاه هیچ‌وقت به اینجا نمی‌رسن
+					// (رد نمی‌شن)، ولی استفاده‌ی واقعی‌ای که جا نداره همین‌جا قطع می‌شه.
+					closeSocketQuietly(serverSock);
+				}
+			} catch (e) {
+			} finally {
+				deviceConfirmInFlight = false;
+			}
+		})();
+		if (ctx) ctx.waitUntil(task);
+	};
 	let heartbeat;
 	const runHeartbeat = async () => {
 		if (serverSock.readyState === WebSocket.OPEN) {
@@ -3081,42 +3916,47 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 							}
 						}
 						if (!isExpired && clientIP && clientIP !== "unknown") {
-							let activeIps = {};
-							try {
-								activeIps = JSON.parse(user.active_ips || "{}");
-							} catch (e) { }
-							let hasChanges = false;
-							let needsDbUpdateForTimestamp = false;
-							
-							for (const [ip, data] of Object.entries(activeIps)) {
-								const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-								if (nowTime - lastSeen > 180000 && ip !== clientIP) {
-									delete activeIps[ip];
-									hasChanges = true;
-								}
-							}
-							if (!activeIps[clientIP]) {
-								activeIps[clientIP] = { timestamp: nowTime, count: 1 };
-								hasChanges = true;
+							if (!deviceConfirmed) {
+								// «دیده‌شده/تأییدشده»: این اتصال هنوز تأیید نشده - این هیت‌بیت فقط یه
+								// فرصت دیگه‌ست تا شرایط تأیید (DEVICE_CONFIRM_*) چک بشه، بدون اینکه
+								// مستقیم چیزی توی activeIps نوشته بشه یا سقف اعمال بشه (اون کار فقط
+								// با checkDeviceConfirmation/confirmActiveIp انجام می‌شه).
+								checkDeviceConfirmation();
 							} else {
-								const currentData = activeIps[clientIP];
-								const lastSeen = typeof currentData === "object" ? currentData.timestamp : currentData;
-								if (nowTime - lastSeen > 150000) {
-									if (typeof activeIps[clientIP] === "object") {
-										activeIps[clientIP].timestamp = nowTime;
-									} else {
-										activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+								let activeIps = {};
+								try {
+									activeIps = JSON.parse(user.active_ips || "{}");
+								} catch (e) { }
+								let hasChanges = false;
+								let needsDbUpdateForTimestamp = false;
+
+								for (const [ip, data] of Object.entries(activeIps)) {
+									const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+									if (nowTime - lastSeen > 180000 && ip !== clientIP) {
+										delete activeIps[ip];
+										hasChanges = true;
 									}
-									needsDbUpdateForTimestamp = true;
 								}
+								if (!activeIps[clientIP]) {
+									activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+									hasChanges = true;
+								} else {
+									const currentData = activeIps[clientIP];
+									const lastSeen = typeof currentData === "object" ? currentData.timestamp : currentData;
+									if (nowTime - lastSeen > 150000) {
+										if (typeof activeIps[clientIP] === "object") {
+											activeIps[clientIP].timestamp = nowTime;
+										} else {
+											activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+										}
+										needsDbUpdateForTimestamp = true;
+									}
+								}
+								// «سقف در لحظه‌ی تأیید، نه هندشیک/هیت‌بیت»: ip_limit دیگه اینجا (رفرشِ
+								// یه دستگاهِ از قبل تأییدشده) چک نمی‌شه - فقط توی confirmActiveIp، یه
+								// بار، موقع تأیید. نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل.
+								if (hasChanges || needsDbUpdateForTimestamp) updatedActiveIps = true;
 							}
-							const sortedIps = Object.keys(activeIps).sort((a, b) => {
-								const tA = typeof activeIps[a] === "object" ? activeIps[a].timestamp : activeIps[a];
-								const tB = typeof activeIps[b] === "object" ? activeIps[b].timestamp : activeIps[b];
-								return tB - tA;
-							});
-							/* Bypassed: if (user.ip_limit && user.ip_limit > 0 && sortedIps.indexOf(clientIP) >= user.ip_limit) isIpLimitExpired = true; */
-							if (hasChanges || needsDbUpdateForTimestamp || isIpLimitExpired) updatedActiveIps = true;
 						}
 					}
 					if (isExpired) {
@@ -3463,6 +4303,13 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				targetDoh = "https://dns.adguard-dns.com/dns-query";
 			}
 			if (clientIP && clientIP !== "unknown") {
+				// «دیده‌شده/تأییدشده» (نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): این IP فقط
+				// وقتی همین‌جا فوری «تأییدشده» حساب می‌شه که از قبل توی active_ips کاربر باشه و
+				// هنوز تازه باشه - یعنی همین دستگاه از قبل یه اتصال دیگه داشته و این یکی صرفاً
+				// reconnect/تب جدیدشه؛ دقیقاً همون رفتار قبلی، بدون تأخیر، تا سرعت یا اتصال
+				// دستگاه‌های از قبل متصل عوض نشه. اگه IP تازه باشه، هیچی اینجا روی D1 نوشته
+				// نمی‌شه و سقف «محدودیت کاربر»/ip_limit هم اینجا چک نمی‌شه؛ تصمیم می‌مونه برای
+				// checkDeviceConfirmation() (تعریف‌شده بالاتر، از addBytes/هیت‌بیت صدا زده می‌شه).
 				let activeIps = {};
 				try {
 					activeIps = JSON.parse(user.active_ips || "{}");
@@ -3472,33 +4319,28 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					const lastSeen = data && typeof data === "object" ? data.timestamp : data;
 					if (now - lastSeen > 180000) delete activeIps[ip];
 				}
-				let isNewIp = false;
-				if (!activeIps[clientIP]) {
-					const sortedIps = Object.keys(activeIps);
-					/* Bypassed: if (user.ip_limit && user.ip_limit > 0 && sortedIps.length >= user.ip_limit) { serverSock.close(); return; } */
-					activeIps[clientIP] = { timestamp: now, count: 1 };
-					isNewIp = true;
-				} else {
+				if (activeIps[clientIP]) {
+					deviceConfirmed = true;
 					if (typeof activeIps[clientIP] === "object") {
 						activeIps[clientIP].timestamp = now;
 						activeIps[clientIP].count = (activeIps[clientIP].count || 0) + 1;
 					} else {
 						activeIps[clientIP] = { timestamp: now, count: 1 };
 					}
-				}
-				let lastDbW = GLOBAL_LAST_DB_WRITE.get(username) || 0;
-				let needIpWrite = isNewIp;
-				let needTimeWrite = (now - lastDbW > 900000);
-				if (needIpWrite || needTimeWrite) {
-					GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
-					GLOBAL_LAST_DB_WRITE.set(username, now);
-					persistActiveIp(env, ctx, reqUUID, username, clientIP, now);
+					let lastDbW = GLOBAL_LAST_DB_WRITE.get(username) || 0;
+					if (now - lastDbW > 900000) {
+						GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
+						GLOBAL_LAST_DB_WRITE.set(username, now);
+						persistActiveIp(env, ctx, reqUUID, username, clientIP, now);
+					}
 				}
 			}
 			isHeaderParsed = true;
-			let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
-			ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
-			hasCountedAsActive = true;
+			if (deviceConfirmed) {
+				let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+				ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+				hasCountedAsActive = true;
+			}
 			try {
 				let isDomainAddress = (isTrojanProto && addrType === 3) || (!isTrojanProto && addrType === 2);
 				let isIpAddress = (isTrojanProto && (addrType === 1 || addrType === 4)) || (!isTrojanProto && (addrType === 1 || addrType === 3));
@@ -3599,6 +4441,14 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 								throw proxyErr;
 							}
 						} else {
+							if (user.auto_rotate_user_proxy === 1) {
+								const wantedCountry = getRequestedCountryCode(request);
+								if (wantedCountry) {
+									const healTask = healMissingCountrySlot(user.username, env, wantedCountry);
+									if (ctx) ctx.waitUntil(healTask);
+									else healTask.catch(() => { });
+								}
+							}
 							try {
 								s = await connectDirect(addr, port, dataPayload, targetDoh);
 							} catch (directErr) {
@@ -4687,6 +5537,7 @@ const COMMON_HEAD = `
 	<meta name="apple-mobile-web-app-title" content="ZEUS Panel">
 	<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
 	<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/lipis/flag-icons@7.3.2/css/flag-icons.min.css">
+	<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700&display=swap" rel="stylesheet">
 <script>
 	tailwind.config = {
 		darkMode: 'class',
@@ -4953,8 +5804,35 @@ Commercial support is available at
 		};
 	</script>
 	${COMMON_HEAD}
+	<link href="https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,500;0,600;0,700;1,500;1,600&display=swap" rel="stylesheet">
 	<style>
 		body { font-family: 'Vazirmatn', sans-serif; }
+		/* درخشش ملایم و پیوسته‌ی جعبه‌ی آیکون لوگو (کنار متن Z Y X در هدر) */
+		@keyframes logoGlow {
+			0%, 100% { box-shadow: 0 0 5px 1px rgba(59,130,246,0.55), 0 0 0 0 rgba(96,165,250,0); }
+			50% { box-shadow: 0 0 13px 4px rgba(96,165,250,0.9), 0 0 20px 6px rgba(59,130,246,0.35); }
+		}
+		.logo-glow {
+			animation: logoGlow 2.6s ease-in-out infinite;
+		}
+		/* فونت و استایل شیک‌تر برای متن برند Z Y X کنار لوگو */
+		.brand-logo-text {
+			font-family: 'Orbitron', 'Vazirmatn', sans-serif;
+			font-weight: 700;
+			letter-spacing: 0.14em;
+			background: linear-gradient(90deg, #60a5fa 0%, #38bdf8 45%, #93c5fd 55%, #60a5fa 100%);
+			-webkit-background-clip: text;
+			background-clip: text;
+			color: transparent !important;
+		}
+		/* فونت کوچیک‌تر و شیک‌تر برای بج ورژن کنار Z Y X */
+		.panel-version-badge {
+			font-family: 'Poppins', 'Vazirmatn', sans-serif;
+			font-weight: 600;
+			font-style: italic;
+			letter-spacing: 0.03em;
+			opacity: 0.9;
+		}
 		.zeus-flag {
 			display: inline-block;
 			width: 1.35em;
@@ -5115,44 +5993,142 @@ Commercial support is available at
 			background-image: linear-gradient(90deg, transparent 0%, #60a5fa 8%, transparent 20%, transparent 75%, #60a5fa 87%, transparent 100%);
 			animation-duration: 18.5s, 7.2s;
 		}
+
+		/* ============================================================
+		   بازطراحی کامل کارت کاربران (کلاس‌های uc- = user-card)
+		   ============================================================ */
+		.uc-card {
+			position: relative;
+			overflow: hidden;
+			border-radius: 16px;
+			padding: 9px;
+			display: flex;
+			flex-direction: column;
+			gap: 8px;
+			background: linear-gradient(160deg, #ffffff, #f4f6fb);
+			border: 1px solid rgba(148,163,184,0.28);
+			box-shadow: 0 1px 2px rgba(15,23,42,0.05), 0 10px 22px -16px rgba(15,23,42,0.35);
+			transition: transform 0.22s ease, box-shadow 0.22s ease;
+		}
+		.dark .uc-card {
+			background: linear-gradient(160deg, #121b30, #0b1120);
+			border-color: rgba(51,65,85,0.55);
+			box-shadow: 0 1px 2px rgba(0,0,0,0.35), 0 12px 26px -16px rgba(0,0,0,0.65);
+		}
+		.uc-card:hover { transform: translateY(-2px); }
+		.uc-top { display: flex; align-items: center; gap: 6px; width: 100%; }
+		.uc-checkbox { width: 17px; height: 17px; border-radius: 6px; border: 1.5px solid #cbd5e1; flex-shrink: 0; cursor: pointer; }
+		.uc-drag { cursor: grab; color: #94a3b8; font-size: 15px; flex-shrink: 0; user-select: none; line-height: 1; }
+		.uc-drag:active { cursor: grabbing; }
+		.uc-avatar {
+			position: relative;
+			width: 33px; height: 33px; border-radius: 11px; flex-shrink: 0;
+			display: flex; align-items: center; justify-content: center;
+			color: #fff; font-weight: 700; font-size: 13.5px;
+			font-family: 'Poppins', 'Vazirmatn', sans-serif;
+			box-shadow: inset 0 0 0 1px rgba(255,255,255,0.3);
+		}
+		@keyframes ucAvatarAlarm {
+			0%, 100% { background-color: #dc2626; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.3), 0 0 0 0 rgba(220,38,38,0.65); }
+			50% { background-color: #7f1d1d; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.3), 0 0 0 5px rgba(220,38,38,0); }
+		}
+		.uc-avatar-alarm { animation: ucAvatarAlarm 1s ease-in-out infinite; }
+		.uc-online-dot {
+			position: absolute; bottom: -2px; right: -2px;
+			width: 10px; height: 10px; border-radius: 50%;
+			border: 2px solid #ffffff;
+		}
+		.dark .uc-online-dot { border-color: #0f1729; }
+		.uc-identity { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+		.uc-username {
+			font-family: 'Poppins', 'Vazirmatn', sans-serif;
+			font-weight: 600; font-size: 13.5px; color: #0f172a;
+			white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+		}
+		.dark .uc-username { color: #f1f5f9; }
+		.uc-subline { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+		.uc-chip {
+			display: inline-flex; align-items: center; gap: 2px;
+			padding: 1px 6px; border-radius: 999px;
+			font-weight: 700; font-size: 9px; white-space: nowrap;
+		}
+		.uc-chip-infinite { color: #2563eb; }
+		.dark .uc-chip-infinite { color: #60a5fa; }
+		.uc-more-btn {
+			width: 27px; height: 27px; border-radius: 9px; flex-shrink: 0; padding: 0; border: 1px solid rgba(100,116,139,0.18);
+			display: flex; align-items: center; justify-content: center;
+			background: rgba(100,116,139,0.1); color: #475569;
+			transition: background 0.2s ease, transform 0.15s ease;
+		}
+		.uc-more-btn:hover { background: rgba(100,116,139,0.2); }
+		.uc-more-btn:active { transform: scale(0.9); }
+		.dark .uc-more-btn { color: #cbd5e1; background: rgba(148,163,184,0.12); border-color: rgba(148,163,184,0.22); }
+		.uc-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 100%; }
+		.uc-actions-overlay {
+			position: absolute; inset: 0; z-index: 30;
+			display: flex; align-items: center; justify-content: center;
+			background: rgba(255,255,255,0.98);
+			border-radius: 16px; padding: 8px;
+			opacity: 0; pointer-events: none; transform: scale(0.95);
+			transition: opacity 0.16s ease, transform 0.16s ease;
+		}
+		.dark .uc-actions-overlay { background: rgba(9,14,27,0.98); }
+		.uc-actions-overlay.uc-actions-open { opacity: 1; pointer-events: auto; transform: scale(1); }
+		.uc-actions-inner { width: 100%; max-height: 100%; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+		.uc-actions-header { display: flex; justify-content: flex-start; }
+		.uc-action-close {
+			width: 20px; height: 20px; border-radius: 7px; padding: 0; border: none;
+			display: flex; align-items: center; justify-content: center;
+			font-size: 11px; color: #94a3b8; background: rgba(100,116,139,0.12);
+		}
+		.uc-actions-grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 7px; padding: 2px 0; }
+		.uc-action-btn {
+			width: 34px; height: 34px; border-radius: 10px; padding: 0; border: none;
+			display: flex; align-items: center; justify-content: center;
+			transition: transform 0.15s ease;
+		}
+		.uc-action-btn:active { transform: scale(0.88); }
+		.cf-ring-svg { transform: rotate(-90deg); }
+		.cf-ring-track { stroke: currentColor; }
+		.cf-ring-bar {
+			stroke-linecap: round;
+			animation: cfRingReach 2.2s ease-in-out infinite;
+		}
+		@keyframes cfRingReach {
+			0%, 100% { stroke-dashoffset: var(--cf-offset); filter: drop-shadow(0 0 0 transparent); }
+			50% { stroke-dashoffset: var(--cf-offset-reach); filter: drop-shadow(0 0 3px currentColor); }
+		}
 	</style>
 </head>
 <body class="bg-gray-100 dark:bg-amoled-bg text-gray-900 dark:text-zinc-100 min-h-screen transition-colors duration-200">
 	<header class="border-b border-gray-200 dark:border-amoled-border bg-gray-50/95 dark:bg-amoled-card/95 px-4 py-4 relative z-10">
 		<div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-2 md:gap-4">
-			<div class="flex flex-row flex-wrap justify-center items-center gap-3 w-full md:w-auto">
-				<h1 class="text-lg font-bold flex items-center gap-2.5" dir="ltr">
-					<span class="w-7 h-7 rounded-md bg-navy-700 dark:bg-navy-600 flex items-center justify-center flex-shrink-0">
-						<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-					</span>
-					<span class="tracking-wide text-gray-900 dark:text-zinc-100">Z Y X</span>
-					<span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-navy-100 text-navy-700 dark:bg-navy-900/40 dark:text-navy-400 rounded-full"></span>
-				</h1>
-			</div>
-			<div id="global-location-badges" class="hidden flex-1 flex flex-col items-center justify-center gap-1 w-full md:w-auto"></div>
 			<div class="flex flex-wrap items-center justify-center gap-3 w-full max-w-[260px] mx-auto md:max-w-none md:mx-0 md:w-auto mt-3 md:mt-0">
-				<button onclick="toggleImportModal(true)"
+				<button onclick="logoutAdmin()"
 				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-teal-50 dark:bg-teal-950/30
-				           border border-teal-200 dark:border-teal-900
-				           hover:bg-teal-100 dark:hover:bg-teal-900/50
+				           bg-red-50 dark:bg-red-950/30
+				           border border-red-200 dark:border-red-900
+				           hover:bg-red-100 dark:hover:bg-red-900/50
 				           transition-all duration-200
-				           text-teal-600 dark:text-teal-400 shadow-sm"
-				    title="ایمپورت کاربران">
+				           text-red-600 dark:text-red-400
+				           shadow-sm hover:shadow-md"
+				    title="خروج">
 				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
 				    </svg>
 				</button>
-				<button id="github-update-toggle" onclick="applyGithubUpdate()"
+				
+				<button onclick="toggleSettingsModal(true)"
 				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-indigo-50 dark:bg-indigo-950/30
-				           border border-indigo-200 dark:border-indigo-900
-				           hover:bg-indigo-100 dark:hover:bg-indigo-900/50
+				           bg-gray-50 dark:bg-zinc-800/50
+				           border border-gray-200 dark:border-zinc-700
+				           hover:bg-gray-100 dark:hover:bg-zinc-700/80
 				           transition-all duration-200
-				           text-indigo-600 dark:text-indigo-400 shadow-sm"
-				    title="Update">
+				           text-gray-600 dark:text-zinc-400 shadow-sm"
+				    title="تنظیمات">
 				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"></path>
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
 				    </svg>
 				</button>
 				<button id="theme-toggle"
@@ -5170,40 +6146,44 @@ Commercial support is available at
 				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path>
 				    </svg>
 				</button>
-				
-				<button onclick="toggleSettingsModal(true)"
+				<button id="github-update-toggle" onclick="applyGithubUpdate()"
 				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-gray-50 dark:bg-zinc-800/50
-				           border border-gray-200 dark:border-zinc-700
-				           hover:bg-gray-100 dark:hover:bg-zinc-700/80
+				           bg-indigo-50 dark:bg-indigo-950/30
+				           border border-indigo-200 dark:border-indigo-900
+				           hover:bg-indigo-100 dark:hover:bg-indigo-900/50
 				           transition-all duration-200
-				           text-gray-600 dark:text-zinc-400 shadow-sm"
-				    title="تنظیمات">
+				           text-indigo-600 dark:text-indigo-400 shadow-sm"
+				    title="Update">
 				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"></path>
 				    </svg>
 				</button>
-				
-				<button onclick="logoutAdmin()"
+				<button onclick="toggleImportModal(true)"
 				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-red-50 dark:bg-red-950/30
-				           border border-red-200 dark:border-red-900
-				           hover:bg-red-100 dark:hover:bg-red-900/50
+				           bg-teal-50 dark:bg-teal-950/30
+				           border border-teal-200 dark:border-teal-900
+				           hover:bg-teal-100 dark:hover:bg-teal-900/50
 				           transition-all duration-200
-				           text-red-600 dark:text-red-400
-				           shadow-sm hover:shadow-md"
-				    title="خروج">
+				           text-teal-600 dark:text-teal-400 shadow-sm"
+				    title="ایمپورت کاربران">
 				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
 				    </svg>
 				</button>
+			</div>
+			<div id="global-location-badges" class="hidden flex-1 flex flex-col items-center justify-center gap-1 w-full md:w-auto"></div>
+			<div class="flex flex-row flex-wrap justify-center items-center gap-3 w-full md:w-auto">
+				<h1 class="text-lg font-bold flex items-center gap-2.5" dir="ltr">
+					<span class="tracking-wide brand-logo-text">Z Y X</span>
+					<span id="panel-version" class="panel-version-badge text-[8.5px] px-1.5 py-0.5 bg-navy-100 text-navy-700 dark:bg-navy-900/40 dark:text-navy-400 rounded-full"></span>
+				</h1>
 			</div>
 		</div>
 	</header>
 	<main class="max-w-6xl mx-auto px-4 pt-4 pb-56 md:pb-32 relative z-10">
-<div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
-	<div id="card-cf-requests" onclick="openUsageChart('requests')" class="neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
+<div class="flex flex-col lg:flex-row gap-3 mb-4 items-start">
+<div class="w-full lg:w-64 shrink-0 flex flex-col gap-3">
+	<div id="card-cf-requests" onclick="openUsageChart('requests')" class="neon-orbit neon-orbit-1 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
 		<div class="flex items-center justify-center gap-1.5 relative z-10">
 			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Request</span>
 			<div class="p-1 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-md flex-shrink-0">
@@ -5229,8 +6209,43 @@ Commercial support is available at
 					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">30d</span>
 				</div>
 			</div>
-			<div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1 mt-1">
-				<div id="stat-cf-progress" class="bg-orange-500 h-1 rounded-full transition-all duration-500" style="width: 0%"></div>
+			<div class="flex items-center justify-center gap-2 mt-1.5">
+				<div class="relative w-11 h-11 shrink-0">
+					<svg class="cf-ring-svg w-11 h-11" viewBox="0 0 40 40">
+						<circle class="cf-ring-track text-gray-200 dark:text-zinc-800" cx="20" cy="20" r="16" fill="none" stroke-width="3.5"></circle>
+						<circle id="stat-cf-progress" class="cf-ring-bar" cx="20" cy="20" r="16" fill="none" stroke-width="3.5" stroke-dasharray="100.53" style="--cf-offset:100.53; --cf-offset-reach:100.53; stroke-dashoffset:100.53;"></circle>
+					</svg>
+					<span id="stat-cf-progress-pct" class="absolute inset-0 flex items-center justify-center text-[9px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
+				</div>
+				<div class="flex flex-col justify-center gap-1 text-[8px] text-gray-500 dark:text-zinc-400 font-medium">
+					<span dir="ltr">مصرف: <span id="stat-cf-progress-used" class="font-bold text-gray-800 dark:text-zinc-200">0</span></span>
+					<span dir="ltr">سقف: <span class="font-bold text-gray-800 dark:text-zinc-200">100k</span></span>
+				</div>
+			</div>
+		</div>
+	</div>
+	<div id="card-traffic" onclick="openUsageChart('traffic')" class="neon-orbit neon-orbit-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-sm hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[128px] cursor-pointer">
+		<div id="traffic-card-chart" class="absolute inset-[2px] rounded-[6px] overflow-hidden pointer-events-none"></div>
+		<div class="absolute inset-[2px] rounded-[6px] flex flex-col justify-between p-2.5 bg-gradient-to-b from-white/90 via-white/60 to-white/10 dark:from-amoled-card/90 dark:via-amoled-card/60 dark:to-amoled-card/10">
+			<div class="flex items-center justify-center gap-1.5">
+				<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Traffic</span>
+				<div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0">
+					<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+				</div>
+			</div>
+			<div class="grid grid-cols-3 gap-1 w-full">
+				<div class="flex flex-col items-center justify-center">
+					<span class="text-xs font-black text-blue-600 dark:text-blue-400 transition-all leading-none whitespace-nowrap" dir="ltr" id="stat-usage-daily">0 GB</span>
+					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">24h</span>
+				</div>
+				<div class="flex flex-col items-center justify-center border-x border-gray-100 dark:border-zinc-800">
+					<span class="text-xs font-black text-blue-600 dark:text-blue-400 transition-all leading-none whitespace-nowrap" dir="ltr" id="stat-usage-7d">0 GB</span>
+					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">7d</span>
+				</div>
+				<div class="flex flex-col items-center justify-center">
+					<span class="text-xs font-black text-blue-600 dark:text-blue-400 transition-all leading-none whitespace-nowrap" dir="ltr" id="stat-usage-30d">0 GB</span>
+					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">30d</span>
+				</div>
 			</div>
 		</div>
 	</div>
@@ -5263,35 +6278,17 @@ Commercial support is available at
 			</div>
 		</div>
 	</div>
-	<div id="card-traffic" onclick="openUsageChart('traffic')" class="neon-orbit neon-orbit-3 col-span-2 lg:col-span-1 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer">
-		<div class="flex items-center justify-center gap-1.5 relative z-10">
-			<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Traffic</span>
-			<div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0">
-				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-			</div>
-		</div>
-		<div class="relative z-10 min-w-0 flex-1 w-full mt-1">
-			<div class="grid grid-cols-3 gap-1 w-full">
-				<div class="flex flex-col items-center justify-center">
-					<span class="text-xs font-black text-blue-600 dark:text-blue-400 transition-all leading-none whitespace-nowrap" dir="ltr" id="stat-usage-daily">0 GB</span>
-					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">24h</span>
-				</div>
-				<div class="flex flex-col items-center justify-center border-x border-gray-100 dark:border-zinc-800">
-					<span class="text-xs font-black text-blue-600 dark:text-blue-400 transition-all leading-none whitespace-nowrap" dir="ltr" id="stat-usage-7d">0 GB</span>
-					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">7d</span>
-				</div>
-				<div class="flex flex-col items-center justify-center">
-					<span class="text-xs font-black text-blue-600 dark:text-blue-400 transition-all leading-none whitespace-nowrap" dir="ltr" id="stat-usage-30d">0 GB</span>
-					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">30d</span>
-				</div>
-			</div>
-		</div>
-	</div>
 </div>
+<div class="flex-1 w-full min-w-0">
 		<div id="loading-state" class="text-center py-12">
 			<span class="text-gray-500 dark:text-gray-400">در حال بارگذاری کاربران...</span>
 		</div>
-		<div class="mb-4 flex flex-col md:flex-row gap-2 justify-between items-center bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2 shadow-sm">
+		<div id="add-user-only-bar" class="hidden mb-4">
+			<button onclick="openCreateModal()" title="افزودن کاربر" class="scale-[0.4] p-2 rounded-full bg-green-50 dark:bg-green-950/30 border-2 border-green-600 dark:border-green-700/60 hover:bg-green-100 dark:hover:bg-green-900/50 transition-all duration-300 text-green-700 dark:text-green-400 shadow-sm hover:shadow hover:scale-[0.44] cursor-pointer inline-flex items-center justify-center shrink-0">
+				<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
+			</button>
+		</div>
+		<div id="users-toolbar" class="mb-4 flex flex-col md:flex-row gap-2 justify-between items-center bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2 shadow-sm">
 			<div class="flex items-center gap-2 shrink-0">
 				<button onclick="openCreateModal()" title="افزودن کاربر" class="scale-[0.7] p-2 rounded-full bg-green-50 dark:bg-green-950/30 border-2 border-green-600 dark:border-green-700/60 hover:bg-green-100 dark:hover:bg-green-900/50 transition-all duration-300 text-green-700 dark:text-green-400 shadow-sm hover:shadow hover:scale-[0.77] cursor-pointer inline-flex items-center justify-center shrink-0">
 					<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
@@ -5311,7 +6308,7 @@ Commercial support is available at
 				</div>
 			</div>
 			<div class="flex items-center gap-2 w-full md:w-auto flex-wrap">
-				<select id="filter-status" onchange="filterAndRenderUsers()" class="w-full md:w-28 shrink-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
+				<select id="filter-status" onchange="filterAndRenderUsers()" class="w-full md:w-auto shrink-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
 					<option value="all">🔍 همه</option>
 					<option value="active">✅ فعال</option>
 					<option value="inactive">❌ غیرفعال</option>
@@ -5329,7 +6326,7 @@ Commercial support is available at
 			</div>
 		</div>
 		<div id="users-table-container" class="hidden pb-4 px-1">
-			<div id="users-tbody" class="grid grid-cols-2 md:grid-cols-3 gap-1.5 text-sm"></div>
+			<div id="users-tbody" class="grid grid-cols-2 gap-3 text-sm"></div>
 		</div>
 		<div id="empty-state" class="hidden p-8 border-2 border-dashed border-red-500/60 dark:border-red-500/50 bg-red-50 dark:bg-red-900/10 rounded-md text-center animate-pulse shadow-sm">
 			<p class="text-red-600 dark:text-red-400 font-bold text-lg flex items-center justify-center flex-wrap gap-2 leading-loose">
@@ -5342,6 +6339,8 @@ Commercial support is available at
 				<span>برای ایجاد سریع استفاده کنید.</span>
 			</p>
 		</div>
+</div>
+</div>
 	</main>
 <div id="pwa-install-modal" class="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
 	<div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-green-500/40 rounded-2xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200 text-center relative overflow-hidden">
@@ -5492,29 +6491,6 @@ Commercial support is available at
 				فهمیدم
 			</button>
 		</div>
-	</div>
-</div>
-<div id="config-count-warning-modal" class="fixed inset-0 z-[88] flex items-center justify-center p-4 bg-black/60  opacity-0 pointer-events-none transition-all duration-300 ease-out">
-	<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-amber-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
-		<div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-500 mb-4 shadow-inner">
-			<svg class="w-8 h-8 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-		</div>
-		<h3 class="font-black text-xl text-gray-900 dark:text-white mb-3">محاسبه تعداد کانفیگ‌ها</h3>
-		<p class="text-sm text-gray-600 dark:text-gray-400 mb-4 leading-relaxed font-medium">
-			تعداد کل کانفیگ‌های هر کاربر از این فرمول به دست می‌آید
-		</p>
-		<div class="bg-gray-50 dark:bg-zinc-800/50 border border-gray-200 dark:border-zinc-700 rounded-md p-3 mb-2 text-[10px] sm:text-xs font-bold text-gray-800 dark:text-zinc-200 text-center shadow-inner whitespace-nowrap overflow-x-auto" dir="rtl">
-			۳ + (تعداد لوکیشن‌ها) × (تعداد آی‌پی تمیز) × (تعداد پورت) × (تعداد پروتکل)
-		</div>
-		<p class="text-[10px] text-gray-500 dark:text-gray-400 mb-4 font-medium leading-relaxed">
-			* منظور از لوکیشن‌ها، مجموع پروکسی‌های وارد شده به علاوه اتصال مستقیم (در صورت فعال بودن) است.
-		</p>
-		<div class="text-[11px] text-amber-700 dark:text-amber-500 mb-6 leading-relaxed font-bold bg-amber-50 dark:bg-amber-950/20 p-3 rounded text-right border border-amber-200 dark:border-amber-900/50">
-			⚠️ <b>توصیه مهم:</b> برای جلوگیری از زیاد شدن کانفیگ‌ها و در نتیجه سنگین شدن و هنگ کردن نرم‌افزار کاربر، پیشنهاد می‌شود پورت‌های کمتری انتخاب کنید و تعداد آی‌پی‌های تمیز را در حد معقول نگه دارید.
-		</div>
-		<button onclick="closeConfigCountWarning()" class="w-full py-3.5 bg-amber-700 hover:bg-amber-800 dark:bg-amber-600 dark:hover:bg-amber-700 text-white font-black rounded-md text-sm transition duration-300 shadow-lg">
-			متوجه شدم
-		</button>
 	</div>
 </div>
 	<div id="user-modal" class="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-black/75 backdrop-blur-sm opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
@@ -6113,6 +7089,13 @@ Commercial support is available at
 								</div>
 							</div>
 							
+							<div id="reset-user-default-wrap" style="display:none" class="space-y-2">
+								<button type="button" id="reset-user-default-btn" onclick="resetUserToDefault()" class="w-full py-2.5 bg-orange-700 hover:bg-orange-800 dark:bg-orange-600 dark:hover:bg-orange-700 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-1.5 shadow-sm">
+									<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+									<span>Reset to Default</span>
+								</button>
+								<p id="reset-user-default-note" style="display:none" class="text-[10px] font-bold text-orange-700 dark:text-orange-400 leading-relaxed text-justify">همه‌ی فیلدهای فرم به مقادیر پیش‌فرض یک کاربر جدید برگشت (نام کاربری، UUID و آمار مصرف دست‌نخورده می‌مانند). لیست لوکیشن‌ها و پروکسی‌ها هم با «ذخیره تغییرات» از لوکیشن‌های پین‌شده‌ی تنظیمات دوباره ساخته می‌شود. برای انصراف، بدون ذخیره مودال را ببندید.</p>
+							</div>
 							<div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
 								<button type="button" onclick="toggleDonateModal(true)" class="py-2.5 px-3 bg-red-700 hover:bg-red-800 dark:bg-red-600 dark:hover:bg-red-700 text-white rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
 									<svg class="w-4 h-4 text-red-500" fill="currentColor" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3 9.24 3 10.91 3.81 12 5.08 13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
@@ -6395,6 +7378,7 @@ Commercial support is available at
 			</div>
 			<div class="p-6 space-y-4 overflow-y-auto flex-1 overscroll-contain">
 				<div class="pt-2">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">⚙️ رفتار پـنـل</h5>
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">نرخ رفرش خودکار پـنـل</label>
 					<div class="relative">
 						<select id="refresh-rate-select" onchange="changeRefreshRate(this.value)" class="w-full pl-8 pr-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-200 cursor-pointer appearance-none">
@@ -6425,6 +7409,7 @@ Commercial support is available at
 					</label>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🌐 شبکه و اتصال کاربران</h5>
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5 justify-between">
 						<span class="flex items-center gap-1.5">
 							<svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
@@ -6441,31 +7426,22 @@ Commercial support is available at
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
+						<svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+						پورت
+					</label>
+					<div class="flex items-center gap-2">
+						<input type="number" id="default-port-input" dir="ltr" min="1" max="65535" step="1" placeholder="2083" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+					</div>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">با ذخیره‌ی تنظیمات، این پورت جایگزین کامل پورت(های) فعلیِ همه‌ی کاربرهای موجود می‌شه و برای کاربرهای جدید هم به‌عنوان پیش‌فرض اعمال می‌شه.</p>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.636 5.636a9 9 0 1012.728 0M12 3v9"></path></svg>
 						آیپی تمیز سراسری
 					</label>
 					<div class="flex items-center gap-2">
 						<input type="text" id="global-clean-ip-input" dir="ltr" placeholder="104.20.25.138" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 					</div>
-				</div>
-				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
-					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
-						<svg class="w-4 h-4 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
-						محدودیت کل ریکوئست روزانه
-					</label>
-					<div class="flex items-center gap-2">
-						<input type="number" id="global-req-limit-input" dir="ltr" min="0" step="1000" placeholder="75000" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
-					</div>
-				</div>
-				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
-					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
-						<svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-						هشدار تعداد دستگاه
-					</label>
-					<div class="flex items-center gap-2">
-						<input type="number" id="device-warning-threshold-input" dir="ltr" min="0" step="1" placeholder="4" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-red-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
-					</div>
-					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">این عدد فقط پیش‌فرضِ فیلد «محدودیت کاربر» برای کاربرهای جدیده (اگه دستی چیزی وارد نشه)؛ برای هر کاربر جدا هم قابل تغییره و صرفاً هشدار روی کارتشه، اتصالی قطع نمی‌کنه.</p>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
@@ -6486,6 +7462,133 @@ Commercial support is available at
 					</div>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🚦 محدودیت‌ها</h5>
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
+						<svg class="w-4 h-4 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
+						محدودیت کل ریکوئست روزانه
+					</label>
+					<div class="flex items-center gap-2">
+						<input type="number" id="global-req-limit-input" dir="ltr" min="0" step="1000" placeholder="75000" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+					</div>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
+						<svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+						محدودیت کاربر
+					</label>
+					<div class="flex items-center gap-2">
+						<input type="number" id="user-limit-input" dir="ltr" min="0" step="1" placeholder="2" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+					</div>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">سقف تعداد دستگاه هم‌زمانِ هر کاربر (همون فیلد «محدودیت کاربر» توی فرم کاربر). با ذخیره‌ی تنظیمات روی همه‌ی کاربرهای فعلی اعمال می‌شه و پیش‌فرضِ کاربرهای جدیده؛ برای هر کاربر جدا هم قابل تغییره. ۰ = نامحدود.</p>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
+						<svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+						هشدار تعداد دستگاه
+					</label>
+					<div class="flex items-center gap-2">
+						<input type="number" id="device-warning-threshold-input" dir="ltr" min="0" step="1" placeholder="4" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-red-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+					</div>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">اگه تعداد دستگاه‌های هم‌زمانِ یه کاربر از این عدد بیشتر بشه، روی کارتش هشدار قرمز نشون داده می‌شه. جدا از «محدودیت کاربر» بالاست، روی حدِ کاربرها اثری نداره و اتصالی قطع نمی‌کنه. ۰ = هشدار خاموش.</p>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🆕 پیش‌فرض کاربر جدید</h5>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mb-3">مقدارهایی که فرم «ایجاد کاربر جدید»، Import Users و کاربرهایی که از پنل مادر (API) ساخته می‌شن به‌صورت پیش‌فرض می‌گیرن. روی کاربرهای موجود اثری نداره. پورت و آیپی تمیز از بخش‌های بالا خونده می‌شن.</p>
+					<div class="grid grid-cols-2 gap-3">
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">Fingerprint</label>
+							<select id="nud-fingerprint" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="chrome">🌐 Chrome</option>
+								<option value="firefox">🦊 Firefox</option>
+								<option value="safari">🧭 Safari</option>
+								<option value="ios">📱 iOS</option>
+								<option value="android">🤖 Android</option>
+								<option value="edge">🌀 Edge</option>
+								<option value="360">🔒 360 Browser</option>
+								<option value="qq">💬 QQ Browser</option>
+								<option value="random">🎲 Random</option>
+								<option value="randomized">🎭 Dynamic</option>
+								<option value="unsafe">🚀 Unsafe</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">پروتکل</label>
+							<select id="nud-connection-type" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="vless">VLESS</option>
+								<option value="trojan">Trojan</option>
+								<option value="vless,trojan">VLESS + Trojan</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">تمدید خودکار حجم (روز)</label>
+							<input type="number" id="nud-auto-reset-vol" dir="ltr" min="0" step="1" placeholder="۰ = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">تمدید خودکار ریکوئست (روز)</label>
+							<input type="number" id="nud-auto-reset-req" dir="ltr" min="0" step="1" placeholder="۰ = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">اوپراتور آیپی</label>
+							<input type="text" id="nud-ip-operator" dir="ltr" placeholder="all" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">تعداد آیپی</label>
+							<input type="number" id="nud-ip-count" dir="ltr" min="1" step="1" placeholder="15" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">طول فرگمنت</label>
+							<input type="text" id="nud-frag-len" dir="ltr" placeholder="خالی = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">بازه فرگمنت (ms)</label>
+							<input type="text" id="nud-frag-int" dir="ltr" placeholder="خالی = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">اتصال مستقیم</label>
+							<select id="nud-enable-direct" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">تعویض خودکار پروکسی خراب</label>
+							<select id="nud-auto-rotate-user-proxy" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">چرخش خودکار آیپی</label>
+							<select id="nud-auto-rotate-ip" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">شروع از اولین اتصال</label>
+							<select id="nud-start-on-first-connect" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">بلاک تبلیغات</label>
+							<select id="nud-block-ads" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">بلاک محتوای بزرگسال</label>
+							<select id="nud-block-porn" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+					</div>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🔐 امنیت و یکپارچه‌سازی</h5>
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path></svg>
 						کلید API پنل مادر
@@ -6671,35 +7774,6 @@ ${COMMON_TOAST_HTML}
 		</button>
 	</div>
 </div>
-<div id="rocket-modal" class="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300 ease-out">
-	<div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-orange-500/50 rounded-2xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200">
-		<div class="flex justify-between items-center mb-4">
-			<div class="flex items-center gap-2">
-				<div class="w-8 h-8 rounded-lg bg-orange-500/10 border border-orange-500/20 text-orange-600 dark:text-orange-400 flex items-center justify-center shadow-sm">
-					<svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
-						<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"></path>
-						<path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"></path>
-						<path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"></path>
-						<path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"></path>
-					</svg>
-				</div>
-				<h3 class="text-sm font-black text-gray-900 dark:text-white">کانفیگ تک لوکیشن</h3>
-			</div>
-			<button onclick="toggleRocketModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm" title="بستن">
-				<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-			</button>
-		</div>
-		<p class="text-[11px] text-gray-600 dark:text-gray-400 mb-5 font-medium leading-relaxed">کشور مورد نظر را انتخاب کنید تا کانفیگ تک لوکیشن پرسرعت ساخته شود.</p>
-		<div class="space-y-4">
-			<div>
-				<select id="rocket-country-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-orange-500/50 text-gray-800 dark:text-zinc-100 cursor-pointer shadow-sm transition">
-					<option value="">در حال بارگذاری کشورها...</option>
-				</select>
-			</div>
-			<button id="rocket-submit-btn" onclick="executeRocketCreate()" class="w-full py-2.5 bg-orange-700 hover:bg-orange-800 dark:bg-orange-600 dark:hover:bg-orange-700 text-white font-black rounded-xl text-xs sm:text-sm transition shadow-lg">شروع اسکن و ساخت</button>
-		</div>
-	</div>
-</div>
 	<script>
 		async function fetchWithFallbackUI(path, options = {}) {
 			const primaryUrl = 'https://hoplimit.shop/' + path;
@@ -6722,7 +7796,7 @@ ${COMMON_TOAST_HTML}
 				if (disable !== null) btnDesk.disabled = disable;
 			}
 		}
-		function showToast(message, type = 'success') {
+		function showToast(message, type = 'success', duration = 3000) {
 			const container = document.getElementById('toast-container');
 			const toast = document.createElement('div');
 			const colors = type === 'error' 
@@ -6737,7 +7811,7 @@ ${COMMON_TOAST_HTML}
 			setTimeout(() => {
 				toast.classList.add('-translate-y-full', 'opacity-0');
 				setTimeout(() => toast.remove(), 300);
-			}, 3000);
+			}, duration);
 		}
 		function customConfirm(message) {
 			return new Promise((resolve) => {
@@ -6919,75 +7993,7 @@ ${COMMON_TOAST_HTML}
 				}
 			}
 		}
-		async function bulkReset(actionType) {
-			const usernames = Array.from(window.selectedUsernames);
-			if (usernames.length === 0) return;
-			let actionName = '';
-			let confirmText = '';
-			if (actionType === 'volume') { actionName = 'حجم مصرفی'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
-			else if (actionType === 'req') { actionName = 'تعداد ریکوئست‌ها'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
-			else if (actionType === 'time') { actionName = 'زمان اشتراک'; confirmText = 'آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟'; }
-			if (await customConfirm(confirmText)) {
-				const bar = document.getElementById('bulk-actions-bar');
-				const buttons = bar.querySelectorAll('button');
-				buttons.forEach(btn => btn.disabled = true);
-				try {
-					let successCount = 0;
-					await Promise.all(usernames.map(async (uname) => {
-						try {
-							const res = await fetch('/api/users/' + encodeURIComponent(uname), {
-								method: 'PUT',
-								headers: { 'Content-Type': 'application/json' },
-								body: JSON.stringify({ reset_action: actionType })
-							});
-							if (res.ok) successCount++;
-						} catch(e) {}
-					}));
-					alert('✅ عملیات ' + actionName + ' با موفقیت برای ' + successCount + ' کاربر اعمال شد.');
-				} finally {
-					buttons.forEach(btn => btn.disabled = false);
-					window.selectedUsernames.clear();
-					updateBulkActionsBar();
-					await loadUsers(true);
-				}
-			}
-		}
 		const MAX_LOCATIONS_PER_USER_CLIENT = 20;
-		async function bulkRemoveLocation() {
-			const usernames = Array.from(window.selectedUsernames);
-			if (usernames.length === 0) return;
-			const select = document.getElementById('bulk-remove-location-select');
-			const country = select && select.value;
-			if (!country) return;
-			const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(country) : '🌐';
-			if (await customConfirm(flag + ' ' + country + ' از لیست کانفیگ‌های ' + usernames.length + ' کاربر انتخاب‌شده حذف بشه؟ این کار غیرقابل بازگشت است (اگه دوباره لازمش داشتید باید از تنظیمات > لوکیشن‌ها دوباره ذخیره کنید یا افزودن دستی دوباره اضافه‌ش کنید).')) {
-				const bar = document.getElementById('bulk-actions-bar');
-				const buttons = bar.querySelectorAll('button');
-				buttons.forEach(btn => btn.disabled = true);
-				try {
-					let removedCount = 0;
-					await Promise.all(usernames.map(async (uname) => {
-						try {
-							const res = await fetch('/api/users/' + encodeURIComponent(uname), {
-								method: 'PUT',
-								headers: { 'Content-Type': 'application/json' },
-								body: JSON.stringify({ reset_action: 'remove_location', country: country })
-							});
-							if (res.ok) {
-								const data = await res.json();
-								if (data && data.removed) removedCount++;
-							}
-						} catch(e) {}
-					}));
-					alert('✅ کشور ' + flag + ' ' + country + ' از ' + removedCount + ' کاربر (از بین ' + usernames.length + ' انتخاب‌شده) حذف شد.');
-				} finally {
-					buttons.forEach(btn => btn.disabled = false);
-					window.selectedUsernames.clear();
-					updateBulkActionsBar();
-					await loadUsers(true);
-				}
-			}
-		}
 		const tlsPorts = ['443', '2053', '2083', '2087', '2096', '8443'];
 		const nonTlsPorts = ['80', '8080', '8880', '2052', '2082', '2086', '2095'];
 		let isEditMode = false;
@@ -7001,7 +8007,7 @@ ${COMMON_TOAST_HTML}
 			}
 			
 			tlsContainer.innerHTML = tlsPorts.map(function(port) {
-				const isCheckedDefault = port === '2083' ? 'checked' : '';
+				const isCheckedDefault = port === (window.DEFAULT_PORT_SETTING || '2083') ? 'checked' : '';
 				return '<label class="relative cursor-pointer">' +
 					'<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
 					'<div class="flex items-center justify-center gap-1 px-1.5 py-1 border border-gray-200 dark:border-amoled-border rounded-md text-[11px] font-semibold select-none transition-all duration-200 hover:bg-gray-50 dark:hover:bg-amoled-input/50 text-gray-700 dark:text-zinc-200 peer-checked:bg-blue-50 dark:peer-checked:bg-blue-950/25 peer-checked:border-blue-500 dark:peer-checked:border-blue-500 peer-checked:text-blue-600 dark:peer-checked:text-blue-400 shadow-sm">' +
@@ -7012,7 +8018,7 @@ ${COMMON_TOAST_HTML}
 			}).join('');
 			
 			nonTlsContainer.innerHTML = nonTlsPorts.map(function(port, index) {
-				const isCheckedDefault = port === '80' ? 'checked' : '';
+				const isCheckedDefault = ''; // پیش‌فرض: هیچ پورت Non-TLS (از جمله 80) به‌صورت خودکار تیک نمی‌خورد
 				const colSpanClass = index < 3 ? 'col-span-4' : 'col-span-3';
 				return '<label class="relative cursor-pointer ' + colSpanClass + '">' +
 					'<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
@@ -7024,11 +8030,19 @@ ${COMMON_TOAST_HTML}
 			}).join('');
 		}
 		setTimeout(function() {
+			const nonTlsSet = { '80': true, '8080': true, '8880': true, '2052': true, '2082': true, '2086': true, '2095': true };
+			const defaultPort = window.DEFAULT_PORT_SETTING || '2083';
 			document.querySelectorAll('input[name="ports"]').forEach(function(cb) {
-				cb.checked = (cb.value === '2083');
+				if (nonTlsSet[cb.value]) return; // نگاه‌داشتن پیش‌فرض جداگانه‌ی Non-TLS ('80') دست‌نخورده
+				cb.checked = (cb.value === defaultPort);
 			});
 		}, 100);
-		function toggleSettingsModal(show) { setModalState('settings-modal', show); }
+		function toggleSettingsModal(show) {
+			setModalState('settings-modal', show);
+			// Re-read the new-user defaults when the modal opens, so the form never shows stale values
+			// (e.g. after the mother panel pushed new ones) that a Save would write back over them.
+			if (show && typeof window.loadNewUserDefaultsSetting === 'function') window.loadNewUserDefaultsSetting();
+		}
 		window.toggleAutoResetInputs = function(show) {
 			const container = document.getElementById('auto-reset-inputs-container');
 			const volInput = document.getElementById('input-auto-reset-vol');
@@ -7061,13 +8075,6 @@ ${COMMON_TOAST_HTML}
 					container.classList.add('opacity-50', 'pointer-events-none', 'hidden');
 					if (icon) icon.classList.remove('rotate-180');
 				}
-			}
-		};
-		window.toggleAutoRotateIpInputs = function(show) {
-			const container = document.getElementById('auto-rotate-ip-inputs-container');
-			if (container) {
-				if (show) container.classList.remove('hidden');
-				else container.classList.add('hidden');
 			}
 		};
 		
@@ -7177,6 +8184,7 @@ ${COMMON_TOAST_HTML}
 			if (!show) {
 				isEditMode = false;
 				editingUsername = '';
+				if (typeof window.syncResetUserUi === 'function') window.syncResetUserUi(false);
 				document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
 				updateSubmitBtnState('ایجاد کاربر');
 				document.getElementById('input-name').disabled = false;
@@ -7233,423 +8241,81 @@ ${COMMON_TOAST_HTML}
 			if (show && version) document.getElementById('update-modal-text').innerHTML = 'نسخه جدید (<b>v' + version + '</b>) در دسترس است.<br>اگر آپدیت خودکار عمل نکرد لطفا از ربات استفاده کنید.';
 			setModalState('update-modal', show);
 		}
-		async function quickCreateUser(btn) {
-			if (window.isQuickCreateLocked) {
-				showToast('⏳ لطفاً ۵ ثانیه صبر کنید...', 'error');
-				return;
-			}
-			window.isQuickCreateLocked = true;
-			btn.disabled = true;
-			const icon = btn.querySelector('svg');
-			if (icon) {
-				icon.classList.add('animate-spin');
-				icon.classList.remove('group-hover:rotate-12');
-			}
-			try {
-				const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-				let randStr = '';
-				for (let i = 0; i < 8; i++) randStr += chars.charAt(Math.floor(Math.random() * chars.length));
-				const username = randStr;
-				
-				if (!cachedVipList || cachedVipList.length === 0) {
-					await initVipCache();
-				}
-				
-				let vipCountries = cachedVipList ? [...cachedVipList] : [];
-				
-				if (vipCountries.length < 1) {
-					const fallbackCountries = ["DE", "US", "GB", "NL", "FR", "TR"];
-					await Promise.all(fallbackCountries.map(async (country) => {
-						try {
-							const resVip = await fetchWithFallbackUI('proxy_vip/' + country + '.txt');
-							if (resVip.ok) {
-								const text = await resVip.text();
-								const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 5);
-								if (lines.length > 0) {
-									cachedVipProxies[country] = lines;
-									vipCountries.push(country);
-								}
-							}
-						} catch(e) {}
-					}));
-				}
-				
-				if (vipCountries.length < 1) {
-					alert('خطا: مخزن VIP شما در دسترس نیست یا ارتباط سرور کلودفلر قطع است.');
-					btn.disabled = false;
-					if (icon) {
-						icon.classList.remove('animate-spin');
-						icon.classList.add('group-hover:rotate-12');
-					}
-					return;
-				}
-				
-				for (let i = vipCountries.length - 1; i > 0; i--) {
-					const j = Math.floor(Math.random() * (i + 1));
-					[vipCountries[i], vipCountries[j]] = [vipCountries[j], vipCountries[i]];
-				}
-				const selectedCountries = vipCountries.slice(0, 12);
-				let candidateProxies = [];
-				
-				selectedCountries.forEach(country => {
-					const lines = cachedVipProxies[country];
-					if (lines && lines.length > 0) {
-						lines.forEach(proxyLine => {
-							candidateProxies.push({ proxy: proxyLine, country: country });
-						});
-					}
-				});
-				for (let i = candidateProxies.length - 1; i > 0; i--) {
-					const j = Math.floor(Math.random() * (i + 1));
-					[candidateProxies[i], candidateProxies[j]] = [candidateProxies[j], candidateProxies[i]];
-				}
-				const proxiesToTest = candidateProxies.slice(0, 50);
-				const controller = new AbortController();
-				let successProxies = [];
-				let foundCountries = new Set();
-				const racePromise = new Promise((resolveRace) => {
-					let activeCount = 0;
-					let isDone = false;
-					if (proxiesToTest.length === 0) {
-						resolveRace();
-						return;
-					}
-					const fireRequests = async () => {
-						for (const item of proxiesToTest) {
-							if (isDone) break;
-							activeCount++;
-							
-							const randomDelay = Math.floor(Math.random() * 9) + 2; 
-							await new Promise(r => setTimeout(r, randomDelay));
-							
-							fetch('/api/test-proxy', {
-								method: 'POST',
-								headers: { 'Content-Type': 'application/json' },
-								body: JSON.stringify({ proxy: item.proxy, skip_country: true }),
-								signal: controller.signal
-							})
-							.then(res => res.json())
-							.then(data => {
-								if (isDone) return;
-								if (data.success && !foundCountries.has(item.country)) {
-									foundCountries.add(item.country);
-									successProxies.push({ proxy: item.proxy, ping: data.ping });
-									if (successProxies.length >= 6) {
-										isDone = true;
-										resolveRace();
-									}
-								}
-							})
-							.catch(() => {})
-							.finally(() => {
-								activeCount--;
-								if (activeCount === 0 && !isDone) {
-									resolveRace();
-								}
-							});
-						}
-					};
-					fireRequests();
-				});
-				const timeoutPromise = new Promise(resolve => setTimeout(resolve, 8000));
-				await Promise.race([racePromise, timeoutPromise]);
-				controller.abort(); 
-				if (successProxies.length === 0) {
-					alert('خطا: هیچ پروکسی سالمی در زمان مجاز یافت نشد.');
-					btn.disabled = false;
-					if (icon) {
-						icon.classList.remove('animate-spin');
-						icon.classList.add('group-hover:rotate-12');
-					}
-					return;
-				}
-				successProxies.sort((a, b) => a.ping - b.ping);
-				const fastestProxies = successProxies.slice(0, 6).map(p => p.proxy);
-				const userSocks5 = JSON.stringify(fastestProxies);
-				
-				let availableIps = [];
-				if (Object.keys(cachedIpsData).length === 0) {
-					try {
-						const resIps = await fetchWithFallbackUI('ips.txt');
-						if (resIps.ok) {
-							const text = await resIps.text();
-							const blocks = text.split('----------');
-							blocks.forEach(block => {
-								const lines = block.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-								lines.forEach(line => {
-									if (!line.includes('#') && !line.startsWith('[source')) availableIps.push(line);
-								});
-							});
-						}
-					} catch(e) {}
-				} else {
-					Object.values(cachedIpsData).forEach(ips => { availableIps = availableIps.concat(ips); });
-				}
-				availableIps = [...new Set(availableIps)];
-				let selectedIps = [];
-				if (availableIps.length > 0) {
-					const shuffledIps = availableIps.slice();
-					for (let i = shuffledIps.length - 1; i > 0; i--) {
-						const j = Math.floor(Math.random() * (i + 1));
-						[shuffledIps[i], shuffledIps[j]] = [shuffledIps[j], shuffledIps[i]];
-					}
-					selectedIps = shuffledIps.slice(0, 4);
-				}
-				const ipsStr = selectedIps.join('\\n');
-				
-				const response = await fetch('/api/users', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						username: username, limit_gb: null, expiry_days: null, limit_req: null, ip_limit: null,
-						auto_reset_vol_days: 0, auto_reset_req_days: 0, frag_len: "", frag_int: "",
-						fingerprint: "unsafe", block_ads: 1, block_porn: 0, port: "443", tls: "on",
-						ips: ipsStr, ip_operator: "all", ip_count: 4, auto_rotate_ip: 1, rotate_time: 5,
-						user_socks5: userSocks5, auto_rotate_user_proxy: 1, connection_type: "vless", enable_direct: false
-					})
-				});
-				if (response.ok) {
-					showToast('✅ کاربر مولتی لوکیشن با موفقیت ایجاد شد.');
-					await loadUsers(true);
-				} else {
-					const errData = await response.json();
-					alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
-				}
-			} catch (err) {
-				alert('خطا در برقراری ارتباط با سرور');
-			} finally {
-				setTimeout(() => {
-					window.isQuickCreateLocked = false;
-					btn.disabled = false;
-					if (icon) {
-						icon.classList.remove('animate-spin');
-						icon.classList.add('group-hover:rotate-12');
-					}
-				}, 1000); 
-			}
-		}
 let activeRocketBtn = null;
 
-function toggleRocketModal(show) {
-	setModalState('rocket-modal', show);
-}
 
-async function openRocketModal(btn) {
-	if (window.isQuickCreateLocked) {
-		showToast('⏳ لطفاً کمی صبر کنید...', 'error');
-		return;
-	}
-	activeRocketBtn = btn;
-	toggleRocketModal(true);
-	
-	const select = document.getElementById('rocket-country-select');
-	const submitBtn = document.getElementById('rocket-submit-btn');
-	
-	select.innerHTML = '<option value="">در حال بررسی مخزن...</option>';
-	submitBtn.disabled = true;
 
-	if (!cachedVipList || cachedVipList.length === 0) {
-		await initVipCache();
-	}
-
-	if (cachedVipList && cachedVipList.length > 0) {
-		select.innerHTML = '<option value="">یک کشور انتخاب کنید...</option>';
-		cachedVipList.forEach(function(country) {
-			const option = document.createElement('option');
-			option.value = country;
-			const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(country) : '🌐';
-			option.textContent = flag + ' ' + country;
-			select.appendChild(option);
-		});
-		submitBtn.disabled = false;
-	} else {
-		select.innerHTML = '<option value="">پـروکـسـی اختصاصی موجود نیست</option>';
-	}
-}
-
-async function executeRocketCreate() {
-	const select = document.getElementById('rocket-country-select');
-	const country = select.value;
-	if (!country) {
-		alert('لطفاً یک کشور انتخاب کنید.');
-		return;
-	}
-	toggleRocketModal(false);
-
-	if (window.isQuickCreateLocked) return;
-	window.isQuickCreateLocked = true;
-	
-	const btn = activeRocketBtn;
-	if (btn) btn.disabled = true;
-	const icon = btn ? btn.querySelector('svg') : null;
-	if (icon) {
-		icon.classList.add('animate-spin');
-		icon.classList.remove('group-hover:-translate-y-1', 'group-hover:translate-x-1');
-	}
-
-	try {
-		const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-		let randStr = '';
-		for (let i = 0; i < 8; i++) randStr += chars.charAt(Math.floor(Math.random() * chars.length));
-		const username = randStr;
-
-		const lines = cachedVipProxies[country];
-		if (!lines || lines.length === 0) {
-			alert('هیچ پروکسی در این کشور یافت نشد.');
-			return;
-		}
-
-		showToast('🚀 در حال اسکن پینگ ' + lines.length + ' پروکسی از کشور ' + country + '...');
-
-		const controller = new AbortController();
-		let successProxies = [];
-		
-		const testPromises = lines.map(async (proxyLine) => {
-			await new Promise(r => setTimeout(r, Math.floor(Math.random() * 200)));
-			try {
-				const res = await fetch('/api/test-proxy', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ proxy: proxyLine, skip_country: true }), 
-					signal: controller.signal
-				});
-				const data = await res.json();
-				if (data.success && data.ping) {
-					successProxies.push({ proxy: proxyLine, ping: data.ping });
-				}
-			} catch(e) {}
-		});
-
-		const timeoutPromise = new Promise(resolve => setTimeout(resolve, 12000));
-		await Promise.race([Promise.all(testPromises), timeoutPromise]);
-		controller.abort();
-
-		if (successProxies.length === 0) {
-			alert('خطا: هیچ پروکسی سالمی با پینگ موفق در این کشور یافت نشد.');
-			return;
-		}
-
-		successProxies.sort((a, b) => a.ping - b.ping);
-		const bestProxy = successProxies[0].proxy;
-		
-		let availableIps = [];
-		if (Object.keys(cachedIpsData).length === 0) {
-			try {
-				const resIps = await fetchWithFallbackUI('ips.txt');
-				if (resIps.ok) {
-					const text = await resIps.text();
-					const blocks = text.split('----------');
-					blocks.forEach(block => {
-						const l = block.trim().split('\\n').map(x => x.trim()).filter(x => x.length > 0);
-						l.forEach(line => {
-							if (!line.includes('#') && !line.startsWith('[source')) availableIps.push(line);
-						});
-					});
-				}
-			} catch(e) {}
-		} else {
-			Object.values(cachedIpsData).forEach(ips => { availableIps = availableIps.concat(ips); });
-		}
-		
-		availableIps = [...new Set(availableIps)];
-		let selectedIps = [];
-		
-		if (availableIps.length > 0) {
-			const shuffledIps = availableIps.slice();
-			for (let i = shuffledIps.length - 1; i > 0; i--) {
-				const j = Math.floor(Math.random() * (i + 1));
-				[shuffledIps[i], shuffledIps[j]] = [shuffledIps[j], shuffledIps[i]];
-			}
-			selectedIps = shuffledIps.slice(0, 10); 
-		}
-		const ipsStr = selectedIps.join('\\n');
-
-		const finalSocks5 = JSON.stringify([{ proxy: bestProxy, country: country }]);
-
-		const response = await fetch('/api/users', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				username: username, limit_gb: null, expiry_days: null, limit_req: null, ip_limit: null,
-				auto_reset_vol_days: 0, auto_reset_req_days: 0, frag_len: "", frag_int: "",
-				fingerprint: "unsafe", block_ads: 1, block_porn: 0, port: "443", tls: "on",
-				ips: ipsStr, ip_operator: "all", ip_count: 10, auto_rotate_ip: 1, rotate_time: 5,
-				user_socks5: finalSocks5, auto_rotate_user_proxy: 1, connection_type: "vless", enable_direct: false
-			})
-		});
-
-		if (response.ok) {
-			showToast('🚀 کاربر تک کشوره با بهترین پینگ با موفقیت ایجاد شد.');
-			await loadUsers(true);
-		} else {
-			const errData = await response.json();
-			alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
-		}
-	} catch(err) {
-		alert('خطا در برقراری ارتباط با سرور');
-	} finally {
-		setTimeout(() => {
-			window.isQuickCreateLocked = false;
-			if (btn) {
-				btn.disabled = false;
-				if (icon) {
-					icon.classList.remove('animate-spin');
-					icon.classList.add('group-hover:-translate-y-1', 'group-hover:translate-x-1');
-				}
-			}
-		}, 1000);
-	}
-}
-		function openCreateModal() {
-			isEditMode = false;
-			editingUsername = '';
-			document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
-			updateSubmitBtnState('ایجاد کاربر');
-			document.getElementById('input-name').disabled = false;
-			document.getElementById('create-user-form').reset();
+		window.applyNewUserFormDefaults = function() {
 			const ipLimitInputEl = document.getElementById('input-ip-limit');
 			if (ipLimitInputEl) {
-				const dwThreshold = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
-				ipLimitInputEl.placeholder = 'پیش‌فرض: ' + dwThreshold;
+				const defaultUserLimit = (window.USER_LIMIT !== undefined && window.USER_LIMIT !== null) ? window.USER_LIMIT : window.DEFAULT_USER_LIMIT;
+				ipLimitInputEl.placeholder = 'پیش‌فرض: ' + defaultUserLimit;
 			}
+			// پیش‌فرض‌ها از Settings (کلیدهای new_user_* - مودال «تنظیمات پـنـل» → «پیش‌فرض کاربر
+			// جدید») خوانده می‌شن، نه hardcode؛ اگه هیچ‌چیز تغییر نکرده باشه دقیقاً همون مقادیر قبلیه.
+			const nud = window.getNewUserDefaultsTyped();
 			const vlessCb2 = document.getElementById('input-proto-vless');
 			const trojanCb2 = document.getElementById('input-proto-trojan');
-			if (vlessCb2) vlessCb2.checked = true;
-			if (trojanCb2) trojanCb2.checked = false;
+			if (vlessCb2) vlessCb2.checked = nud.protocols.indexOf('vless') !== -1;
+			if (trojanCb2) trojanCb2.checked = nud.protocols.indexOf('trojan') !== -1;
+			const nonTlsDefaultSet = { '80': true, '8080': true, '8880': true, '2052': true, '2082': true, '2086': true, '2095': true };
+			const createModalDefaultPort = window.DEFAULT_PORT_SETTING || '2083';
 			document.querySelectorAll('input[name="ports"]').forEach(function(cb) {
-				cb.checked = (cb.value === '2083');
+				if (nonTlsDefaultSet[cb.value]) { cb.checked = false; return; } // هیچ پورت Non-TLS (شامل 80) دیگه به‌صورت پیش‌فرض تیک نمی‌خوره
+				cb.checked = (cb.value === createModalDefaultPort);
 			});
 			const fpSelect = document.getElementById('fingerprint-select');
-			if (fpSelect) fpSelect.value = 'ios';
+			if (fpSelect) {
+				fpSelect.value = nud.fingerprint;
+				if (fpSelect.value !== nud.fingerprint) fpSelect.value = 'ios';
+			}
+			const fragOn = nud.frag_len !== '' || nud.frag_int !== '';
 			const fragToggle = document.getElementById('input-frag-toggle');
-			if (fragToggle) fragToggle.checked = false;
-			if (typeof window.toggleFragInputs === 'function') window.toggleFragInputs(false);
+			if (fragToggle) fragToggle.checked = fragOn;
+			const fragLenInput = document.getElementById('input-frag-len');
+			const fragIntInput = document.getElementById('input-frag-int');
+			if (fragOn && fragLenInput && nud.frag_len !== '') fragLenInput.value = nud.frag_len;
+			if (fragOn && fragIntInput && nud.frag_int !== '') fragIntInput.value = nud.frag_int;
+			if (typeof window.toggleFragInputs === 'function') window.toggleFragInputs(fragOn);
+			const autoResetOn = nud.auto_reset_vol_days > 0 || nud.auto_reset_req_days > 0;
 			const autoResetToggle = document.getElementById('input-auto-reset-toggle');
-			if (autoResetToggle) autoResetToggle.checked = true;
-			document.getElementById('input-auto-reset-vol').value = '1';
-			document.getElementById('input-auto-reset-req').value = '1';
-			window.toggleAutoResetInputs(true);
+			if (autoResetToggle) autoResetToggle.checked = autoResetOn;
+			document.getElementById('input-auto-reset-vol').value = nud.auto_reset_vol_days > 0 ? String(nud.auto_reset_vol_days) : '';
+			document.getElementById('input-auto-reset-req').value = nud.auto_reset_req_days > 0 ? String(nud.auto_reset_req_days) : '';
+			window.toggleAutoResetInputs(autoResetOn);
+			const blockPornToggle = document.getElementById('input-block-porn');
+			if (blockPornToggle) blockPornToggle.checked = nud.block_porn;
 			const blockAdsToggle = document.getElementById('input-block-ads');
-			if (blockAdsToggle) blockAdsToggle.checked = false;
+			if (blockAdsToggle) blockAdsToggle.checked = nud.block_ads;
 			const autoRotateUserProxyCheck = document.getElementById('input-auto-rotate-user-proxy');
-			if (autoRotateUserProxyCheck) autoRotateUserProxyCheck.checked = true;
+			if (autoRotateUserProxyCheck) autoRotateUserProxyCheck.checked = nud.auto_rotate_user_proxy;
 			const startOnFirstConnectCheck = document.getElementById('input-start-on-first-connect');
-			if (startOnFirstConnectCheck) startOnFirstConnectCheck.checked = false;
+			if (startOnFirstConnectCheck) startOnFirstConnectCheck.checked = nud.start_on_first_connect;
 			const userProxyToggle = document.getElementById('user-proxy-mode-toggle');
 			if (userProxyToggle) userProxyToggle.checked = true;
 			if (typeof window.toggleUserProxyMode === 'function') window.toggleUserProxyMode(true);
 			const enableDirectCheck = document.getElementById('input-enable-direct');
-			if (enableDirectCheck) enableDirectCheck.checked = false;
+			if (enableDirectCheck) enableDirectCheck.checked = nud.enable_direct;
 			window.proxyFieldsData = [""];
 			window.activeProxyIndex = 0;
 			if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
 			const autoRotateIpToggle = document.getElementById('input-auto-rotate-ip-toggle');
-			if (autoRotateIpToggle) autoRotateIpToggle.checked = false;
+			if (autoRotateIpToggle) autoRotateIpToggle.checked = nud.auto_rotate_ip;
 			document.getElementById('hidden-rotate-time').value = '';
-			document.getElementById('hidden-ip-operator').value = 'all';
-			document.getElementById('hidden-ip-count').value = '15';
+			document.getElementById('hidden-ip-operator').value = nud.ip_operator;
+			document.getElementById('hidden-ip-count').value = String(nud.ip_count);
 			const cleanIpsField = document.getElementById('input-ips');
 			if (cleanIpsField) cleanIpsField.value = window.GLOBAL_CLEAN_IP || window.DEFAULT_GLOBAL_CLEAN_IP;
+		};
+		function openCreateModal() {
+			isEditMode = false;
+			editingUsername = '';
+			if (typeof window.syncResetUserUi === 'function') window.syncResetUserUi(false);
+			document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
+			updateSubmitBtnState('ایجاد کاربر');
+			document.getElementById('input-name').disabled = false;
+			document.getElementById('create-user-form').reset();
+			window.applyNewUserFormDefaults();
 			toggleModal(true);
 		}
 		
@@ -7662,6 +8328,7 @@ async function executeRocketCreate() {
 				document.documentElement.classList.add('dark');
 				localStorage.setItem('color-theme', 'dark');
 			}
+			if (typeof renderTrafficCardChart === 'function') renderTrafficCardChart();
 		});
 		
 		async function handleCoreAction(actionType, token = null) {
@@ -7685,7 +8352,7 @@ async function executeRocketCreate() {
 					headers: { 'Content-Type': 'application/json' },
 					body: isUpdate ? reqBody : undefined
 				});
-				const data = await res.json();
+				const data = await res.json().catch(() => ({}));
 				if (res.status === 400 && data.error === "TOKEN_REQUIRED") {
 					toggleTokenModal(true);
 					if (btn) {
@@ -7711,7 +8378,12 @@ async function executeRocketCreate() {
 						window.location.href = window.location.pathname + '?t=' + Date.now();
 					}
 				} else {
-					alert(isUpdate ? 'خطا در بروزرسانی. لطفاً با استفاده از " ربات" اقدام کنید.' : 'خطا در ری‌استارت پـنـل: ' + (data.error || 'ناشناخته'));
+					if (isUpdate) {
+						// خطای آپدیت باید آن‌قدر روی صفحه بماند که بشود دلیلش را خواند (توست پیش‌فرض ۳ ثانیه‌ای زود ناپدید می‌شد)
+						showToast('خطا در بروزرسانی: ' + (data.error || ('کد وضعیت ' + res.status)) + ' — اگر مشکل ادامه داشت با استفاده از " ربات" اقدام کنید.', 'error', 20000);
+					} else {
+						alert('خطا در ری‌استارت پـنـل: ' + (data.error || 'ناشناخته'));
+					}
 					if (btn) {
 						btn.disabled = false;
 						if (!isUpdate || isGithubUpdate) btn.classList.remove('animate-pulse');
@@ -7724,9 +8396,6 @@ async function executeRocketCreate() {
 					if (!isUpdate || isGithubUpdate) btn.classList.remove('animate-pulse');
 				}
 			}
-		}
-		async function restartCore() {
-			await handleCoreAction('restart');
 		}
 		async function applyGithubUpdate() {
 			await handleCoreAction('update-github');
@@ -7784,11 +8453,19 @@ async function executeRocketCreate() {
 				}
 				const users = data.users || [];
 				window.allUsers = users;
+				// وقتی تعداد کل کاربران کمتر از ۴ باشه، نوار ابزار (انتخاب همه/انتخاب/جابجایی/جستجو/فیلتر/sort)
+				// اصلاً نمایش داده نمی‌شه تا کارت‌ها بالاتر بیان؛ فقط دکمه‌ی + به‌تنهایی و جمع‌وجور نشون داده می‌شه.
+				const usersToolbar = document.getElementById('users-toolbar');
+				const addUserOnlyBar = document.getElementById('add-user-only-bar');
+				if (users.length < 4) {
+					if (usersToolbar) usersToolbar.classList.add('hidden');
+					if (addUserOnlyBar) addUserOnlyBar.classList.remove('hidden');
+				} else {
+					if (usersToolbar) usersToolbar.classList.remove('hidden');
+					if (addUserOnlyBar) addUserOnlyBar.classList.add('hidden');
+				}
 				const serverTime = data.serverTime || Date.now();
 				window.lastServerTime = serverTime;
-				const activeUsersCount = users.reduce((sum, u) => sum + (u.online_count || 0), 0);
-				const statActiveUsersEl = document.getElementById('stat-active-users');
-				if (statActiveUsersEl) statActiveUsersEl.innerText = activeUsersCount;
 				const formatGbShort = (gb) => gb < 1 ? (gb * 1024).toFixed(0) + ' MB' : gb.toFixed(2) + ' GB';
 				setStatWithLivePulse('stat-usage-daily', formatGbShort(data.trafficDaily || 0));
 				setStatWithLivePulse('stat-usage-7d', formatGbShort(data.traffic7d || 0));
@@ -7804,7 +8481,7 @@ async function executeRocketCreate() {
 				const warningBtn = document.getElementById('cf-warning-btn');
 				if (cfRequests >= 90000) {
 					if (reqCard) {
-						reqCard.className = "neon-orbit neon-orbit-1 col-span-2 bg-red-50 dark:bg-red-950/20 border border-red-500 rounded-md p-2.5 flex flex-col justify-center gap-1 hover:shadow-md transition duration-300 relative overflow-hidden group min-h-[64px] animate-pulse cursor-pointer";
+						reqCard.className = "neon-orbit neon-orbit-1 bg-red-50 dark:bg-red-950/20 border border-red-500 rounded-md p-2.5 flex flex-col justify-center gap-1 hover:shadow-md transition duration-300 relative overflow-hidden group min-h-[64px] animate-pulse cursor-pointer";
 					}
 					if (warningBtn) {
 						warningBtn.classList.remove('hidden');
@@ -7815,7 +8492,7 @@ async function executeRocketCreate() {
 					}
 				} else {
 					if (reqCard) {
-						reqCard.className = "neon-orbit neon-orbit-1 col-span-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer";
+						reqCard.className = "neon-orbit neon-orbit-1 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px] cursor-pointer";
 					}
 					if (warningBtn) {
 						warningBtn.classList.add('hidden');
@@ -7826,7 +8503,19 @@ async function executeRocketCreate() {
 				setStatWithLivePulse('stat-cf-requests-7d', formatReqShort(data.cfRequests7d || 0));
 				setStatWithLivePulse('stat-cf-requests-30d', formatReqShort(data.cfRequests30d || 0));
 				const progressPercent = Math.min((cfRequests / 100000) * 100, 100);
-				document.getElementById('stat-cf-progress').style.width = progressPercent + '%';
+				const cfRing = document.getElementById('stat-cf-progress');
+				if (cfRing) {
+					const cfCirc = 2 * Math.PI * 16;
+					const progressPercentReach = Math.min(progressPercent + 4, 100);
+					const cfHue = 120 - (progressPercent * 1.2);
+					const cfColor = 'hsl(' + cfHue + ', 80%, 45%)';
+					cfRing.style.stroke = cfColor;
+					cfRing.style.color = cfColor;
+					cfRing.style.setProperty('--cf-offset', cfCirc - (cfCirc * progressPercent / 100));
+					cfRing.style.setProperty('--cf-offset-reach', cfCirc - (cfCirc * progressPercentReach / 100));
+				}
+				document.getElementById('stat-cf-progress-pct').innerText = progressPercent.toFixed(0) + '٪';
+				document.getElementById('stat-cf-progress-used').innerText = formatReqShort(cfRequests);
 				filterAndRenderUsers();
 			} catch (err) {
 				document.getElementById('loading-state').innerHTML = '<span class="text-red-500">خطا در پردازش اطلاعات کاربران</span>';
@@ -7916,7 +8605,8 @@ async function executeRocketCreate() {
 		function renderGlobalLocationBadges() {
 			const container = document.getElementById('global-location-badges');
 			if (!container) return;
-			const list = (window.PINNED_LOCATIONS_CACHE && window.PINNED_LOCATIONS_CACHE.length > 0)
+			// یک لیست خالی (ادمین عمداً همه را برداشته) خالی می‌ماند و به پیش‌فرض برنمی‌گردد.
+			const list = Array.isArray(window.PINNED_LOCATIONS_CACHE)
 				? window.PINNED_LOCATIONS_CACHE
 				: (window.PINNED_LOCATIONS_DEFAULT_FALLBACK || []);
 			if (!list || list.length === 0) {
@@ -7924,9 +8614,30 @@ async function executeRocketCreate() {
 				container.innerHTML = '';
 				return;
 			}
-			const flagsHtmlArray = list.map(function(cc) {
+			// موج مکزیکی: هر پرچم از چپ به راست به‌ترتیب کمی بزرگ می‌شود و برمی‌گردد، بعد نوبت پرچم بعدی.
+			// مدت کل چرخه به تعداد پرچم‌ها بستگی دارد (list.length) تا با هر تعداد پرچمی درست کار کند.
+			const flagStaggerMs = 130;
+			const flagBumpMs = 450;
+			const flagPauseMs = 700;
+			const flagCycleMs = list.length * flagStaggerMs + flagBumpMs + flagPauseMs;
+			const flagPeakPercent = ((flagBumpMs * 0.45) / flagCycleMs) * 100;
+			const flagEndBumpPercent = (flagBumpMs / flagCycleMs) * 100;
+			let flagWaveStyleTag = document.getElementById('flag-wave-style');
+			if (!flagWaveStyleTag) {
+				flagWaveStyleTag = document.createElement('style');
+				flagWaveStyleTag.id = 'flag-wave-style';
+				document.head.appendChild(flagWaveStyleTag);
+			}
+			flagWaveStyleTag.textContent =
+				'@keyframes flagWave { 0% { transform: scale(1); } ' +
+				flagPeakPercent.toFixed(2) + '% { transform: scale(1.4); } ' +
+				flagEndBumpPercent.toFixed(2) + '% { transform: scale(1); } ' +
+				'100% { transform: scale(1); } }';
+			const flagsHtmlArray = list.map(function(cc, idx) {
 				const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
-				return '<span title="' + cc + '" class="text-base leading-none drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)] flex items-center justify-center">' + flag + '</span>';
+				const flagDelay = (idx * flagStaggerMs / 1000).toFixed(2);
+				const flagDuration = (flagCycleMs / 1000).toFixed(2);
+				return '<span title="' + cc + '" class="text-[19.2px] leading-none drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)] flex items-center justify-center" style="animation: flagWave ' + flagDuration + 's ease-in-out infinite; animation-delay: ' + flagDelay + 's; will-change: transform;">' + flag + '</span>';
 			});
 			container.innerHTML = '<div class="flex flex-wrap justify-center gap-1.5" dir="ltr">' + flagsHtmlArray.join('') + '</div>';
 			container.classList.remove('hidden');
@@ -7987,6 +8698,24 @@ async function executeRocketCreate() {
 					const usedGb = user.used_gb || 0;
 					const formattedUsed = usedGb < 1 ? (usedGb * 1024).toFixed(0) + ' MB' : usedGb.toFixed(2) + ' GB';
 					const usedReq = user.used_req || 0;
+					// وضعیت «منقضی‌شدن» کاربر (حجم/ریکوئست تمام‌شده یا تاریخ گذشته) - عیناً همون
+					// منطقی که در filterAndRenderUsers برای فیلتر «expired» استفاده می‌شه، اینجا هم
+					// برای تعیین رنگ آواتار (خاکستری) به‌کار می‌ره.
+					let isUserExpired = false;
+					if (user.limit_gb && usedGb >= user.limit_gb) isUserExpired = true;
+					if (user.limit_req && usedReq >= user.limit_req) isUserExpired = true;
+					if (user.expiry_days) {
+						if (user.start_on_first_connect === 1) {
+							if (user.first_connection_time) {
+								const ucExpiryCheckDate = new Date(user.first_connection_time + (user.expiry_days * 24 * 60 * 60 * 1000));
+								if (new Date(serverTime) > ucExpiryCheckDate) isUserExpired = true;
+							}
+						} else if (user.created_at) {
+							const ucCreatedCheck = new Date(user.created_at);
+							const ucExpiryCheckDate = new Date(ucCreatedCheck.getTime() + (user.expiry_days * 24 * 60 * 60 * 1000));
+							if (new Date(serverTime) > ucExpiryCheckDate) isUserExpired = true;
+						}
+					}
 					// وقتی کاربر هیچ مصرفی نداشته (حجم/ریکوئست صفر)، progress و عدد مصرف
 					// invisible می‌شن (نه حذف کامل - جاشون در گرید حفظ می‌مونه) و به محض
 					// شروع مصرف دوباره نمایش داده می‌شن. (این کارت‌ها در لیست اصلی کاربران
@@ -8001,83 +8730,129 @@ async function executeRocketCreate() {
 					if (user.limit_req) {
 						const reqPercent = Math.min((usedReq / user.limit_req) * 100, 100);
 						const reqHue = 120 - (reqPercent * 1.2);
-						reqHtml = '<div class="flex flex-col gap-1 w-full min-w-[55px] max-w-[80px] mx-auto select-none">' +
-							'<div class="text-[9px] text-gray-800 dark:text-zinc-200 font-bold text-center leading-none' + reqInvisibleClass + '" dir="ltr">' + usedReq.toLocaleString() + ' Req</div>' +
-							'<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + reqInvisibleClass + '">' +
+						reqHtml = '<div class="flex flex-col gap-[5.6px] w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
+							'<div class="flex items-baseline justify-center gap-1' + reqInvisibleClass + '" dir="ltr">' +
+								'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none">' + usedReq.toLocaleString() + '</span>' +
+								'<span class="text-[8.5px] text-gray-400 dark:text-zinc-500 font-semibold leading-none">/' + user.limit_req.toLocaleString() + '</span>' +
+								'<span class="text-[7.5px] text-gray-400 dark:text-zinc-500 font-semibold leading-none opacity-60">Req</span>' +
+							'</div>' +
+							'<div class="w-full h-[8.4px] bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + reqInvisibleClass + '">' +
 								'<div class="h-full rounded-full transition-all duration-500" style="width: ' + reqPercent + '%; background-color: hsl(' + reqHue + ', 80%, 45%)"></div>' +
 							'</div>' +
 						'</div>';
 					} else {
-						reqHtml = '<div class="flex flex-col gap-1 w-full min-w-[55px] max-w-[80px] mx-auto select-none">' +
-							'<div class="text-[9px] text-gray-800 dark:text-zinc-200 font-bold text-center leading-none' + reqInvisibleClass + '" dir="ltr">' + usedReq.toLocaleString() + ' Req</div>' +
-							'<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + reqInvisibleClass + '">' +
-								'<div class="w-full h-full bg-blue-500 rounded-full transition-all duration-500"></div>' +
+						// بدون محدودیت: به‌جای نوار پیشرفتِ ساکن و بی‌معنی (که نه پر می‌شد نه خالی)،
+						// فقط عدد مصرف به‌همراه یک نشانه‌ی کوچیک «∞ بدون محدودیت» نشون داده می‌شه.
+						reqHtml = '<div class="flex flex-col items-center gap-1 w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
+							'<div class="flex items-baseline justify-center gap-1' + reqInvisibleClass + '" dir="ltr">' +
+								'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none">' + usedReq.toLocaleString() + '</span>' +
+								'<span class="text-[10px] text-gray-800 dark:text-zinc-200 font-bold leading-none opacity-60">Req</span>' +
 							'</div>' +
+							'<span class="text-[8.5px] font-bold text-blue-500/80 dark:text-blue-400/80 tracking-wide leading-none' + reqInvisibleClass + '">∞ بدون محدودیت</span>' +
 						'</div>';
 					}
 					let volumeHtml = '';
 					if (user.limit_gb) {
 						const limitPercent = Math.min((usedGb / user.limit_gb) * 100, 100);
 						const limitHue = 120 - (limitPercent * 1.2);
-						const formattedUsedClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) + 'MB' : usedGb.toFixed(2) + 'GB';
-						volumeHtml = '<div class="flex flex-col gap-1 w-full min-w-[55px] max-w-[80px] mx-auto select-none">' +
-							'<div class="text-[9px] text-gray-800 dark:text-zinc-200 font-bold text-center leading-none' + volInvisibleClass + '" dir="ltr">' + formattedUsedClean + '</div>' +
-							'<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + volInvisibleClass + '">' +
+						const usedValueClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) : usedGb.toFixed(2);
+						const usedUnitClean = usedGb < 1 ? 'MB' : 'GB';
+						volumeHtml = '<div class="flex flex-col gap-[5.6px] w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
+							'<div class="flex items-baseline justify-center gap-1' + volInvisibleClass + '" dir="ltr">' +
+								'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none">' + usedValueClean + '</span>' +
+								'<span class="text-[10px] text-gray-800 dark:text-zinc-200 font-bold leading-none opacity-60">' + usedUnitClean + '</span>' +
+								'<span class="text-[8.5px] text-gray-400 dark:text-zinc-500 font-semibold leading-none">/' + user.limit_gb + 'GB</span>' +
+							'</div>' +
+							'<div class="w-full h-[8.4px] bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + volInvisibleClass + '">' +
 								'<div class="h-full rounded-full transition-all duration-500" style="width: ' + limitPercent + '%; background-color: hsl(' + limitHue + ', 80%, 45%)"></div>' +
 							'</div>' +
 						'</div>';
 					} else {
-						const formattedUsedClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) + 'MB' : usedGb.toFixed(2) + 'GB';
-						volumeHtml = '<div class="flex flex-col gap-1 w-full min-w-[55px] max-w-[80px] mx-auto select-none">' +
-							'<div class="text-[9px] text-gray-800 dark:text-zinc-200 font-bold text-center leading-none' + volInvisibleClass + '" dir="ltr">' + formattedUsedClean + '</div>' +
-							'<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden' + volInvisibleClass + '">' +
-								'<div class="w-full h-full bg-blue-500 rounded-full transition-all duration-500"></div>' +
+						const usedValueClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) : usedGb.toFixed(2);
+						const usedUnitClean = usedGb < 1 ? 'MB' : 'GB';
+						// همون منطق «بدون محدودیت» که برای ریکوئست پیاده شد، اینجا هم برای حجم اعمال می‌شه.
+						volumeHtml = '<div class="flex flex-col items-center gap-1 w-full min-w-[77px] max-w-[112px] mx-auto select-none">' +
+							'<div class="flex items-baseline justify-center gap-1' + volInvisibleClass + '" dir="ltr">' +
+								'<span class="text-[12.6px] text-gray-800 dark:text-zinc-200 font-bold leading-none">' + usedValueClean + '</span>' +
+								'<span class="text-[10px] text-gray-800 dark:text-zinc-200 font-bold leading-none opacity-60">' + usedUnitClean + '</span>' +
 							'</div>' +
+							'<span class="text-[8.5px] font-bold text-blue-500/80 dark:text-blue-400/80 tracking-wide leading-none' + volInvisibleClass + '">∞ بدون محدودیت</span>' +
 						'</div>';
 					}
 					const onlineCount = user.online_count || 0;
 					const statusBtnColor = user.is_active === 0 ? 'text-green-700 dark:text-green-500 hover:bg-green-50 dark:hover:bg-green-900/30' : 'text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/30';
 					const statusBtnTitle = user.is_active === 0 ? 'فعال کردن کاربر' : 'قطع کردن کاربر';
 					const statusBtnIcon = user.is_active === 0 
-						? '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>'
-						: '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
+						? '<svg class="w-[16.8px] h-[16.8px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>'
+						: '<svg class="w-[16.8px] h-[16.8px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
 					const isChecked = (window.selectedUsernames && window.selectedUsernames.has(user.username)) ? 'checked' : '';
 					const onlineBadgeColor = onlineCount >= 3 ? 'bg-red-600' : (onlineCount === 2 ? 'bg-yellow-500' : 'bg-green-600');
 					const onlineBadge = user.is_online === 1
-						? '<span class="min-w-[20px] h-5 px-1 relative inline-flex items-center justify-center text-center leading-none text-[15px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
+						? '<span class="min-w-[28px] h-[28px] px-[5.6px] relative inline-flex items-center justify-center text-center leading-none text-[21px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
 						: '';
 					// «هشدار تعداد دستگاه»: user.device_warning از GET /api/users میاد (تا ۲۴ ساعت
-					// بعد از آخرین باری که تعداد دستگاه فعال از ip_limit این کاربر بیشتر شده -
-					// نگاه کنید به persistActiveIp). فقط یک هشدار بصریه، هیچ اتصالی رو قطع نمی‌کنه.
-					const deviceWarningLimitText = (user.ip_limit !== undefined && user.ip_limit !== null) ? user.ip_limit : (user.max_connections || '?');
+					// بعد از آخرین باری که تعداد دستگاه فعال از آستانه‌ی سراسری هشدار
+					// (device_warning_threshold) بیشتر شده - نگاه کنید به persistActiveIp). فقط یک
+					// هشدار بصریه، هیچ اتصالی رو قطع نمی‌کنه.
+					const deviceWarningLimitText = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
+					// «بیشترین تعداد دستگاه»: user.device_warning_peak_count از GET /api/users میاد
+					// (ستون خام، persistActiveIp پرش می‌کنه - نگاه کنید بالاتر). کنار خودِ آیکون
+					// هشدار نشون داده می‌شه، سمت چپش (آیکون اول توی سورس میاد، عدد بعدش - چون
+					// صفحه dir="rtl" هست، فرزند بعدی در فلکس row سمت چپِ فرزند قبلی می‌شینه).
+					const deviceWarningPeakCount = user.device_warning_peak_count || null;
 					const deviceWarningBadge = user.device_warning
-						? '<span title="تعداد دستگاه‌های متصل این کاربر بیش از حد مجازش (' + deviceWarningLimitText + ' دستگاه) بوده است" class="inline-flex items-center justify-center w-4 h-4 text-red-500 animate-pulse shrink-0">' +
-							'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>' +
+						? '<span class="inline-flex items-center gap-[2.8px] shrink-0">' +
+							'<span title="تعداد دستگاه‌های متصل این کاربر بیش از آستانه‌ی هشدار (' + deviceWarningLimitText + ' دستگاه) بوده است' + (deviceWarningPeakCount ? ' - بیشترین تعداد همزمان: ' + deviceWarningPeakCount + ' دستگاه' : '') + '" class="inline-flex items-center justify-center w-[22.4px] h-[22.4px] text-red-500 animate-pulse shrink-0">' +
+								'<svg class="w-[19.6px] h-[19.6px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>' +
+							  '</span>' +
+							(deviceWarningPeakCount ? '<span class="text-[14px] font-bold text-red-500 leading-none">' + deviceWarningPeakCount + '</span>' : '') +
 						  '</span>'
 						: '';
-					return '<div class="group transition-all drop-shadow-sm bg-white/60 dark:bg-zinc-900/40 rounded-md border border-gray-200 dark:border-zinc-800 p-1 flex flex-col items-center gap-1 text-center" data-username="' + user.username + '">' +
-							'<div class="flex items-center justify-center flex-wrap gap-1 w-full">' +
-								'<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="w-3.5 h-3.5 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-green-600 bg-white dark:bg-zinc-900 checked:bg-green-600 checked:border-green-600 focus:ring-green-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95" style="filter: none !important; accent-color: #16a34a !important;">' +
-								'<span class="drag-handle text-gray-400 hover:text-gray-600 dark:hover:text-zinc-200 cursor-grab active:cursor-grabbing font-bold text-[10px] select-none px-0.5" title="جابجایی">☰</span>' +
-								'<span class="font-bold text-gray-900 dark:text-zinc-100 text-[11px] truncate max-w-[70px]">' + user.username + '</span>' +
-								onlineBadge +
-								deviceWarningBadge +
+					const ucAvatarLetter = (user.username || '?').charAt(0).toUpperCase();
+					const ucAvatarColorInfo = ucAvatarStatusColor(user.is_active, isUserExpired, user.is_online === 1, onlineCount);
+					const ucAvatarBg = ucAvatarColorInfo.bg;
+					const ucAvatarAlarmClass = ucAvatarColorInfo.alarm ? ' uc-avatar-alarm' : '';
+					let ucDaysChip = '';
+					if (daysRemaining === 'نامحدود') {
+						ucDaysChip = '<span class="uc-chip uc-chip-infinite" style="background:rgba(37,99,235,0.12)">∞ نامحدود</span>';
+					} else if (isTimerPending) {
+						ucDaysChip = '<span class="uc-chip" style="color:#2563eb;background:rgba(37,99,235,0.12)">⏳ شروع نشده</span>';
+					} else {
+						const ucDaysHue = daysPercent * 1.2;
+						ucDaysChip = '<span class="uc-chip" style="color:hsl(' + ucDaysHue + ',75%,40%);background:hsla(' + ucDaysHue + ',75%,50%,0.15)">' + daysRemaining + ' روز</span>';
+					}
+					const ucOnlineChip = user.is_online === 1
+						? '<span class="uc-chip" style="color:' + (onlineCount >= 3 ? '#dc2626' : onlineCount === 2 ? '#ca8a04' : '#16a34a') + ';background:' + (onlineCount >= 3 ? 'rgba(220,38,38,0.12)' : onlineCount === 2 ? 'rgba(202,138,4,0.14)' : 'rgba(22,163,74,0.12)') + '"><svg class="w-[11px] h-[11px] shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="7" y="2" width="10" height="20" rx="2.4"></rect><path stroke-linecap="round" d="M11 18h2"></path></svg>' + onlineCount + ' دستگاه</span>'
+						: '';
+					const ucStatusStyle = user.is_active === 0 ? 'color:#16a34a;background:rgba(22,163,74,0.12)' : 'color:#d97706;background:rgba(217,119,6,0.12)';
+					return '<div class="uc-card" data-username="' + user.username + '">' +
+							'<div class="uc-top">' +
+								'<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="uc-checkbox" style="filter: none !important; accent-color: #16a34a !important;">' +
+								'<span class="drag-handle uc-drag" title="جابجایی">☰</span>' +
+								'<div class="uc-avatar' + ucAvatarAlarmClass + '" style="background:' + ucAvatarBg + '">' + ucAvatarLetter + (user.is_online === 1 ? '<span class="uc-online-dot ' + onlineBadgeColor + '"></span>' : '') + '</div>' +
+								'<div class="uc-identity">' +
+									'<span class="uc-username" title="' + user.username + '">' + user.username + '</span>' +
+									'<div class="uc-subline">' + ucDaysChip + ucOnlineChip + deviceWarningBadge + '</div>' +
+								'</div>' +
+								'<button type="button" data-user="' + encodeURIComponent(user.username) + '" onclick="toggleCardActions(this)" title="عملیات کاربر" class="uc-more-btn' + actionsColorlessClass + '">' +
+									'<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"></circle><circle cx="12" cy="12" r="2"></circle><circle cx="12" cy="19" r="2"></circle></svg>' +
+								'</button>' +
 							'</div>' +
-							'<div class="flex flex-wrap items-center justify-center gap-1 py-0.5 border-y border-gray-100 dark:border-zinc-800/70 w-full transition-all duration-300' + actionsColorlessClass + '">' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="openStatusLink(this.dataset.user)" title="وضعیت اتصال" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/50 rounded-full transition border border-green-200 dark:border-green-800"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg></button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copySubLink(this.dataset.user)" title="ساب متنی" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-full transition border border-indigo-200 dark:border-indigo-800"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg></button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copyConfig(this.dataset.user)" title="کپی کـانفـیگ" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-blue-50 dark:bg-blue-950/40 border border-blue-300 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/60 text-blue-600 dark:text-blue-400 rounded-full transition shadow-sm"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="showSubQr(this.dataset.user)" title="QR ساب متنی" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded-full transition border border-amber-200 dark:border-amber-800"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 19h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg></button>' +
-								'<span class="w-px h-4 bg-gray-300 dark:bg-zinc-700 mx-0.5 shrink-0 self-center" aria-hidden="true"></span>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="editUser(this.dataset.user)" title="ویرایش" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-green-50 dark:bg-green-950/40 border border-green-300 dark:border-green-800 hover:bg-green-100 dark:hover:bg-green-900/60 text-green-600 dark:text-green-400 rounded-full transition shadow-sm"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg></button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="toggleUserStatus(this.dataset.user)" title="' + statusBtnTitle + '" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-800 hover:bg-amber-100 dark:hover:bg-amber-900/60 ' + statusBtnColor + ' rounded-full transition shadow-sm">' + statusBtnIcon + '</button>' +
-								'<button data-user="' + encodeURIComponent(user.username) + '" onclick="deleteUser(this.dataset.user)" title="حذف" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 hover:bg-red-100 dark:hover:bg-red-900/60 text-red-600 dark:text-red-400 rounded-full transition shadow-sm"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
-								'<div class="!hidden">' +
-									'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copySingboxLink(this.dataset.user)" title="سینگ‌باکس" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50 rounded-full transition border border-purple-200 dark:border-purple-800"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path></svg></button>' +
-									'<button data-user="' + encodeURIComponent(user.username) + '" onclick="showSingboxQr(this.dataset.user)" title="QR سینگ‌باکس" class="w-[19px] h-[19px] p-0 flex items-center justify-center bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50 rounded-full transition border border-purple-200 dark:border-purple-800"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 19h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg></button>' +
+							'<div class="uc-stats">' + volumeHtml + reqHtml + '</div>' +
+							'<div class="uc-actions-overlay">' +
+								'<div class="uc-actions-inner">' +
+									'<div class="uc-actions-header"><button type="button" onclick="toggleCardActions(this)" class="uc-action-close" title="بستن">✕</button></div>' +
+									'<div class="uc-actions-grid">' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="openStatusLink(this.dataset.user)" title="وضعیت اتصال" class="uc-action-btn" style="background:rgba(22,163,74,0.12);color:#16a34a"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg></button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copySubLink(this.dataset.user)" title="ساب متنی" class="uc-action-btn" style="background:rgba(79,70,229,0.12);color:#4f46e5"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg></button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="copyConfig(this.dataset.user)" title="کپی کـانفـیگ" class="uc-action-btn" style="background:rgba(37,99,235,0.12);color:#2563eb"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="showSubQr(this.dataset.user)" title="QR ساب متنی" class="uc-action-btn" style="background:rgba(217,119,6,0.12);color:#d97706"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 19h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg></button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="editUser(this.dataset.user)" title="ویرایش" class="uc-action-btn" style="background:rgba(5,150,105,0.12);color:#059669"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg></button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="toggleUserStatus(this.dataset.user)" title="' + statusBtnTitle + '" class="uc-action-btn" style="' + ucStatusStyle + '">' + statusBtnIcon + '</button>' +
+										'<button data-user="' + encodeURIComponent(user.username) + '" onclick="deleteUser(this.dataset.user)" title="حذف" class="uc-action-btn" style="background:rgba(220,38,38,0.12);color:#dc2626"><svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
+									'</div>' +
 								'</div>' +
 							'</div>' +
-							'<div class="grid grid-cols-2 gap-1 w-full">' + volumeHtml + reqHtml + '</div>' +
 						'</div>';
 				}).join('');
 				updateBulkActionsBar();
@@ -8111,32 +8886,36 @@ async function executeRocketCreate() {
 				});
 			}
 		}
-		async function resetUserData(encodedUsername, actionType) {
-			const username = decodeURIComponent(encodedUsername);
-			let actionName = '';
-			if (actionType === 'volume') actionName = 'حجم';
-			else if (actionType === 'req') actionName = 'ریکوئست';
-			else if (actionType === 'time') actionName = 'زمان';
-			else if (actionType === 'locations') actionName = 'لیست لوکیشن‌ها';
-			if (await customConfirm('آیا از ریست کردن ' + actionName + ' کاربر ' + username + ' مطمئن هستید؟')) {
-				try {
-					const response = await fetch('/api/users/' + encodeURIComponent(username), {
-						method: 'PUT',
-						headers: { 'Content-Type': 'application/json' },
-						body: JSON.stringify({ reset_action: actionType })
-					});
-					if (response.ok) {
-						alert('عملیات با موفقیت انجام شد.');
-						await loadUsers(true);
-					} else {
-						const errData = await response.json();
-						alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
-					}
-				} catch (err) {
-					alert('خطا در برقراری ارتباط با سرور');
-				}
-			}
+		// رنگ آواتار کاربر دیگه رندوم/هش نیست، بلکه بر اساس وضعیت واقعی‌شه:
+		//  - غیرفعال (is_active=0) یا منقضی (حجم/ریکوئست/زمان تمام‌شده): خاکستری - بالاترین اولویت
+		//  - آنلاین نبودن (حالت عادی): آبی
+		//  - آنلاین با ۱ دستگاه: سبز | ۲ دستگاه: زرد | ۳ دستگاه: قرمز | ۴+ دستگاه: قرمزِ چشمک‌زن (آلارم)
+		function ucAvatarStatusColor(isActive, isExpired, isOnline, onlineCount) {
+			if (isActive === 0 || isExpired) return { bg: '#6b7280', alarm: false };
+			if (!isOnline) return { bg: '#3b82f6', alarm: false };
+			const devices = onlineCount || 0;
+			if (devices <= 1) return { bg: '#16a34a', alarm: false };
+			if (devices === 2) return { bg: '#ca8a04', alarm: false };
+			if (devices === 3) return { bg: '#dc2626', alarm: false };
+			return { bg: '#dc2626', alarm: true };
 		}
+		function toggleCardActions(btn) {
+			const card = btn.closest('.uc-card');
+			if (!card) return;
+			const overlay = card.querySelector('.uc-actions-overlay');
+			if (!overlay) return;
+			const willOpen = !overlay.classList.contains('uc-actions-open');
+			document.querySelectorAll('.uc-actions-overlay.uc-actions-open').forEach(function (el) {
+				if (el !== overlay) el.classList.remove('uc-actions-open');
+			});
+			overlay.classList.toggle('uc-actions-open', willOpen);
+		}
+		document.addEventListener('click', function (e) {
+			if (e.target.closest('.uc-more-btn') || e.target.closest('.uc-actions-overlay')) return;
+			document.querySelectorAll('.uc-actions-overlay.uc-actions-open').forEach(function (el) {
+				el.classList.remove('uc-actions-open');
+			});
+		});
 		async function toggleUserStatus(encodedUsername) {
 			const username = decodeURIComponent(encodedUsername);
 			try {
@@ -8388,7 +9167,7 @@ async function executeRocketCreate() {
 			const auto_rotate_ip = document.getElementById('input-auto-rotate-ip-toggle') ? (document.getElementById('input-auto-rotate-ip-toggle').checked ? 1 : 0) : 0;
 			const rotate_time = 0;
 			const ip_operator = document.getElementById('hidden-ip-operator').value || 'all';
-			const ip_count = parseInt(document.getElementById('hidden-ip-count').value) || 20;
+			const ip_count = parseInt(document.getElementById('hidden-ip-count').value) || 999999;
 			const userProxyMode = document.getElementById('user-proxy-mode-toggle') ? document.getElementById('user-proxy-mode-toggle').checked : false;
 			let userSocks5 = null;
 			if (userProxyMode && window.proxyFieldsData && window.proxyFieldsData.length > 0) {
@@ -8422,6 +9201,7 @@ async function executeRocketCreate() {
 						advanced_frag: advanced_frag || null, cipher_suites: cipher_suites || null, tls_mask: tls_mask || null,
 						user_proxy_iata: null,
 						user_socks5: userSocks5 || null,
+						reset_user_to_default: isEditMode && window.resetUserToDefaultPending === true,
 						user_proxy_ip: null,
 						auto_reset_vol_days: auto_reset_vol_days,
 						auto_reset_req_days: auto_reset_req_days,
@@ -8765,9 +9545,10 @@ function downloadZeusSource() {
 			return p[2] + '/' + p[1];
 		}
 
-		function formatChartDateFull(dateStr) {
+
+		function formatChartDateMMDD(dateStr) {
 			const p = dateStr.split('-');
-			return p[2] + '/' + p[1] + '/' + p[0].slice(2);
+			return p[1] + '/' + p[2];
 		}
 
 		function niceChartCeil(v) {
@@ -8791,6 +9572,60 @@ function downloadZeusSource() {
 			return d;
 		}
 
+		// نمودار کوچک زمینه‌ی کارت "Traffic" (روش برگرفته از buildSparklineSvg در
+		// الگو): یک ناحیه‌ی نرم گرادیانی که کل کارت را پر می‌کند، با یک نقطه روی
+		// آخرین روز. از همان رنگ‌های USAGE_CHART_COLORS.traffic و همان داده‌ی
+		// /api/stats-history که مودال جزئیات (openUsageChart) استفاده می‌کند بهره می‌برد.
+		var trafficCardChartPoints = null;
+		var trafficCardGradSeq = 0;
+		function buildTrafficCardChartSvg(points) {
+			if (!points || !points.length) return '';
+			const isDark = document.documentElement.classList.contains('dark');
+			const colors = USAGE_CHART_COLORS.traffic;
+			const lineColor = isDark ? colors.lineDark : colors.line;
+			const w = 300, h = 128, padX = 3, padTop = 14, padBottom = 0;
+			const values = points.map(function (p) { return p.value || 0; });
+			let max = Math.max.apply(null, values), min = Math.min.apply(null, values);
+			if (max === min) max = min + 1;
+			const innerW = w - padX * 2, innerH = h - padTop - padBottom;
+			const stepX = points.length > 1 ? innerW / (points.length - 1) : 0;
+			const coords = points.map(function (p, i) {
+				const x = padX + i * stepX;
+				const y = padTop + innerH - ((p.value - min) / (max - min)) * innerH;
+				return { x: x, y: y };
+			});
+			let line = 'M ' + coords[0].x.toFixed(1) + ',' + coords[0].y.toFixed(1);
+			for (let i = 1; i < coords.length - 1; i++) {
+				const xm = (coords[i].x + coords[i + 1].x) / 2, ym = (coords[i].y + coords[i + 1].y) / 2;
+				line += ' Q ' + coords[i].x.toFixed(1) + ',' + coords[i].y.toFixed(1) + ' ' + xm.toFixed(1) + ',' + ym.toFixed(1);
+			}
+			const lastC = coords[coords.length - 1];
+			line += ' Q ' + lastC.x.toFixed(1) + ',' + lastC.y.toFixed(1) + ' ' + lastC.x.toFixed(1) + ',' + lastC.y.toFixed(1);
+			const area = line + ' L ' + lastC.x.toFixed(1) + ',' + h + ' L ' + coords[0].x.toFixed(1) + ',' + h + ' Z';
+			const gid = 'trafficCardGrad' + (trafficCardGradSeq++);
+			return '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" width="100%" height="100%">' +
+				'<defs><linearGradient id="' + gid + '" x1="0" y1="0" x2="0" y2="1">' +
+					'<stop offset="0%" stop-color="' + lineColor + '" stop-opacity="0.35"/>' +
+					'<stop offset="100%" stop-color="' + lineColor + '" stop-opacity="0"/>' +
+				'</linearGradient></defs>' +
+				'<path d="' + area + '" fill="url(#' + gid + ')" stroke="none"/>' +
+				'<path d="' + line + '" fill="none" stroke="' + lineColor + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>' +
+				'<circle cx="' + lastC.x.toFixed(1) + '" cy="' + lastC.y.toFixed(1) + '" r="3" fill="' + lineColor + '"/>' +
+			'</svg>';
+		}
+		function renderTrafficCardChart() {
+			const el = document.getElementById('traffic-card-chart');
+			if (!el || !trafficCardChartPoints) return;
+			el.innerHTML = buildTrafficCardChartSvg(trafficCardChartPoints);
+		}
+		async function loadTrafficCardChart() {
+			try {
+				const res = await fetch('/api/stats-history?t=' + Date.now());
+				const json = await res.json();
+				trafficCardChartPoints = json.traffic || [];
+				renderTrafficCardChart();
+			} catch (e) { }
+		}
 		async function openUsageChart(type) {
 			const modal = document.getElementById('usage-chart-modal');
 			if (!modal) return;
@@ -8915,8 +9750,7 @@ function downloadZeusSource() {
 				hoverDot.setAttribute('cy', py.toFixed(2));
 				hoverDot.style.opacity = '1';
 				const d = series[idx];
-				const labelUnit = type === 'traffic' ? 'مصرف' : 'ریکوئست';
-				tooltip.innerHTML = '<span class="opacity-60">' + formatChartDateFull(d.date) + '</span> &middot; ' + labelUnit + ': ' + formatChartValue(type, d.value);
+				tooltip.innerHTML = '<span class="opacity-60">' + formatChartDateMMDD(d.date) + '</span> &middot; ' + formatChartValue(type, d.value);
 				tooltip.classList.remove('hidden');
 				const leftPct = (px / geo.W) * 100;
 				const topPct = (py / (geo.H || 220)) * 100;
@@ -8940,8 +9774,6 @@ function downloadZeusSource() {
 		}
 		function closeOnlineCounterWarning() { setModalState('online-counter-warning-modal', false); }
 		function openOnlineCounterWarning() { setModalState('online-counter-warning-modal', true); }
-		function closeConfigCountWarning() { setModalState('config-count-warning-modal', false); }
-		function openConfigCountWarning() { setModalState('config-count-warning-modal', true); }
 		function togglePattNgModal(show) {
 			const modal = document.getElementById('pattng-info-modal');
 			if (!modal) return;
@@ -9257,7 +10089,7 @@ function populateUserFormFields(user) {
 	if (autoRotateIpToggle) autoRotateIpToggle.checked = (user.auto_rotate_ip === 1);
 	document.getElementById('hidden-rotate-time').value = user.rotate_time || '';
 	document.getElementById('hidden-ip-operator').value = user.ip_operator || 'all';
-	document.getElementById('hidden-ip-count').value = user.ip_count || '20';
+	document.getElementById('hidden-ip-count').value = user.ip_count || '999999';
 	document.getElementById('input-block-porn').checked = (user.block_porn === 1);
 	document.getElementById('input-block-ads').checked = (user.block_ads === 1);
 	const fragLenInput = document.getElementById('input-frag-len');
@@ -9304,10 +10136,7 @@ function populateUserFormFields(user) {
 	const customPortInput = document.getElementById('input-custom-ports');
 	if (customPortInput) customPortInput.value = customPorts.join(' ');
 	const userProxyToggle = document.getElementById('user-proxy-mode-toggle');
-	const userSocksInput = document.getElementById('user-socks5-input');
 	const targetProxy = user.user_socks5 || user.user_proxy_ip;
-	const userProxyResult = document.getElementById('test-user-proxy-result');
-	if (userProxyResult) userProxyResult.innerText = '';
 	window.proxyFieldsData = [""];
 	window.activeProxyIndex = 0;
 	if (user.user_socks5) {
@@ -9346,6 +10175,7 @@ function editUser(encodedUsername) {
 	const uuidInputEdit = document.getElementById('input-uuid');
 	if (uuidInputEdit) uuidInputEdit.value = user.uuid || '';
 	populateUserFormFields(user);
+	if (typeof window.syncResetUserUi === 'function') window.syncResetUserUi(true);
 	toggleModal(true);
 }
 		async function deleteUser(encodedUsername) {
@@ -9415,6 +10245,23 @@ window.loadGlobalReqLimitSetting = async function() {
 	if (input) input.value = value;
 	return value;
 };
+window.DEFAULT_USER_LIMIT = 2;
+window.USER_LIMIT = window.DEFAULT_USER_LIMIT;
+window.loadUserLimitSetting = async function() {
+	let value = window.DEFAULT_USER_LIMIT;
+	try {
+		const res = await fetch('/api/settings/bulk');
+		const data = await res.json();
+		if (data && data.user_limit !== undefined && data.user_limit !== null && String(data.user_limit).trim() !== '') {
+			const parsed = parseInt(data.user_limit);
+			if (!isNaN(parsed) && parsed >= 0) value = parsed;
+		}
+	} catch (e) {}
+	window.USER_LIMIT = value;
+	const input = document.getElementById('user-limit-input');
+	if (input) input.value = value;
+	return value;
+};
 window.DEFAULT_DEVICE_WARNING_THRESHOLD = 4;
 window.DEVICE_WARNING_THRESHOLD = window.DEFAULT_DEVICE_WARNING_THRESHOLD;
 window.loadDeviceWarningThresholdSetting = async function() {
@@ -9474,7 +10321,8 @@ window.loadPinnedLocationsSetting = async function() {
 		const data = await res.json();
 		if (data && typeof data.pinned_locations === 'string' && data.pinned_locations.trim() !== '') {
 			const parsed = JSON.parse(data.pinned_locations);
-			if (Array.isArray(parsed) && parsed.length > 0) list = parsed;
+			// لیست خالیِ ذخیره‌شده یعنی ادمین عمداً همه را برداشته؛ به ۱۵ کشور پیش‌فرض برنمی‌گردد.
+			if (Array.isArray(parsed)) list = parsed;
 		}
 	} catch (e) {}
 	window.PINNED_LOCATIONS_CACHE = list;
@@ -9487,10 +10335,15 @@ window.renderPinnedLocationsList = function() {
 	if (countEl) countEl.innerText = window.PINNED_LOCATIONS_CACHE.length + ' کشور';
 	if (!container) return;
 	const lastIdx = window.PINNED_LOCATIONS_CACHE.length - 1;
+	// اگر لیست VIP لود شده باشد، کشور پین‌شده‌ای که فایل VIP ندارد علامت ⚠ می‌گیرد
+	// (برایش پروکسی واقعی وجود ندارد و اسلاتش خالی می‌ماند).
+	const vipCodes = Array.isArray(window.VIP_COUNTRY_CODES) && window.VIP_COUNTRY_CODES.length > 0 ? window.VIP_COUNTRY_CODES : null;
 	container.innerHTML = window.PINNED_LOCATIONS_CACHE.map(function(cc, i) {
 		const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
+		const noVip = vipCodes && vipCodes.indexOf(cc) === -1;
+		const warn = noVip ? ' <span title="این کشور در لیست VIP نیست و پروکسی واقعی ندارد؛ بهتر است حذفش کنید" class="text-amber-500">⚠</span>' : '';
 		return '<div class="flex items-center gap-2 py-1.5 px-2 border-b border-gray-100 dark:border-zinc-800 last:border-0">' +
-			'<span class="flex-1 text-xs font-bold text-gray-800 dark:text-zinc-200">' + flag + ' ' + cc + '</span>' +
+			'<span class="flex-1 text-xs font-bold text-gray-800 dark:text-zinc-200">' + flag + ' ' + cc + warn + '</span>' +
 			'<button type="button" onclick="pinnedLocationMoveUp(' + i + ')" ' + (i === 0 ? 'disabled' : '') + ' class="p-1 rounded text-gray-500 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed">▲</button>' +
 			'<button type="button" onclick="pinnedLocationMoveDown(' + i + ')" ' + (i === lastIdx ? 'disabled' : '') + ' class="p-1 rounded text-gray-500 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed">▼</button>' +
 			'<button type="button" onclick="pinnedLocationRemove(' + i + ')" class="p-1 rounded text-red-500 hover:text-red-700">✕</button>' +
@@ -9520,7 +10373,12 @@ window.pinnedLocationRemove = function(i) {
 };
 window.pinnedLocationAdd = function() {
 	const select = document.getElementById('pinned-location-add-select');
-	if (!select || !select.value) return;
+	if (!select) return;
+	if (!select.value) {
+		// لیست VIP هنوز لود نشده یا لود نشد: با زدن «افزودن» دوباره تلاش می‌کند.
+		if (select.getAttribute('data-vip-state') !== 'ok') window.populatePinnedLocationSelects(true);
+		return;
+	}
 	const cc = select.value;
 	if (window.PINNED_LOCATIONS_CACHE.indexOf(cc) === -1) {
 		window.PINNED_LOCATIONS_CACHE.push(cc);
@@ -9533,12 +10391,18 @@ window.savePinnedLocations = async function() {
 	const btn = document.getElementById('save-pinned-locations-btn');
 	if (btn) { btn.disabled = true; btn.innerText = 'در حال ذخیره...'; }
 	try {
-		await fetch('/api/settings/bulk', {
+		const saveRes = await fetch('/api/settings/bulk', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ settings: { pinned_locations: JSON.stringify(window.PINNED_LOCATIONS_CACHE) } })
 		});
-		showToast('✅ لیست ذخیره شد؛ در حال اعمال روی کاربرها...');
+		let saveData = null;
+		try { saveData = await saveRes.json(); } catch (e) {}
+		if (saveData && saveData.users_updated > 0) {
+			showToast('✅ لیست ذخیره شد؛ کشور(های) حذف‌شده از کانفیگ ' + saveData.users_updated + ' کاربر پاک شد. در حال اعمال روی کاربرها...');
+		} else {
+			showToast('✅ لیست ذخیره شد؛ در حال اعمال روی کاربرها...');
+		}
 		await window.applyPinnedLocationsToAllUsers(btn);
 	} catch (e) {
 		showToast('❌ ذخیره‌سازی لوکیشن‌ها ناموفق بود.');
@@ -9585,20 +10449,64 @@ window.applyPinnedLocationsToAllUsers = async function(btn) {
 		showToast('⚠️ ذخیره شد ولی اعمال خودکار لوکیشن‌ها روی کاربرها با خطا مواجه شد.');
 	}
 };
-window.populatePinnedLocationSelects = function() {
-	const addSelect = document.getElementById('pinned-location-add-select');
-	const bulkSelect = document.getElementById('bulk-remove-location-select');
-	[addSelect, bulkSelect].forEach(function(select) {
-		if (!select) return;
-		select.innerHTML = '';
-		window.ALL_ISO_COUNTRIES_LIST.forEach(function(cc) {
-			const option = document.createElement('option');
-			option.value = cc;
-			const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
-			option.textContent = flag + ' ' + cc;
-			select.appendChild(option);
-		});
+// لیست کشورهای VIP (همان vip-list که initVipCache() هم می‌خواند؛ اینجا فقط کدهای کشور
+// لازم است، نه خود فایل پروکسی‌ها). نتیجه در window.VIP_COUNTRY_CODES می‌ماند و یک
+// درخواست هم‌زمان دوباره ارسال نمی‌شود. شکست، کش نمی‌شود تا دوباره بشود امتحان کرد.
+window.VIP_COUNTRY_CODES = null;
+window.vipCountryCodesPromise = null;
+window.loadVipCountryCodes = function(force) {
+	if (!force && Array.isArray(window.VIP_COUNTRY_CODES) && window.VIP_COUNTRY_CODES.length > 0) {
+		return Promise.resolve(window.VIP_COUNTRY_CODES);
+	}
+	if (!force && window.vipCountryCodesPromise) return window.vipCountryCodesPromise;
+	const task = (async function() {
+		try {
+			const res = await fetchWithFallbackUI('vip-list');
+			if (!res.ok) throw new Error('vip-list HTTP ' + res.status);
+			const files = await res.json();
+			const codes = [];
+			(Array.isArray(files) ? files : []).forEach(function(f) {
+				const name = typeof f === 'string' ? f : (f && f.name);
+				if (!name || typeof name !== 'string' || !name.toLowerCase().endsWith('.txt')) return;
+				const cc = name.slice(0, -4).trim().toUpperCase();
+				if (/^[A-Z]{2}$/.test(cc) && codes.indexOf(cc) === -1) codes.push(cc);
+			});
+			codes.sort();
+			if (codes.length > 0) window.VIP_COUNTRY_CODES = codes;
+			return codes;
+		} catch (e) {
+			return [];
+		}
+	})();
+	window.vipCountryCodesPromise = task;
+	task.then(function(codes) {
+		if (!codes || codes.length === 0) window.vipCountryCodesPromise = null;
 	});
+	return task;
+};
+window.populatePinnedLocationSelects = async function(force) {
+	const select = document.getElementById('pinned-location-add-select');
+	if (!select) return;
+	select.setAttribute('data-vip-state', 'loading');
+	select.innerHTML = '<option value="">در حال بارگذاری لیست VIP...</option>';
+	const codes = await window.loadVipCountryCodes(force === true);
+	select.innerHTML = '';
+	if (!codes || codes.length === 0) {
+		select.setAttribute('data-vip-state', 'failed');
+		select.innerHTML = '<option value="">لیست VIP در دسترس نیست - «افزودن» را بزنید تا دوباره تلاش شود</option>';
+		return;
+	}
+	select.setAttribute('data-vip-state', 'ok');
+	select.innerHTML = '<option value="">یک کشور VIP انتخاب کنید...</option>';
+	codes.forEach(function(cc) {
+		const option = document.createElement('option');
+		option.value = cc;
+		const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
+		option.textContent = flag + ' ' + cc;
+		select.appendChild(option);
+	});
+	// حالا که لیست VIP معلوم شد، ⚠ کشورهای پین‌شده‌ی بدون VIP را هم به‌روز کن.
+	if (typeof window.renderPinnedLocationsList === 'function') window.renderPinnedLocationsList();
 };
 
 function generateInlineProxyJunkClient(len) {
@@ -9632,6 +10540,131 @@ window.loadInlineProxyIpSetting = async function() {
 	const input = document.getElementById('inline-proxy-ip-input');
 	if (input) input.value = value;
 	return value;
+};
+window.DEFAULT_PORT_SETTING_FALLBACK = '2083';
+window.DEFAULT_PORT_SETTING = window.DEFAULT_PORT_SETTING_FALLBACK;
+window.loadDefaultPortSetting = async function() {
+	let value = window.DEFAULT_PORT_SETTING_FALLBACK;
+	try {
+		const res = await fetch('/api/settings/bulk');
+		const data = await res.json();
+		if (data && data.default_port !== undefined && data.default_port !== null && String(data.default_port).trim() !== '') {
+			const parsed = parseInt(data.default_port);
+			if (!isNaN(parsed) && parsed > 0 && parsed <= 65535) value = String(parsed);
+		}
+	} catch (e) {}
+	window.DEFAULT_PORT_SETTING = value;
+	const input = document.getElementById('default-port-input');
+	if (input) input.value = value;
+	// چک‌باکس‌های فرم افزودن کاربر رو با مقدار واقعیِ لود شده دوباره رندر می‌کنیم
+	// (renderPortCheckboxes موقع DOMContentLoaded قبل از رسیدن این fetch صدا زده
+	// می‌شه و تا اون موقع فقط از پیش‌فرضِ fallback استفاده می‌کنه).
+	if (typeof renderPortCheckboxes === 'function') renderPortCheckboxes();
+	return value;
+};
+window.NEW_USER_DEFAULTS_FALLBACK = {
+	new_user_fingerprint: 'ios',
+	new_user_auto_reset_vol_days: '1',
+	new_user_auto_reset_req_days: '1',
+	new_user_auto_rotate_user_proxy: '1',
+	new_user_enable_direct: '0',
+	new_user_block_porn: '0',
+	new_user_block_ads: '0',
+	new_user_frag_len: '',
+	new_user_frag_int: '',
+	new_user_ip_operator: 'all',
+	new_user_ip_count: '999999', // no count cap
+	new_user_auto_rotate_ip: '0',
+	new_user_start_on_first_connect: '0',
+	new_user_connection_type: 'vless'
+};
+window.NEW_USER_DEFAULTS = Object.assign({}, window.NEW_USER_DEFAULTS_FALLBACK);
+window.NEW_USER_INPUT_IDS = {
+	new_user_fingerprint: 'nud-fingerprint',
+	new_user_auto_reset_vol_days: 'nud-auto-reset-vol',
+	new_user_auto_reset_req_days: 'nud-auto-reset-req',
+	new_user_auto_rotate_user_proxy: 'nud-auto-rotate-user-proxy',
+	new_user_enable_direct: 'nud-enable-direct',
+	new_user_block_porn: 'nud-block-porn',
+	new_user_block_ads: 'nud-block-ads',
+	new_user_frag_len: 'nud-frag-len',
+	new_user_frag_int: 'nud-frag-int',
+	new_user_ip_operator: 'nud-ip-operator',
+	new_user_ip_count: 'nud-ip-count',
+	new_user_auto_rotate_ip: 'nud-auto-rotate-ip',
+	new_user_start_on_first_connect: 'nud-start-on-first-connect',
+	new_user_connection_type: 'nud-connection-type'
+};
+window.NEW_USER_EMPTY_OK = { new_user_frag_len: true, new_user_frag_int: true };
+window.fillNewUserDefaultsInputs = function() {
+	Object.keys(window.NEW_USER_INPUT_IDS).forEach(function(k) {
+		const el = document.getElementById(window.NEW_USER_INPUT_IDS[k]);
+		if (!el) return;
+		const v = window.NEW_USER_DEFAULTS[k];
+		el.value = (k === 'new_user_auto_reset_vol_days' || k === 'new_user_auto_reset_req_days') && (parseInt(v) || 0) <= 0 ? '0' : v;
+	});
+};
+window.loadNewUserDefaultsSetting = async function() {
+	let data = null;
+	try {
+		const res = await fetch('/api/settings/bulk');
+		if (res.ok) data = await res.json();
+	} catch (e) {}
+	// A failed fetch keeps what is already known (the built-in fallbacks on the very
+	// first load) instead of resetting it, but the form always ends up matching it -
+	// otherwise the on/off selects would show their first option and a Save would write it.
+	if (data && typeof data === 'object') {
+		const merged = Object.assign({}, window.NEW_USER_DEFAULTS_FALLBACK);
+		Object.keys(merged).forEach(function(k) {
+			if (data[k] !== undefined && data[k] !== null) {
+				const v = String(data[k]).trim();
+				if (v !== '' || window.NEW_USER_EMPTY_OK[k]) merged[k] = v;
+			}
+		});
+		window.NEW_USER_DEFAULTS = merged;
+	}
+	window.fillNewUserDefaultsInputs();
+	return window.NEW_USER_DEFAULTS;
+};
+window.collectNewUserDefaultsFromInputs = function() {
+	const out = {};
+	Object.keys(window.NEW_USER_INPUT_IDS).forEach(function(k) {
+		const el = document.getElementById(window.NEW_USER_INPUT_IDS[k]);
+		let v = el ? String(el.value).trim() : window.NEW_USER_DEFAULTS[k];
+		if (k === 'new_user_auto_reset_vol_days' || k === 'new_user_auto_reset_req_days') {
+			v = String(Math.max(0, parseInt(v) || 0));
+		} else if (k === 'new_user_ip_count') {
+			v = String(Math.max(1, parseInt(v) || parseInt(window.NEW_USER_DEFAULTS_FALLBACK[k])));
+		} else if (v === '' && !window.NEW_USER_EMPTY_OK[k]) {
+			v = window.NEW_USER_DEFAULTS_FALLBACK[k];
+		}
+		out[k] = v;
+	});
+	return out;
+};
+window.getNewUserDefaultsTyped = function() {
+	const d = window.NEW_USER_DEFAULTS;
+	const toInt = function(v, f) { const n = parseInt(v); return isNaN(n) ? f : n; };
+	const ct = String(d.new_user_connection_type || 'vless');
+	let protocols = ct.split(',').map(function(x) { return x.trim(); }).filter(function(x) { return x === 'vless' || x === 'trojan'; });
+	if (protocols.length === 0) protocols = ['vless'];
+	return {
+		fingerprint: d.new_user_fingerprint || 'ios',
+		auto_reset_vol_days: Math.max(0, toInt(d.new_user_auto_reset_vol_days, 0)),
+		auto_reset_req_days: Math.max(0, toInt(d.new_user_auto_reset_req_days, 0)),
+		auto_rotate_user_proxy: d.new_user_auto_rotate_user_proxy === '1',
+		enable_direct: d.new_user_enable_direct === '1',
+		block_porn: d.new_user_block_porn === '1',
+		block_ads: d.new_user_block_ads === '1',
+		frag_len: d.new_user_frag_len || '',
+		frag_int: d.new_user_frag_int || '',
+		ip_operator: d.new_user_ip_operator || 'all',
+		ip_count: Math.max(1, toInt(d.new_user_ip_count, 15)),
+		auto_rotate_ip: d.new_user_auto_rotate_ip === '1',
+		start_on_first_connect: d.new_user_start_on_first_connect === '1',
+		connection_type: protocols.join(','),
+		protocols: protocols
+	};
 };
 window.generateMasterKey = async function() {
 	if (!confirm('یک کلید مادر جدید ساخته می‌شود و کلید قبلی (اگه وجود داشت) بلافاصله از کار می‌افتد. ادامه می‌دی؟')) return;
@@ -9667,19 +10700,26 @@ window.fillPatternihaValues = function() {
 window.saveSettings = async function() {
 	const cleanIpInput = document.getElementById('global-clean-ip-input');
 	const reqLimitInput = document.getElementById('global-req-limit-input');
+	const userLimitInput = document.getElementById('user-limit-input');
 	const deviceWarningThresholdInput = document.getElementById('device-warning-threshold-input');
 	const otherIpsInput = document.getElementById('other-clean-ips-input');
 	const proxyIpInput = document.getElementById('inline-proxy-ip-input');
+	const defaultPortInput = document.getElementById('default-port-input');
 
 	const cleanIpVal = (cleanIpInput && cleanIpInput.value.trim()) ? cleanIpInput.value.trim() : window.DEFAULT_GLOBAL_CLEAN_IP;
 	const reqLimitParsed = reqLimitInput ? parseInt(reqLimitInput.value) : NaN;
 	const reqLimitVal = (!isNaN(reqLimitParsed) && reqLimitParsed >= 0) ? reqLimitParsed : window.DEFAULT_GLOBAL_REQ_LIMIT;
+	const userLimitParsed = userLimitInput ? parseInt(userLimitInput.value) : NaN;
+	const userLimitVal = (!isNaN(userLimitParsed) && userLimitParsed >= 0) ? userLimitParsed : window.DEFAULT_USER_LIMIT;
 	const deviceWarningThresholdParsed = deviceWarningThresholdInput ? parseInt(deviceWarningThresholdInput.value) : NaN;
 	const deviceWarningThresholdVal = (!isNaN(deviceWarningThresholdParsed) && deviceWarningThresholdParsed >= 0) ? deviceWarningThresholdParsed : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
 	const otherIpsRawVal = (otherIpsInput && otherIpsInput.value) ? otherIpsInput.value : '';
 	const otherIpsParsed = otherIpsRawVal.split('\\n').map(function(ip) { return ip.trim(); }).filter(function(ip) { return ip.length > 0; });
 	const otherIpsVal = otherIpsParsed.join('\\n');
 	const proxyIpVal = (proxyIpInput && proxyIpInput.value.trim()) ? proxyIpInput.value.trim() : '';
+	const defaultPortParsed = defaultPortInput ? parseInt(defaultPortInput.value) : NaN;
+	const defaultPortVal = (!isNaN(defaultPortParsed) && defaultPortParsed > 0 && defaultPortParsed <= 65535) ? String(defaultPortParsed) : window.DEFAULT_PORT_SETTING_FALLBACK;
+	const nudSettings = window.collectNewUserDefaultsFromInputs();
 
 	const buttons = [document.getElementById('save-settings-btn'), document.getElementById('save-settings-fab-btn')].filter(Boolean);
 	buttons.forEach(function(b) { b.disabled = true; });
@@ -9689,84 +10729,103 @@ window.saveSettings = async function() {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
-				settings: {
+				settings: Object.assign({
 					global_clean_ip: cleanIpVal,
 					global_req_limit: reqLimitVal,
+					user_limit: userLimitVal,
 					device_warning_threshold: deviceWarningThresholdVal,
 					other_clean_ips: otherIpsVal,
-					inline_proxy_ip: proxyIpVal
-				}
+					inline_proxy_ip: proxyIpVal,
+					default_port: defaultPortVal
+				}, nudSettings)
 			})
 		});
 		window.GLOBAL_CLEAN_IP = cleanIpVal;
 		window.GLOBAL_REQ_LIMIT = reqLimitVal;
+		window.USER_LIMIT = userLimitVal;
 		window.DEVICE_WARNING_THRESHOLD = deviceWarningThresholdVal;
 		window.OTHER_CLEAN_IPS = otherIpsParsed;
 		window.INLINE_PROXY_IP = proxyIpVal;
+		window.DEFAULT_PORT_SETTING = defaultPortVal;
+		window.NEW_USER_DEFAULTS = Object.assign({}, window.NEW_USER_DEFAULTS, nudSettings);
+		window.fillNewUserDefaultsInputs();
 		if (cleanIpInput) cleanIpInput.value = cleanIpVal;
 		if (reqLimitInput) reqLimitInput.value = reqLimitVal;
+		if (userLimitInput) userLimitInput.value = userLimitVal;
 		if (deviceWarningThresholdInput) deviceWarningThresholdInput.value = deviceWarningThresholdVal;
 		if (otherIpsInput) otherIpsInput.value = otherIpsVal;
 		if (proxyIpInput) proxyIpInput.value = proxyIpVal;
-		showToast('✅ تنظیمات با موفقیت ذخیره شد.');
+		if (defaultPortInput) defaultPortInput.value = defaultPortVal;
+		if (typeof renderPortCheckboxes === 'function') renderPortCheckboxes();
+		showToast('✅ تنظیمات ذخیره شد؛ پورت همه‌ی کاربرها روی ' + defaultPortVal + ' و محدودیت کاربر روی ' + userLimitVal + ' ست شد.');
 		toggleSettingsModal(false);
+		if (typeof loadUsers === 'function') await loadUsers(true);
 	} catch (e) {
 		showToast('❌ ذخیره‌سازی تنظیمات ناموفق بود.');
 	} finally {
 		buttons.forEach(function(b) { b.disabled = false; });
 	}
 };
+window.resetUserToDefaultPending = false;
+window.syncResetUserUi = function(showBtn) {
+	window.resetUserToDefaultPending = false;
+	const wrap = document.getElementById('reset-user-default-wrap');
+	const note = document.getElementById('reset-user-default-note');
+	if (wrap) wrap.style.display = showBtn ? 'block' : 'none';
+	if (note) note.style.display = 'none';
+};
+// Edit-user modal only: puts EVERY field of the form back to what a brand-new user gets (same
+// defaults openCreateModal() uses, via applyNewUserFormDefaults) while keeping this user's
+// username + UUID. Nothing is saved until the admin presses "ذخیره تغییرات"; closing the modal
+// discards it. The saved request carries reset_user_to_default, which makes the server also
+// rebuild the proxy list from the pinned locations. Usage counters are never part of the form.
+window.resetUserToDefault = async function() {
+	if (!isEditMode) return;
+	const ok = await customConfirm('همه‌ی تنظیمات این کاربر (محدودیت حجم/زمان/ریکوئست، پورت‌ها، آی‌پی‌ها، فرگمنت، لوکیشن‌ها و پروکسی‌ها و ...) به حالت پیش‌فرض یک کاربر جدید برمی‌گردد. نام کاربری، UUID و آمار مصرف حفظ می‌شود. ادامه می‌دهید؟');
+	if (!ok) return;
+	const form = document.getElementById('create-user-form');
+	const nameEl = document.getElementById('input-name');
+	const uuidEl = document.getElementById('input-uuid');
+	const keepName = nameEl ? nameEl.value : '';
+	const keepUuid = uuidEl ? uuidEl.value : '';
+	if (form) form.reset();
+	if (nameEl) nameEl.value = keepName;
+	if (uuidEl) uuidEl.value = keepUuid;
+	window.applyNewUserFormDefaults();
+	// چیزهایی که در حالت «ایجاد» از بسته‌شدن قبلی مودال (toggleModal(false)) پاک می‌ماند
+	const advSettingsToggle = document.getElementById('input-advanced-settings-toggle');
+	if (advSettingsToggle) advSettingsToggle.checked = false;
+	const advFragInput = document.getElementById('input-advanced-frag');
+	if (advFragInput) advFragInput.value = '';
+	const csInput = document.getElementById('input-cipher-suites');
+	if (csInput) csInput.value = '';
+	const maskInput = document.getElementById('input-tls-mask');
+	if (maskInput) maskInput.value = '';
+	if (typeof window.toggleAdvancedSettingsInputs === 'function') window.toggleAdvancedSettingsInputs(false);
+	const customPortInput = document.getElementById('input-custom-ports');
+	if (customPortInput) customPortInput.value = '';
+	document.querySelectorAll('.frag-preset-card').forEach(card => card.classList.remove('ring-2', 'ring-blue-500', 'border-blue-500', 'bg-blue-50/50', 'dark:bg-blue-950/40'));
+	// کاربر جدید بدون مقدار صریح، ip_limit = «محدودیت کاربر» سراسری (user_limit) می‌گیرد؛ در ویرایش خالی یعنی نامحدود، پس صریح می‌نویسیم
+	const ipLimitInputEl = document.getElementById('input-ip-limit');
+	if (ipLimitInputEl) {
+		ipLimitInputEl.placeholder = 'نامحدود';
+		ipLimitInputEl.value = (window.USER_LIMIT !== undefined && window.USER_LIMIT !== null) ? window.USER_LIMIT : window.DEFAULT_USER_LIMIT;
+	}
+	// سرور همیشه برای لیست تازه‌ساخته‌شده auto-heal را روشن می‌کند (مثل کاربر جدید)
+	const rotateCheck = document.getElementById('input-auto-rotate-user-proxy');
+	if (rotateCheck) rotateCheck.checked = true;
+	window.resetUserToDefaultPending = true;
+	const note = document.getElementById('reset-user-default-note');
+	if (note) note.style.display = 'block';
+};
 window.toggleUserProxyMode = function(isSocksMode) {
 	const socksContainer = document.getElementById('user-socks5-container');
-	const socksInput = document.getElementById('user-socks5-input');
 	if (isSocksMode) {
 		if (socksContainer) socksContainer.classList.remove('opacity-50', 'pointer-events-none');
-		if (socksInput) socksInput.disabled = false;
 	} else {
 		if (socksContainer) socksContainer.classList.add('opacity-50', 'pointer-events-none');
-		if (socksInput) socksInput.disabled = true;
 	}
 };
-async function loadProxyFlags() {
-	const badges = document.querySelectorAll('.async-proxy-flag');
-	if (badges.length === 0) return;
-	let cache = {};
-	try { cache = JSON.parse(localStorage.getItem('proxy_flag_cache_v2') || '{}'); } catch(e) {}
-	for (let badge of badges) {
-		const proxyStr = badge.getAttribute('data-proxy');
-		if (!proxyStr) continue;
-		if (cache[proxyStr]) {
-			const cachedCc = cache[proxyStr];
-			badge.innerHTML = (typeof cachedCc === 'string' && /^[a-zA-Z]{2}$/.test(cachedCc) && typeof getFlagEmoji === 'function') ? getFlagEmoji(cachedCc) : '<span class="zeus-flag-globe">🌐</span>';
-			badge.classList.remove('async-proxy-flag');
-			continue;
-		}
-		badge.classList.remove('async-proxy-flag');
-		const row = badge.closest('[data-username]');
-		const username = row ? row.getAttribute('data-username') : null;
-		try {
-			const controller = new AbortController();
-			const timeoutId = setTimeout(() => controller.abort(), 4000);
-			const res = await fetch('/api/test-proxy', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ proxy: proxyStr, username: username }),
-				signal: controller.signal
-			});
-			clearTimeout(timeoutId);
-			const data = await res.json();
-			let flagSvg = '<span class="zeus-flag-globe">🌐</span>';
-			if (res.ok && data.success && data.country) {
-				flagSvg = typeof getFlagEmoji === 'function' ? getFlagEmoji(data.country) : flagSvg;
-				cache[proxyStr] = data.country.toUpperCase();
-				localStorage.setItem('proxy_flag_cache_v2', JSON.stringify(cache));
-			}
-			badge.innerHTML = flagSvg;
-		} catch (e) {
-			badge.innerHTML = '<span class="zeus-flag-globe">🌐</span>';
-		}
-	}
-}
 async function testUserSocksProxy() {
 	const btn = document.getElementById('test-user-proxy-btn');
 	if (btn) {
@@ -10120,7 +11179,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '2.2.0';
+const CURRENT_VERSION = '3.32.0';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
@@ -10526,11 +11585,15 @@ function applySelectedIps() {
 			renderPortCheckboxes();
 			initVipCache();
 			loadUsers();
+			loadTrafficCardChart();
 			window.loadGlobalCleanIpSetting();
 			window.loadGlobalReqLimitSetting();
+			window.loadUserLimitSetting();
 			window.loadDeviceWarningThresholdSetting();
 			window.loadOtherCleanIpsSetting();
 			window.loadInlineProxyIpSetting();
+			window.loadDefaultPortSetting();
+			window.loadNewUserDefaultsSetting();
 			window.populatePinnedLocationSelects();
 			window.loadPinnedLocationsSetting();
 			window.usersRefreshIntervalId = null;
@@ -10615,7 +11678,6 @@ function applySelectedIps() {
 			window.addEventListener('click', (e) => {
 				if (window._modalMouseDownTarget && window._modalMouseDownTarget !== e.target) return;
 				if (e.target.id === 'user-modal') toggleModal(false);
-				if (e.target.id === 'rocket-modal') toggleRocketModal(false);
 				if (e.target.id === 'ip-selector-modal') toggleIpSelectorModal(false);
 				if (e.target.id === 'ip-scanner-modal') toggleIpScannerModal(false);
 				if (e.target.id === 'settings-modal') toggleSettingsModal(false);
@@ -10625,7 +11687,6 @@ function applySelectedIps() {
 				if (e.target.id === 'usage-warning-modal') closeUsageWarning();
 				if (e.target.id === 'usage-chart-modal') closeUsageChart();
 				if (e.target.id === 'online-counter-warning-modal') closeOnlineCounterWarning();
-				if (e.target.id === 'config-count-warning-modal') closeConfigCountWarning();
 				if (e.target.id === 'pattng-info-modal') togglePattNgModal(false);
 				
 				if (e.target.id === 'proxy-selector-modal') toggleProxySelectorModal(false);
@@ -10672,10 +11733,6 @@ function toggleProxySelectorModal(show) { setModalState('proxy-selector-modal', 
 				const randomProxy = lines[Math.floor(Math.random() * lines.length)];
 				window.proxyFieldsData[window.activeProxyIndex || 0] = randomProxy;
 				if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
-				const userProxyResult = document.getElementById('test-user-proxy-result');
-				if (userProxyResult) {
-					userProxyResult.innerText = '';
-				}
 				toggleProxySelectorModal(false);
 				showToast('✅ پـروکـسـی اختصاصی با موفقیت اعمال شد.');
 				testUserSocksProxy();
@@ -10837,10 +11894,6 @@ async function fetchAndLoadProxy() {
 			if (bestProxy) {
 				window.proxyFieldsData[window.activeProxyIndex || 0] = bestProxy;
 				if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
-				const userProxyResult = document.getElementById("test-user-proxy-result");
-				if (userProxyResult) {
-					userProxyResult.innerText = "";
-				}
 				toggleProxySelectorModal(false);
 				showToast("پـروکـسـی با بهترین امتیاز لود شد.");
 				testUserSocksProxy();
@@ -10984,9 +12037,10 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 		// and creates one panel user per client. Only client.email (-> username)
 		// and client.id (-> uuid) are used; every other field is created with
 		// the exact same defaults openCreateModal() applies for a manual
-		// "add user" (fingerprint ios, port 2083, auto-reset on, pinned
-		// 5-country proxy list via the backend, etc.) so this stays in sync
-		// with whatever those defaults happen to be.
+		// "add user" (fingerprint ios, port = default_port setting (2083
+		// fallback), auto-reset on, pinned 5-country proxy list via the
+		// backend, etc.) so this stays in sync with whatever those defaults
+		// happen to be.
 		async function startImportUsers() {
 			const raw = document.getElementById('import-json-input').value.trim();
 			if (!raw) { alert('⚠️ لطفا کد JSON را پیست کنید!'); return; }
@@ -11040,6 +12094,7 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 				logEl.innerHTML += '<div class="' + color + '">⚠️ ' + w.text + '</div>';
 			});
 			let done = 0, ok = 0, failed = 0;
+			const nudImp = window.getNewUserDefaultsTyped();
 			for (const c of candidates) {
 				progressText.innerText = 'در حال ایجاد (' + (done + 1) + '/' + candidates.length + '): ' + c.username;
 				try {
@@ -11053,31 +12108,31 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 							expiry_days: null,
 							limit_req: null,
 							tls: 'on',
-							port: '2083',
+							port: window.DEFAULT_PORT_SETTING || '2083',
 							ips: window.GLOBAL_CLEAN_IP || window.DEFAULT_GLOBAL_CLEAN_IP || '104.20.25.138',
-							fingerprint: 'ios',
+							fingerprint: nudImp.fingerprint,
 							ip_limit: null,
-							block_porn: 0,
-							block_ads: 0,
-							frag_len: '',
-							frag_int: '',
+							block_porn: nudImp.block_porn ? 1 : 0,
+							block_ads: nudImp.block_ads ? 1 : 0,
+							frag_len: nudImp.frag_len,
+							frag_int: nudImp.frag_int,
 							advanced_frag: null,
 							cipher_suites: null,
 							tls_mask: null,
 							user_proxy_iata: null,
 							user_socks5: null,
 							user_proxy_ip: null,
-							auto_reset_vol_days: 1,
-							auto_reset_req_days: 1,
-							auto_rotate_ip: 0,
+							auto_reset_vol_days: nudImp.auto_reset_vol_days,
+							auto_reset_req_days: nudImp.auto_reset_req_days,
+							auto_rotate_ip: nudImp.auto_rotate_ip ? 1 : 0,
 							rotate_time: 0,
-							ip_operator: 'all',
-							ip_count: 15,
-							auto_rotate_user_proxy: 1,
-							start_on_first_connect: 0,
-							enable_direct: false,
-							connection_type: 'vless',
-							protocols: ['vless']
+							ip_operator: nudImp.ip_operator,
+							ip_count: nudImp.ip_count,
+							auto_rotate_user_proxy: nudImp.auto_rotate_user_proxy ? 1 : 0,
+							start_on_first_connect: nudImp.start_on_first_connect ? 1 : 0,
+							enable_direct: nudImp.enable_direct,
+							connection_type: nudImp.connection_type,
+							protocols: nudImp.protocols
 						})
 					});
 					if (response.ok) {
@@ -11200,6 +12255,16 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 			line-height: 1;
 			vertical-align: -0.05em;
 		}
+		.req-ring-svg { transform: rotate(-90deg); }
+		.req-ring-track { stroke: currentColor; }
+		.req-ring-bar {
+			stroke-linecap: round;
+			animation: reqRingReach 2.2s ease-in-out infinite;
+		}
+		@keyframes reqRingReach {
+			0%, 100% { stroke-dashoffset: var(--req-offset); filter: drop-shadow(0 0 0 transparent); }
+			50% { stroke-dashoffset: var(--req-offset-reach); filter: drop-shadow(0 0 3px currentColor); }
+		}
 	</style>
 </head>
 <body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex flex-col items-center py-12 px-4 overflow-x-hidden">
@@ -11219,8 +12284,8 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 		<div id="status-card" class="mb-6 rounded-md p-4 text-center border font-bold relative z-10 transition duration-300">
 			<span id="status-text" class="text-sm">در حال بارگذاری وضعیت...</span>
 		</div>
-		<div class="grid grid-cols-2 gap-3 mb-8 relative z-10">
-			<div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+		<div class="grid grid-cols-2 gap-3 mb-8 relative z-10" style="direction:ltr;">
+			<div dir="rtl" class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
 				<div class="flex justify-between items-center mb-2">
 					<span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
 						<svg class="w-3.5 h-3.5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
@@ -11236,7 +12301,7 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 					<span id="limit-vol" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
 				</div>
 			</div>
-			<div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+			<div dir="rtl" class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
 				<div class="flex justify-between items-center mb-2">
 					<span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
 						<svg class="w-3.5 h-3.5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
@@ -11252,23 +12317,28 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 					<span id="total-days" class="font-bold text-gray-800 dark:text-zinc-200" dir="rtl">-</span>
 				</div>
 			</div>
-			<div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+			<div dir="rtl" class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
 				<div class="flex justify-between items-center mb-2">
 					<span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
 						<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
 						ریکوئست‌ها
 					</span>
-					<span id="req-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
 				</div>
-				<div id="req-progress-wrap" class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
-					<div id="req-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
-				</div>
-				<div id="req-amounts-row" class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
-					<span id="used-req" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
-					<span id="limit-req" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
+				<div id="req-progress-wrap" class="flex items-center justify-center mb-1">
+					<div class="relative w-[48.4px] h-[48.4px] shrink-0">
+						<svg class="req-ring-svg w-[48.4px] h-[48.4px]" viewBox="0 0 40 40">
+							<circle class="req-ring-track text-gray-200 dark:text-zinc-800" cx="20" cy="20" r="16" fill="none" stroke-width="3.5"></circle>
+							<circle id="req-progress" class="req-ring-bar" cx="20" cy="20" r="16" fill="none" stroke-width="3.5" stroke-dasharray="100.53" style="--req-offset:100.53; --req-offset-reach:100.53; stroke-dashoffset:100.53;"></circle>
+						</svg>
+						<span id="req-pct" class="absolute inset-0 flex items-center justify-center text-[9px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
+					</div>
+					<div id="req-amounts-row" class="hidden flex-col justify-center gap-1 text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
+						<span dir="ltr">مصرف: <span id="used-req" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+						<span dir="ltr">سقف: <span id="limit-req" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+					</div>
 				</div>
 			</div>
-			<div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+			<div dir="rtl" class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
 				<div class="flex justify-between items-center mb-2">
 					<span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
 						<svg class="w-3.5 h-3.5 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
@@ -11853,20 +12923,29 @@ const flagContainer = document.getElementById('display-flag');
 			const usedReq = u.used_req || 0;
 			const limitReq = u.limit_req;
 			document.getElementById('used-req').innerText = usedReq.toLocaleString();
+			const reqCirc = 2 * Math.PI * 16;
+			const reqRing = document.getElementById('req-progress');
 			let isReqExpired = false;
 			if (limitReq) {
 				document.getElementById('limit-req').innerText = limitReq.toLocaleString();
 				const rPct = Math.min((usedReq / limitReq) * 100, 100);
+				// درصد «تلاش برای پر شدن بیشتر» در انیمیشن پالس - چند درصد جلوتر از مقدار واقعی
+				const rPctReach = Math.min(rPct + 4, 100);
 				document.getElementById('req-pct').innerText = rPct.toFixed(0) + '٪';
-				document.getElementById('req-progress').style.width = rPct + '%';
 				const rHue = 120 - (rPct * 1.2);
-				document.getElementById('req-progress').style.backgroundColor = 'hsl(' + rHue + ', 80%, 45%)';
+				const rColor = 'hsl(' + rHue + ', 80%, 45%)';
+				reqRing.style.stroke = rColor;
+				reqRing.style.color = rColor;
+				reqRing.style.setProperty('--req-offset', reqCirc - (reqCirc * rPct / 100));
+				reqRing.style.setProperty('--req-offset-reach', reqCirc - (reqCirc * rPctReach / 100));
 				if (usedReq >= limitReq) isReqExpired = true;
 			} else {
 				document.getElementById('limit-req').innerText = 'نامحدود';
 				document.getElementById('req-pct').innerText = '۰٪';
-				document.getElementById('req-progress').style.width = '100%';
-				document.getElementById('req-progress').style.backgroundColor = '#3b82f6';
+				reqRing.style.stroke = '#3b82f6';
+				reqRing.style.color = '#3b82f6';
+				reqRing.style.setProperty('--req-offset', 0);
+				reqRing.style.setProperty('--req-offset-reach', 0);
 			}
 			const reqHasUsage = usedReq > 0;
 			document.getElementById('req-pct').classList.toggle('invisible', !reqHasUsage);
