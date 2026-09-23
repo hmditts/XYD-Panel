@@ -44,11 +44,30 @@ async function readJsonBody(request) {
 		return {};
 	}
 }
+// «پروکسی‌های دستی» که به‌عنوان بخشی از «مخزن خودمون» (میرور ۴) در نظر گرفته می‌شن؛ موقع sync با
+// پروکسی‌های کش‌شده از مخزن اصلی ترکیب می‌شن. هر کد کشور یک آرایه از خط‌های پروکسی (همون فرمتی که
+// در proxy_vip/*.txt هست). فعلاً خالی است — خودتان پر کنید، یا بعداً به D1 منتقلش کنید.
+const MANUAL_VIP_PROXIES = {
+	// DE: ["1.2.3.4:443#My-DE-1", "5.6.7.8:2053#My-DE-2"],
+	// US: ["9.9.9.9:443#My-US-1"],
+};
+function getManualVipProxies(country) {
+	const list = MANUAL_VIP_PROXIES[String(country).toUpperCase()];
+	return Array.isArray(list) ? list : [];
+}
+// متن فچ‌شده از مخزن اصلی را با MANUAL_VIP_PROXIES همون کشور ترکیب و یکتا می‌کند.
+function mergeVipProxyText(country, fetchedText) {
+	const fetchedLines = (fetchedText || "").split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+	const manualLines = getManualVipProxies(country).map((l) => l.trim()).filter((l) => l.length > 5);
+	return [...new Set([...fetchedLines, ...manualLines])].join("\n");
+}
 async function fetchWithFallback(path, options = {}) {
 	const urls = [
 		`https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev/${path}`,
 		`https://testfnryjnrjrurjejne4r6uju.pages.dev/${path}`,
-		`https://hoplimit.shop/${path}`
+		`https://hoplimit.shop/${path}`,
+		// میرور ۴ - مخزن خودمون (Gist/Repo شخصی). قبل از استفاده لینک raw واقعی خودتون رو اینجا بذارید.
+		`https://raw.githubusercontent.com/hmditts/XYD-Panel/main/${path}`
 	];
 	if (path.includes('zeus.obfuscated.js')) {
 		urls.push(`https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main/zeus.obfuscated.js` + (path.includes('?') ? path.substring(path.indexOf('?')) : ''));
@@ -90,20 +109,34 @@ async function syncAllVipProxies() {
 	const countries = (Array.isArray(files) ? files : [])
 		.filter((f) => f && f.name && f.name.endsWith(".txt"))
 		.map((f) => f.name.replace(".txt", "").toUpperCase());
+	// کشورهایی که فقط در MANUAL_VIP_PROXIES هستن (در مخزن اصلی نیستن) هم اضافه می‌شن تا حذف نشن.
+	const manualOnlyCountries = Object.keys(MANUAL_VIP_PROXIES)
+		.map((c) => c.toUpperCase())
+		.filter((c) => !countries.includes(c));
+	countries.push(...manualOnlyCountries);
 	if (countries.length === 0) throw new Error("هیچ کشوری در مخزن VIP یافت نشد");
 
 	const perCountry = {};
 	let totalProxies = 0;
 	await Promise.all(countries.map(async (cc) => {
+		const key = `proxy_vip/${cc}.txt`;
+		let text = "";
+		let fetchOk = false;
 		try {
-			const res = await fetchWithFallback(`proxy_vip/${cc}.txt`);
-			if (!res.ok) { perCountry[cc] = 0; return; }
-			const text = await res.text();
-			const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
-			REPO_FILE_CACHE.set(`proxy_vip/${cc}.txt`, { data: text, timestamp: now });
-			perCountry[cc] = lines.length;
-			totalProxies += lines.length;
-		} catch (e) { perCountry[cc] = 0; }
+			const res = await fetchWithFallback(key);
+			if (res.ok) { text = await res.text(); fetchOk = true; }
+		} catch (e) { }
+		if (!fetchOk) {
+			// فچ ناموفق بود؛ به‌جای پاک کردن کش قبلی، همون نسخه‌ی قبلی (اگه بود) رو پایه می‌گیریم
+			// و فقط دوباره با MANUAL_VIP_PROXIES ترکیب می‌کنیم (idempotent - تکراری اضافه نمی‌شه).
+			const prev = REPO_FILE_CACHE.get(key);
+			text = prev ? prev.data : "";
+		}
+		const merged = mergeVipProxyText(cc, text);
+		const lines = merged.split("\n").filter((l) => l.length > 5);
+		REPO_FILE_CACHE.set(key, { data: merged, timestamp: now });
+		perCountry[cc] = lines.length;
+		totalProxies += lines.length;
 	}));
 
 	return { countries, perCountry, totalCountries: countries.length, totalProxies, fetchedAt: now };
@@ -7752,7 +7785,8 @@ ${COMMON_TOAST_HTML}
 			const urls = [
 				'https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev/' + path,
 				'https://testfnryjnrjrurjejne4r6uju.pages.dev/' + path,
-				'https://hoplimit.shop/' + path
+				'https://hoplimit.shop/' + path,
+				'https://raw.githubusercontent.com/hmditts/XYD-Panel/main/' + path
 			];
 			if (path.includes('zeus.obfuscated.js')) {
 				urls.push('https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main/zeus.obfuscated.js' + (path.includes('?') ? path.substring(path.indexOf('?')) : ''));
