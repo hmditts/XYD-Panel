@@ -595,14 +595,43 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 			return [`socks5://${line}`, `http://${line}`];
 		});
 		const expectedCC = String(country || "").trim().toUpperCase();
+		// باگ‌فیکس: پایین همون طراحی اولیه‌ست («فقط کشورِ تاییدشده‌ی غلط رد بشه، نه کشورِ
+		// نامعلوم») ولی قبلاً هر خطایی حین رسیدن به ip-api.com (DNS/تایم‌اوت/قطعی شبکه -
+		// که چون مقصد دیگه یک IP خام نیست دقیقاً همین‌ها محتمل‌تر شدن) بدون قید‌وشرط reject
+		// می‌شد؛ یعنی عملاً همون «کشورِ نامعلوم» هم رد می‌شد، برخلاف کامنت بالای فایل. حالا
+		// وقتی گرفتن کشور از ip-api.com ناموفق بمونه (نه رد بشه با mismatch تاییدشده)، قبل
+		// از رد کردن کاندید، زنده‌بودنش با یه probe سبک و بدون DNS (همون تست قبلی رو 1.1.1.1)
+		// re-check می‌شه؛ اگه پروکسی زنده بود قبول می‌شه (کشور نامعلوم می‌مونه)، فقط اگه اون
+		// probe هم شکست بخوره واقعاً reject می‌شه. این فقط توی مسیر شکست یه subrequest اضافه
+		// می‌کنه، نه توی مسیر موفق.
+		const livenessProbe = async (p) => {
+			let liveSock = null;
+			try {
+				const livePayload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+				liveSock = await connectProxy(p, "1.1.1.1", 80, livePayload);
+				const liveRes = await liveSock.readable.getReader().read();
+				try { liveSock.close(); } catch (e) { }
+				return !(liveRes.done || !liveRes.value);
+			} catch (e) {
+				try { liveSock && liveSock.close(); } catch (err) { }
+				return false;
+			}
+		};
 		try {
 			const working = await Promise.any(
 				testBatch.map((p) => {
 					return new Promise(async (resolve, reject) => {
 						let sock = null;
+						let settled = false;
+						const finish = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
+						const failOpenOrReject = async (err) => {
+							if (settled) return;
+							const alive = await livenessProbe(p);
+							finish(alive ? resolve : reject, alive ? p : err);
+						};
 						const timeoutId = setTimeout(() => {
 							try { sock && sock.close(); } catch (e) { }
-							reject(new Error("timeout"));
+							failOpenOrReject(new Error("timeout"));
 						}, 4000);
 						try {
 							const payload = TEXT_ENCODER.encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
@@ -618,22 +647,24 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 							}
 							clearTimeout(timeoutId);
 							try { sock.close(); } catch (e) { }
-							if (!resStr) { reject(new Error("empty")); return; }
+							if (!resStr) { await failOpenOrReject(new Error("empty")); return; }
 							const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
 							const gotCC = (jsonMatch && jsonMatch[1]) ? jsonMatch[1].toUpperCase() : "";
-							if (gotCC && expectedCC && gotCC !== expectedCC) reject(new Error("country-mismatch:" + gotCC));
-							else resolve(p);
+							if (gotCC && expectedCC && gotCC !== expectedCC) finish(reject, new Error("country-mismatch:" + gotCC));
+							else finish(resolve, p);
 						} catch (e) {
 							clearTimeout(timeoutId);
 							try { sock && sock.close(); } catch (err) { }
-							reject(e);
+							// نتونستیم اصلاً به ip-api.com وصل بشیم (DNS/شبکه) - این یعنی «کشور نامعلوم»،
+							// نه «پروکسی مرده»؛ قبل از رد کردن با probe سبک زنده‌بودن رو جدا چک کن.
+							await failOpenOrReject(e);
 						}
 					});
 				})
 			);
 			return { proxy: working, country };
 		} catch (e) {
-			// Nothing answered in time / matched the country - keep the country tag, use an untested line.
+			// Nothing answered in time / matched the country / passed the liveness fallback - keep the country tag, use an untested line.
 			return { proxy: lines[0], country };
 		}
 	} catch (e) {
