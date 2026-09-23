@@ -4,8 +4,17 @@ const GLOBAL_LAST_ACTIVE_WRITE = new Map();
 const GLOBAL_LAST_DB_WRITE = new Map();
 const GLOBAL_WRITE_LOCK = new Map();
 // Serializes read-merge-write cycles on `active_ips` per username within the same isolate
-// (promise-chaining mutex). See persistActiveIp() near getActiveIpCount() for why this exists.
+// (promise-chaining mutex). See persistActiveIp() near getActiveIpCount() for why this exists
+// (shared with confirmActiveIp() - see the «دیده‌شده/تأییدشده» device policy notes there).
 const GLOBAL_ACTIVE_IPS_WRITE_LOCK = new Map();
+// «سیاست ثبت دستگاه متصل» (device seen/confirmed policy - see DEVICE_CONFIRM_* below): best-effort,
+// per-isolate running total of bytes (both directions) moved by short-lived connections of the
+// same (username, clientIP) pair, within a rolling DEVICE_CONFIRM_BURST_WINDOW_MS window. Used to
+// confirm a device that never keeps a single connection open for DEVICE_CONFIRM_MIN_DURATION_MS,
+// but reconnects often with real usage each time (a chat/browser app is the common case). Not
+// shared across isolates and not persisted to D1 - approximate by design, see handlevIees().
+// Pruned opportunistically in flushExpiredTraffic().
+const IP_BURST_BYTES = new Map();
 const DNS_CACHE = new Map();
 const USER_REQ_CACHE = new Map();
 const LOGIN_ATTEMPTS = new Map();
@@ -41,11 +50,9 @@ async function fetchWithFallback(path, options = {}) {
 		`https://testfnryjnrjrurjejne4r6uju.pages.dev/${path}`,
 		`https://hoplimit.shop/${path}`
 	];
-
 	if (path.includes('zeus.obfuscated.js')) {
 		urls.push(`https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main/zeus.obfuscated.js` + (path.includes('?') ? path.substring(path.indexOf('?')) : ''));
 	}
-
 	for (const url of urls) {
 		try {
 			const res = await fetch(url, options);
@@ -54,73 +61,17 @@ async function fetchWithFallback(path, options = {}) {
 	}
 	return new Response(null, { status: 500 });
 }
-
-// --- منبع یکپارچه‌ی فایل‌های مخزن (proxy_vip/<CC>.txt و ...) ---
-// همه‌ی جاهایی که به یک فایل کشور خاص نیاز دارند، به‌جای فراخوانی مستقیم
-// fetchWithFallback از این تابع عبور می‌کنند. نتیجه‌ی هر مسیر، به همراه
-// زمان دریافتش، در همین یک Map نگه داشته می‌شود - یعنی «یک جا».
-// اگر داخل TTL باشیم، از کش برمی‌گردد و هیچ درخواستی به لینک‌ها زده نمی‌شود؛
-// در غیر این صورت دوباره از لینک‌ها (fetchWithFallback) گرفته و کش می‌شود.
-// اگر گرفتن نسخه‌ی تازه شکست بخورد ولی نسخه‌ی قدیمی در کش باشد، همان نسخه‌ی
-// قدیمی برگردانده می‌شود (به‌جای null) تا یک قطعی موقت لینک‌ها باعث از کار
-// افتادن کامل روتیشن/تست پروکسی نشود.
-const REPO_FILE_CACHE = new Map();
-async function getCachedRepoFile(path, ttl = 900000) { // پیش‌فرض: ۱۵ دقیقه
-	const now = Date.now();
-	const cached = REPO_FILE_CACHE.get(path);
-	if (cached && (now - cached.timestamp < ttl)) {
-		return cached.data;
+// Both update endpoints (/api/update-panel, /api/update-panel-github) upload the fetched file to
+// Cloudflare unchanged, as an ES module (main_module: "zeus.js"). The plain decoded source (vX_Y.js)
+// is only a function BODY that ends with a top-level "return" of the worker object - it is not a
+// module (no default export, and a top-level return is illegal in a module), so Cloudflare refuses it.
+// Only the obfuscated stub (import ... + default export) or a real module can be deployed this way.
+// Fail early with a message that says so, instead of a bare Cloudflare syntax error. A valid module
+// can never end in a top-level return, so this can't block a good file; anything else is left to Cloudflare.
+function assertDeployableWorkerModule(code, sourceLabel) {
+	if (/return\s+__WORKER_EXPORT__\s*;?\s*$/.test(String(code).trim())) {
+		throw new Error("فایل «" + sourceLabel + "» نسخه‌ی decode‌شده (خوانا) است، نه فایل قابل‌دیپلوی: با «return __WORKER_EXPORT__» تمام می‌شود و export default ندارد، برای همین کلودفلر آن را رد می‌کند. نسخه‌ی obfuscated (stub دارای export default) را در گیت‌هاب بگذارید.");
 	}
-	try {
-		const res = await fetchWithFallback(path);
-		if (res.ok) {
-			const text = await res.text();
-			REPO_FILE_CACHE.set(path, { data: text, timestamp: now });
-			return text;
-		}
-	} catch (e) { }
-	return cached ? cached.data : null;
-}
-
-// برای دکمه‌ی «دریافت کامل لیست پروکسی‌های VIP» توی Settings: لیست کشورهای
-// مخزن VIP (vip-list) رو تازه می‌گیره و بعد تک‌تک اون‌ها (proxy_vip/<CC>.txt)
-// رو هم تازه می‌گیره - نه از کش قدیمی، چون این یه درخواست صریح برای بروزرسانیه.
-// نتیجه‌ی هر کشور توی همون REPO_FILE_CACHE مشترک می‌شینه (همون «یک جا»یی که
-// getCachedRepoFile هم ازش می‌خونه)، پس بعد از این تابع، تست/رول‌آور پروکسی
-// دیگه تا پایان TTL نیازی به فچ دوباره از لینک‌ها نداره.
-// فقط مسیر proxy_vip/ (اختصاصی/VIP) - نه proxy/ عمومی که صدها خط داره.
-async function syncAllVipProxies() {
-	const now = Date.now();
-	const listRes = await fetchWithFallback("vip-list");
-	if (!listRes.ok) throw new Error("لیست کشورهای VIP در حال حاضر در دسترس نیست");
-	const files = await listRes.json();
-	const countries = (Array.isArray(files) ? files : [])
-		.filter((f) => f && f.name && f.name.endsWith(".txt"))
-		.map((f) => f.name.replace(".txt", "").toUpperCase());
-	if (countries.length === 0) throw new Error("هیچ کشوری در مخزن VIP یافت نشد");
-
-	const perCountry = {};
-	let totalProxies = 0;
-	await Promise.all(
-		countries.map(async (cc) => {
-			try {
-				const res = await fetchWithFallback(`proxy_vip/${cc}.txt`);
-				if (!res.ok) {
-					perCountry[cc] = 0;
-					return;
-				}
-				const text = await res.text();
-				const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
-				REPO_FILE_CACHE.set(`proxy_vip/${cc}.txt`, { data: text, timestamp: now });
-				perCountry[cc] = lines.length;
-				totalProxies += lines.length;
-			} catch (e) {
-				perCountry[cc] = 0;
-			}
-		}),
-	);
-
-	return { countries, perCountry, totalCountries: countries.length, totalProxies, fetchedAt: now };
 }
 let localLastAutoResetCheck = 0;
 async function checkAutoResets(env, ctx) {
@@ -401,13 +352,48 @@ const PINNED_DEFAULT_LOCATIONS_FALLBACK = ["UZ", "KZ", "TR", "LY", "NL", "AL", "
 const DEFAULT_GLOBAL_CLEAN_IP_FALLBACK = "104.20.25.138";
 const DEFAULT_OTHER_CLEAN_IPS_FALLBACK = ["104.26.1.116", "104.21.122.162", "185.162.228.105", "185.148.105.218", "104.18.39.219", "185.162.230.76"];
 const DEFAULT_INLINE_PROXY_IP_FALLBACK = "178.105.227.210";
-// «هشدار تعداد دستگاه» - آستانه‌ی پیش‌فرض سراسری که موقع ساخت کاربر جدید (اگه ادمین
-// دستی چیزی توی فیلد «محدودیت کاربر» وارد نکرده باشه) روی ستون ip_limit همون کاربر
-// ست می‌شه. توجه: این فقط برای هشداردهی در پنل ادمینه (device_warning_at / device_warning
-// - نزدیک persistActiveIp پایین‌تر)، هیچ enforcement/قطع اتصالی روش انجام نمی‌شه
-// (enforcement جدا و از قبل /* Bypassed */ شده). فقط وقتی استفاده می‌شه که تنظیم
-// 'device_warning_threshold' هیچ‌وقت توی settings ذخیره نشده باشه (نصب تازه).
+// «محدودیت کاربر» (user_limit) - سقف تعداد دستگاه هم‌زمان هر کاربر؛ همون فیلد «محدودیت
+// کاربر» توی فرم کاربر (ستون‌های ip_limit/max_connections). سه‌جا استفاده می‌شه: (۱) پیش‌فرض
+// کاربر جدید وقتی فرم/API چیزی توی این فیلد نفرستاده باشه (POST /api/users)، (۲) با «ذخیره‌ی
+// تنظیمات» یا Push پنل مادر روی ستون‌های ip_limit/max_connections همه‌ی کاربرهای *موجود* هم
+// اعمال می‌شه (POST /api/settings/bulk)، (۳) پیش‌فرض placeholder فرم. فقط وقتی مقدار
+// fallback استفاده می‌شه که تنظیم 'user_limit' هیچ‌وقت توی settings ذخیره نشده باشه (نصب تازه).
+const DEFAULT_USER_LIMIT_FALLBACK = 2;
+// «هشدار تعداد دستگاه» (device_warning_threshold) - آستانه‌ی سراسریِ *هشدار*: اگه تعداد
+// دستگاه‌های فعالِ یه کاربر از این عدد بیشتر بشه، device_warning_at ست می‌شه (persistActiveIp
+// پایین‌تر) و روی کارتش هشدار قرمز می‌آد. این عدد دیگه هیچ ربطی به ip_limit/max_connections
+// کاربرها نداره (اون‌ها با «محدودیت کاربر» بالا ست می‌شن) و هیچ اتصالی قطع نمی‌کنه.
+// 0 = هشدار خاموش. فقط وقتی fallback استفاده می‌شه که تنظیمش هیچ‌وقت ذخیره نشده باشه.
 const DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK = 4;
+// «سیاست ثبت دستگاه متصل» (device seen/confirmed policy). قبلاً همون لحظه‌ی اول پیام
+// VLESS/Trojan یه IP فوری «دستگاه» حساب می‌شد - بدون حداقل زمان یا حجم - برای همین یه
+// تست پینگِ چندثانیه‌ای (یا حتی یه هندشیکِ ناتمام) دقیقاً مثل یه دستگاه واقعی می‌شمرد.
+// حالا هر IPِ تازه اول فقط «دیده‌شده»ست (فقط توی حافظه‌ی خودِ همون اتصال - نه D1، نه
+// سقف ip_limit، نه شمارنده‌ی آنلاین) و با هر کدوم از این دو شرط «تأیید» می‌شه (نگاه
+// کنید به confirmActiveIp/checkDeviceConfirmation در handlevIees):
+//  (۱) اتصالِ پایدار: همون یک اتصال حداقل DEVICE_CONFIRM_MIN_DURATION_MS باز بمونه و
+//      حداقل DEVICE_CONFIRM_MIN_BYTES بایت (مجموع آپلود+دانلود، از addBytes) جابه‌جا کنه.
+//  (۲) اتصال‌های کوتاهِ زیاد: مجموع بایتِ همون (کاربر, IP) - نگاه کنید IP_BURST_BYTES -
+//      توی یه پنجره‌ی DEVICE_CONFIRM_BURST_WINDOW_MS به DEVICE_CONFIRM_BURST_BYTES برسه.
+// این عددها تخمینی‌ان (یه TLS handshake + یه پینگ معمولاً حدود ۵ تا ۸ کیلوبایته)، نه
+// اندازه‌گیری‌شده از داده‌ی واقعی - جایی برای تنظیم دقیق‌ترشون در آینده هست. سقفِ
+// «محدودیت کاربر»/ip_limit هم از همین نسخه به بعد فقط توی confirmActiveIp (لحظه‌ی
+// تأیید) اعمال می‌شه، نه موقع اولین هندشیک - یعنی یه تست پینگ همیشه رد می‌شه، ولی
+// استفاده‌ی واقعی‌ای که جا نداره بعد از چند ثانیه/چند KB قطع می‌شه. محدودیت‌های شناخته‌شده
+// (عمداً حل نشده): دستگاهی که همیشه خیلی کم‌حجمه اصلاً «تأیید» نمی‌شه (مصرفش همچنان
+// روی سهمیه‌ی حجم می‌ره)؛ IPِ قدیمیِ یه دستگاهی که شبکه عوض کرده تا ۱۸۰ ثانیه یه جای
+// سقف رو اشغال می‌کنه؛ IP_BURST_BYTES بین isolateها به اشتراک نیست (تقریبیه، نه دقیق).
+const DEVICE_CONFIRM_MIN_DURATION_MS = 10000;
+const DEVICE_CONFIRM_MIN_BYTES = 30 * 1024;
+const DEVICE_CONFIRM_BURST_WINDOW_MS = 5 * 60 * 1000;
+const DEVICE_CONFIRM_BURST_BYTES = 1024 * 1024;
+// «تأخیر هشدار تعداد دستگاه» - device_warning_at دیگه با همون اولین باری که تعداد
+// دستگاه‌های تأییدشده از آستانه (device_warning_threshold) رد می‌شه ست نمی‌شه؛ باید
+// این تعداد بار پشت‌سرهم (هر بار = یک تأیید دستگاه تازه یا یک رفرش هیت‌بیت - نگاه کنید
+// evaluateDeviceWarning) عبور از آستانه دیده بشه. برگشتن به زیر آستانه (حتی یه بار)
+// شمارش رو صفر می‌کنه. یه IP که با یه اتصال کوتاهِ لحظه‌ای از سقف رد بشه و توی همون
+// دور بعدی دیگه نباشه، هیچ‌وقت هشدار نمی‌سازه.
+const DEVICE_WARNING_CONFIRM_STREAK = 2;
 // «پورت» - پورتی که هم به‌عنوان مقدار پیش‌فرض چک‌باکس پورت توی فرم افزودن
 // کاربر جدید انتخاب می‌شه (renderPortCheckboxes سمت کلاینت)، و هم موقع «ذخیره
 // تنظیمات» به‌صورت override کامل روی ستون port همه‌ی کاربرهای *موجود* هم
@@ -445,6 +431,9 @@ const NEW_USER_DEFAULTS_FALLBACK = {
 // خالی/نامعتبر یعنی «از NEW_USER_DEFAULTS_FALLBACK استفاده کن».
 const NEW_USER_DEFAULTS_EMPTY_OK = ["new_user_frag_len", "new_user_frag_int"];
 const NEW_USER_TLS_PORTS = ["443", "2053", "2083", "2087", "2096", "8443"];
+// Same list as the Fingerprint <select> of the panel (fingerprint-select / nud-fingerprint) — the only
+// values POST /api/settings/bulk accepts when it is asked to write a fingerprint onto existing users.
+const NEW_USER_FINGERPRINTS = ["chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized", "unsafe"];
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
 // runs automatically for every user right after the admin saves the pinned
@@ -584,8 +573,9 @@ const PINNED_PROVISION_TEST_LIMIT = 3;
 // country's VIP list itself is missing or empty.
 async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LIMIT) {
 	try {
-		const text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
-		if (!text) return null;
+		const res = await fetchWithFallback(`proxy_vip/${country}.txt`);
+		if (!res.ok) return null;
+		const text = await res.text();
 		const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
 		if (lines.length === 0) return null;
 		for (let i = lines.length - 1; i > 0; i--) {
@@ -945,8 +935,9 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 		
 		for (const src of sources) {
 			try {
-				const text = await getCachedRepoFile(src.url);
-				if (!text) continue;
+				const res = await fetchWithFallback(src.url);
+				if (!res.ok) continue;
+				const text = await res.text();
 				const lines = text
 					.split("\n")
 					.map((l) => l.trim())
@@ -1565,11 +1556,16 @@ const Router = {
 				});
 				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
 				const newCode = await githubRes.text();
+				assertDeployableWorkerModule(newCode, "zeus.obfuscated.js");
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
 				});
-				if (!bindingsRes.ok) throw new Error("عدم دسترسی به تنظیمات ورکر. کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")");
+				if (!bindingsRes.ok) {
+					const bindingsErr = await bindingsRes.json().catch(() => ({}));
+					const bindingsErrMsg = bindingsErr && bindingsErr.errors && bindingsErr.errors[0] ? bindingsErr.errors[0].message : "";
+					throw new Error("عدم دسترسی به تنظیمات ورکر «" + scriptName + "». کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")" + (bindingsErrMsg ? ": " + bindingsErrMsg : ""));
+				}
 				const bindingsData = await bindingsRes.json().catch(() => ({}));
 				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
 				const newBindings = [];
@@ -1647,11 +1643,16 @@ const Router = {
 				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
 				const newCode = await githubRes.text();
 				if (!newCode || newCode.trim().length < 100) throw new Error("فایل دریافتی از گیت‌هاب خالی یا نامعتبر است.");
+				assertDeployableWorkerModule(newCode, "worker.js");
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
 				});
-				if (!bindingsRes.ok) throw new Error("عدم دسترسی به تنظیمات ورکر. کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")");
+				if (!bindingsRes.ok) {
+					const bindingsErr = await bindingsRes.json().catch(() => ({}));
+					const bindingsErrMsg = bindingsErr && bindingsErr.errors && bindingsErr.errors[0] ? bindingsErr.errors[0].message : "";
+					throw new Error("عدم دسترسی به تنظیمات ورکر «" + scriptName + "». کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")" + (bindingsErrMsg ? ": " + bindingsErrMsg : ""));
+				}
 				const bindingsData = await bindingsRes.json().catch(() => ({}));
 				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
 				const newBindings = [];
@@ -1757,24 +1758,46 @@ const Router = {
 				const body = await readJsonBody(request);
 				let unpinRemoval = { countries: [], usersUpdated: 0 };
 				let fragApplied = false;
+				let userLimitApplied = false;
+				let fingerprintApplied = false;
+				let connTypeApplied = false;
+				let cleanIpApplied = false;
+				let portApplied = false;
 				if (body.settings && typeof body.settings === "object") {
-					// «هشدار تعداد دستگاه» (device_warning_threshold): برخلاف بقیه‌ی تنظیمات
-					// global، این یکی روی ستون ip_limit/max_connections همه‌ی کاربرهای *موجود*
-					// هم override می‌شه (نه فقط پیش‌فرض کاربر تازه‌ساز - نگاه کنید به POST
-					// /api/users).
-					let overrideDeviceWarningThreshold = undefined;
-					if (Object.prototype.hasOwnProperty.call(body.settings, "device_warning_threshold")) {
-						const parsedThreshold = parseInt(body.settings.device_warning_threshold);
-						if (!isNaN(parsedThreshold) && parsedThreshold >= 0) overrideDeviceWarningThreshold = parsedThreshold;
+					// «محدودیت کاربر» (user_limit): برخلاف بقیه‌ی تنظیمات global، این یکی روی ستون
+					// ip_limit/max_connections همه‌ی کاربرهای *موجود* هم override می‌شه (نه فقط پیش‌فرض
+					// کاربر تازه‌ساز - نگاه کنید به POST /api/users). هم «ذخیره‌ی تنظیمات» همین پنل و
+					// هم «Push to Panels» پنل مادر از همین مسیر می‌رن. (تنظیم «هشدار تعداد دستگاه» -
+					// device_warning_threshold - فقط ذخیره می‌شه و آستانه‌ی هشدار رو تعیین می‌کنه؛
+					// دیگه روی ip_limit/max_connections کاربرها اثری نداره.)
+					let overrideUserLimit = undefined;
+					if (Object.prototype.hasOwnProperty.call(body.settings, "user_limit")) {
+						const parsedUserLimit = parseInt(body.settings.user_limit);
+						if (!isNaN(parsedUserLimit) && parsedUserLimit >= 0) overrideUserLimit = parsedUserLimit;
 					}
 					// «پورت»: مثل بالا، این یکی هم - برخلاف بقیه‌ی تنظیمات global - روی ستون
 					// port همه‌ی کاربرهای *موجود* بازنویسی کامل می‌شه (نه فقط پیش‌فرض کاربر
 					// تازه‌ساز؛ نگاه کنید به getDefaultPortSetting() برای اون بخش). پورت(های)
-					// قبلی هر کاربر پاک و با همین یکی جایگزین می‌شه.
+					// قبلی هر کاربر پاک و با همین یکی جایگزین می‌شه. مثل user_limit/global_clean_ip
+					// بالا و پایین، موفقیتش با port_applied: true توی جواب گزارش می‌شه تا پنل
+					// مادر هم بتونه پنل‌های آپدیت‌نشده رو (که این کلید رو نادیده می‌گیرن) تشخیص بده.
 					let overrideDefaultPort = undefined;
 					if (Object.prototype.hasOwnProperty.call(body.settings, "default_port")) {
 						const parsedPort = parseInt(body.settings.default_port);
 						if (!isNaN(parsedPort) && parsedPort > 0 && parsedPort <= 65535) overrideDefaultPort = String(parsedPort);
+					}
+					// «آی‌پی تمیز سراسری» (global_clean_ip): مثل «پورت» و «محدودیت کاربر» بالا -
+					// برخلاف بقیه‌ی تنظیمات global - این یکی هم روی ستون ips همه‌ی کاربرهای
+					// *موجود* بازنویسی کامل می‌شود (نه فقط پیش‌فرض کاربر تازه‌ساز؛ نگاه کنید به
+					// POST /api/users که nud.global_clean_ip را فقط وقتی می‌خواند که خودِ کاربر
+					// در لحظه‌ی ساخت مقدار ips جدا نداشته باشد). قبل از این تغییر این کلید فقط
+					// در جدول settings ذخیره می‌شد و هیچ‌وقت به کارت‌های موجود نمی‌رسید — همین
+					// نبود override باعث می‌شد تغییر «Global Clean IP» در پنل مادر روی کارت
+					// کاربرهایی که از قبل ساخته شده بودند اثر نکند.
+					let overrideGlobalCleanIp = undefined;
+					if (Object.prototype.hasOwnProperty.call(body.settings, "global_clean_ip")) {
+						const cleanIpVal = String(body.settings.global_clean_ip == null ? "" : body.settings.global_clean_ip).trim();
+						if (cleanIpVal) overrideGlobalCleanIp = cleanIpVal;
 					}
 					// «فرگمنت» (new_user_frag_len / new_user_frag_int): کلیدهای new_user_* فقط
 					// پیش‌فرضِ کاربر *تازه‌ساز*ند. لینک‌ها از ستون‌های frag_len/frag_int خودِ هر
@@ -1795,6 +1818,29 @@ const Router = {
 							len: String(body.settings.new_user_frag_len == null ? "" : body.settings.new_user_frag_len).trim(),
 							int: String(body.settings.new_user_frag_int == null ? "" : body.settings.new_user_frag_int).trim(),
 						};
+					}
+					// «فینگرپرینت» (new_user_fingerprint) و «پروتکل» (new_user_connection_type): مثل فرگمنت،
+					// این دو کلید هم فقط پیش‌فرضِ کاربر *تازه‌ساز*ند؛ لینک‌ها از ستون‌های fingerprint/
+					// connection_type خودِ هر کاربر ساخته می‌شوند (SubscriptionService.generateText و
+					// چک پروتکل هنگام اتصال)، نه از settings؛ پس ذخیره‌ی کلید به‌تنهایی روی کانفیگ
+					// کاربرهای موجود اثری نداشت. فقط وقتی فراخواننده (Push پنل مادر) صریحاً
+					// apply_fingerprint_to_existing_users / apply_connection_type_to_existing_users: true
+					// بفرستد (فلگ بیرون از body.settings، مثل apply_frag_to_existing_users)، مقدار روی
+					// ستون همه‌ی کاربرهای *موجود* هم نوشته می‌شود. «ذخیره‌ی تنظیمات» خودِ همین پنل این
+					// فلگ‌ها را نمی‌فرستد، پس فقط برای کاربر بعدی اثر دارد. مقدار نامعتبر = نادیده گرفته
+					// می‌شود (و چون *_applied برنمی‌گردد، مادر آن را به‌عنوان خطا گزارش می‌کند).
+					let overrideFingerprint = undefined;
+					if (body.apply_fingerprint_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_fingerprint")) {
+						const fpVal = String(body.settings.new_user_fingerprint == null ? "" : body.settings.new_user_fingerprint).trim();
+						if (NEW_USER_FINGERPRINTS.includes(fpVal)) overrideFingerprint = fpVal;
+					}
+					let overrideConnType = undefined;
+					if (body.apply_connection_type_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_connection_type")) {
+						const ctParts = String(body.settings.new_user_connection_type == null ? "" : body.settings.new_user_connection_type)
+							.split(",")
+							.map((x) => x.trim().toLowerCase());
+						const ctFinal = ["vless", "trojan"].filter((x) => ctParts.includes(x));
+						if (ctFinal.length > 0) overrideConnType = ctFinal.join(",");
 					}
 					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
 					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
@@ -1826,29 +1872,39 @@ const Router = {
 							}
 						}
 					}
-					if (overrideDeviceWarningThreshold !== undefined) {
-						await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ?").bind(overrideDeviceWarningThreshold, overrideDeviceWarningThreshold).run();
+					if (overrideUserLimit !== undefined) {
+						await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ?").bind(overrideUserLimit, overrideUserLimit).run();
+						userLimitApplied = true;
 					}
 					if (overrideDefaultPort !== undefined) {
 						await env.DB.prepare("UPDATE users SET port = ?").bind(overrideDefaultPort).run();
+						portApplied = true;
+					}
+					if (overrideGlobalCleanIp !== undefined) {
+						await env.DB.prepare("UPDATE users SET ips = ?").bind(overrideGlobalCleanIp).run();
+						cleanIpApplied = true;
 					}
 					if (overrideFrag !== undefined) {
 						await env.DB.prepare("UPDATE users SET frag_len = ?, frag_int = ?").bind(overrideFrag.len, overrideFrag.int).run();
 						fragApplied = true;
 					}
+					if (overrideFingerprint !== undefined) {
+						await env.DB.prepare("UPDATE users SET fingerprint = ?").bind(overrideFingerprint).run();
+						fingerprintApplied = true;
+					}
+					if (overrideConnType !== undefined) {
+						await env.DB.prepare("UPDATE users SET connection_type = ?").bind(overrideConnType).run();
+						connTypeApplied = true;
+						// connection_type is also checked on every incoming connection (VLESS/Trojan), and that
+						// lookup is cached for a few seconds — drop the cached entries so the new protocol
+						// takes effect immediately instead of after the TTL.
+						try {
+							const { results: ctUsers } = await env.DB.prepare("SELECT uuid, trojan_hash FROM users").all();
+							await Promise.all((ctUsers || []).map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
+						} catch (e) { /* best-effort: the cache expires by itself within seconds */ }
+					}
 				}
-				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied }), { headers: { "Content-Type": "application/json" } });
-			}
-		}
-		// دکمه‌ی «دریافت کامل لیست پروکسی‌های VIP» توی Settings. فقط مخزن VIP
-		// (proxy_vip/*.txt) رو به‌تفکیک هر کشور تازه می‌گیره و کش می‌کنه؛ به لیست
-		// عمومی proxy/ کاری نداره.
-		if (url.pathname === "/api/settings/sync-vip-proxies" && request.method === "POST") {
-			try {
-				const result = await syncAllVipProxies();
-				return new Response(JSON.stringify({ success: true, ...result }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-			} catch (e) {
-				return new Response(JSON.stringify({ error: e.message || "خطا در دریافت مخزن VIP" }), { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/proxy-ip") {
@@ -2392,14 +2448,12 @@ const Router = {
 							finalConnType = connection_type;
 						}
 						const trojanHash = sha224Pure(finalUuid);
-						// «هشدار تعداد دستگاه»: اگه ادمین دستی چیزی توی فیلد «محدودیت کاربر» وارد
-						// نکرده باشه (ip_limit خالی/نال)، به‌جای نال، آستانه‌ی سراسری تنظیم‌شده
-						// (device_warning_threshold - پیش‌فرض ۴) روی ip_limit این کاربر جدید ست
-						// می‌شه. این فقط مبنای هشدار پنل ادمینه (persistActiveIp/device_warning_at
-						// پایین‌تر)، enforcement/قطع اتصال جدا و از قبل Bypass شده و دست‌نخورده
-						// می‌مونه. اگه ادمین عدد دیگه‌ای (حتی ۰) وارد کرده باشه، همون عدد ادمین
-						// برنده‌ست، نه پیش‌فرض سراسری.
-						const finalIpLimit = ip_limit !== undefined && ip_limit !== null && String(ip_limit).trim() !== "" ? parseInt(ip_limit) : await getDeviceWarningThresholdSetting(env);
+						// «محدودیت کاربر»: اگه ادمین/فرم/API چیزی توی این فیلد نفرستاده باشه (ip_limit
+						// خالی/نال)، به‌جای نال، عدد سراسریِ تنظیم‌شده (user_limit - پیش‌فرض ۲) روی
+						// ip_limit و max_connections این کاربر جدید ست می‌شه. اگه عدد دیگه‌ای (حتی ۰)
+						// فرستاده شده باشه، همون عدد برنده‌ست، نه پیش‌فرض سراسری. (تنظیم جدای «هشدار
+						// تعداد دستگاه» - device_warning_threshold - دیگه اینجا هیچ نقشی نداره.)
+						const finalIpLimit = ip_limit !== undefined && ip_limit !== null && String(ip_limit).trim() !== "" ? parseInt(ip_limit) : await getUserLimitSetting(env);
 						// «پورت»: اگه ادمین/فرم چیزی برای port نفرستاده باشه (خالی/نال)، به‌جای
 						// نال، پورت پیش‌فرض سراسری تنظیم‌شده (default_port - پیش‌فرض ۲۰۸۳) روی
 						// این کاربر تازه ست می‌شه. اگه مقداری فرستاده شده باشه (مثلاً از چک‌باکس‌های
@@ -2549,6 +2603,7 @@ const DbService = {
 					{ name: "proxy_rotate_cooldowns", def: "TEXT DEFAULT '{}'" },
 					{ name: "device_warning_at", def: "INTEGER DEFAULT NULL" },
 					{ name: "device_warning_peak_count", def: "INTEGER DEFAULT NULL" },
+					{ name: "device_warning_streak", def: "INTEGER DEFAULT 0" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
@@ -2635,18 +2690,41 @@ const DbService = {
 // instead of every connection/heartbeat. A per-username promise-chain lock serializes this
 // within the same isolate so two near-simultaneous writes for the same user can't still race
 // each other on the read step.
+//
+// «تأخیر هشدار تعداد دستگاه» (device_warning_at delay/streak - نگاه کنید DEVICE_WARNING_CONFIRM_STREAK
+// بالای فایل): به‌جای ثبتِ فوریِ هشدار همون اولین باری که activeDeviceCount از آستانه رد
+// می‌شه، device_warning_at فقط وقتی واقعاً ست می‌شه که این تعداد بار پشت‌سرهم عبور از
+// آستانه دیده شده باشه. persistActiveIp (رفرش IP از قبل تأییدشده) و confirmActiveIp (تأیید
+// IP تازه) هر دو از همین یه تابع استفاده می‌کنن تا این حساب یه‌جا بمونه و دوبار نوشته نشه.
+function evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now) {
+	const overThreshold = !!(warnThreshold && warnThreshold > 0 && activeDeviceCount > warnThreshold);
+	// برگشتن به زیر آستانه (حتی یه بار) شمارش رو صفر می‌کنه - یعنی نوسانِ کوتاه دور
+	// آستانه هیچ‌وقت به تنهایی هشدار نمی‌سازه، باید واقعاً پشت‌سرهم بمونه.
+	const newStreak = overThreshold ? (prevStreak || 0) + 1 : 0;
+	const shouldWarn = newStreak >= DEVICE_WARNING_CONFIRM_STREAK;
+	// «بیشترین تعداد دستگاه» (device_warning_peak_count): همون منطق قبلی، دست‌نخورده -
+	// فقط وقتی چرخه‌ی هشدارِ قبلی هنوز منقضی نشده (کمتر از ۲۴ ساعت) بیشینه نگه داشته
+	// می‌شه؛ وگرنه یه چرخه‌ی تازه از همین عدد فعلی شروع می‌شه.
+	const warningStillFresh = !!(prevWarningAt && now - prevWarningAt < 24 * 60 * 60 * 1000);
+	const newPeakCount = warningStillFresh ? Math.max(prevPeakCount || 0, activeDeviceCount) : activeDeviceCount;
+	return { shouldWarn, newStreak, newPeakCount };
+}
 async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 	const run = async () => {
 		let freshIps = {};
-		let ipLimit = null;
+		let warnThreshold = DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
 		let prevWarningAt = null;
 		let prevPeakCount = null;
+		let prevStreak = 0;
 		try {
-			const row = await env.DB.prepare("SELECT active_ips, ip_limit, device_warning_at, device_warning_peak_count FROM users WHERE uuid = ?").bind(uuid).first();
+			// آستانه‌ی سراسری «هشدار تعداد دستگاه» (settings.device_warning_threshold) با همون کوئری
+			// ردیف کاربر و به‌صورت subselect خونده می‌شه - بدون رفت‌وبرگشت اضافه‌ی D1.
+			const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, device_warning_streak, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
 			freshIps = JSON.parse((row && row.active_ips) || "{}");
-			ipLimit = row ? row.ip_limit : null;
+			warnThreshold = parseDeviceWarningThreshold(row ? row.dw_threshold : null);
 			prevWarningAt = row ? row.device_warning_at : null;
 			prevPeakCount = row ? row.device_warning_peak_count : null;
+			prevStreak = (row && row.device_warning_streak) || 0;
 		} catch (e) { }
 		for (const [ip, data] of Object.entries(freshIps)) {
 			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
@@ -2662,26 +2740,17 @@ async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 		} else {
 			freshIps[clientIP] = { timestamp: now, count: 1 };
 		}
-		// «هشدار تعداد دستگاه» (admin-facing only - NOT enforcement, enforcement stays
-		// /* Bypassed */ elsewhere): همین‌جا، دقیقاً روی همون snapshot تازه‌ای که بالا
-		// merge شد (نه یک کپی جدا)، اگه تعداد دستگاه‌های فعال از ip_limit این کاربر
-		// بیشتر شده باشه، device_warning_at با زمان الان ست می‌شه. پنل/API با
-		// `(now - device_warning_at) < 24h` این رو به‌صورت یک هشدار روی کارت کاربر
-		// نشون می‌ده (نگاه کنید به GET /api/users و رندر کارت کاربر در پنل).
+		// «هشدار تعداد دستگاه» (admin-facing only - NOT enforcement, enforcement moved to
+		// confirmActiveIp() - نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): همین‌جا، دقیقاً
+		// روی همون snapshot تازه‌ای که بالا merge شد (نه یک کپی جدا)، evaluateDeviceWarning
+		// تصمیم می‌گیره که آیا device_warning_at واقعاً ست بشه یا فقط شمارش (streak) جلو بره.
 		const activeDeviceCount = Object.keys(freshIps).length;
-		const exceededLimit = ipLimit && ipLimit > 0 && activeDeviceCount > ipLimit;
-		// «بیشترین تعداد دستگاه» (device_warning_peak_count): اگه هشدار قبلی هنوز منقضی
-		// نشده (کمتر از ۲۴ ساعت از device_warning_at قبلی گذشته)، بیشینه‌ی activeDeviceCount
-		// نگه داشته می‌شه (همون چرخه‌ی هشدار ادامه داره). اگه هشدار قبلی منقضی شده بود یا
-		// اصلاً نبود، یه چرخه‌ی تازه شروع می‌شه و peak از همین عدد فعلی شروع می‌شه - دقیقاً
-		// هم‌زمان با device_warning_at (که پنل با همون ۲۴ ساعت محو می‌کنه)، بدون کوئری اضافه.
-		const warningStillFresh = !!(prevWarningAt && now - prevWarningAt < 24 * 60 * 60 * 1000);
-		const newPeakCount = warningStillFresh ? Math.max(prevPeakCount || 0, activeDeviceCount) : activeDeviceCount;
+		const { shouldWarn, newStreak, newPeakCount } = evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now);
 		try {
-			if (exceededLimit) {
-				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, uuid).run();
+			if (shouldWarn) {
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, newStreak, uuid).run();
 			} else {
-				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, uuid).run();
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, newStreak, uuid).run();
 			}
 		} catch (e) { }
 	};
@@ -2690,6 +2759,90 @@ async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
 	GLOBAL_ACTIVE_IPS_WRITE_LOCK.set(username, chained);
 	if (ctx) ctx.waitUntil(chained);
 	else await chained;
+}
+// «تأیید دستگاه» (confirmActiveIp) - طبق سیاستِ «دیده‌شده/تأییدشده» (نگاه کنید توضیح
+// DEVICE_CONFIRM_* بالای فایل)، این تنها جاییه که یک IPِ *تازه* واقعاً «تأییدشده» می‌شه:
+// توی active_ips نوشته می‌شه، جزو تعداد دستگاه‌ها حساب می‌شه، و به سقف «محدودیت
+// کاربر»/ip_limit می‌خوره - این سقف هم از همین نسخه به بعد فقط همین‌جا (لحظه‌ی تأیید)
+// چک می‌شه، نه موقع هندشیک اولیه‌ی اتصال. فقط از checkDeviceConfirmation() توی
+// handlevIees صدا زده می‌شه، وقتی شرطِ «اتصال پایدار» یا «اتصال‌های کوتاهِ زیاد» رد شده
+// باشه. با persistActiveIp() روی همون قفلِ per-username (GLOBAL_ACTIVE_IPS_WRITE_LOCK)
+// مشترکه تا این دوتا هیچ‌وقت رو نوشتنِ همدیگه روی ستون active_ips مسابقه ندن. خروجی:
+// true = تأیید شد/جا بود، false = سقف پر بود (تماس‌گیرنده باید همین اتصال رو ببنده).
+async function confirmActiveIp(env, ctx, uuid, username, clientIP, now) {
+	let admitted = true;
+	const run = async () => {
+		let freshIps = {};
+		let warnThreshold = DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		let prevWarningAt = null;
+		let prevPeakCount = null;
+		let prevStreak = 0;
+		let ipLimit = null;
+		try {
+			const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, device_warning_streak, ip_limit, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
+			freshIps = JSON.parse((row && row.active_ips) || "{}");
+			warnThreshold = parseDeviceWarningThreshold(row ? row.dw_threshold : null);
+			prevWarningAt = row ? row.device_warning_at : null;
+			prevPeakCount = row ? row.device_warning_peak_count : null;
+			prevStreak = (row && row.device_warning_streak) || 0;
+			ipLimit = row ? row.ip_limit : null;
+		} catch (e) { }
+		for (const [ip, data] of Object.entries(freshIps)) {
+			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+			const lastSeenNum = typeof lastSeen === "number" ? lastSeen : Number(lastSeen);
+			if (ip !== clientIP && (!isFinite(lastSeenNum) || now - lastSeenNum > 180000)) delete freshIps[ip];
+		}
+		if (!freshIps[clientIP]) {
+			// «سقف در لحظه‌ی تأیید، نه هندشیک»: دقیقاً همون مقایسه‌ای که قبلاً موقع هندشیک
+			// انجام می‌شد (>= ip_limit یعنی جا نیست)، فقط حالا اینجا و روی دیتای تازه.
+			const confirmedCount = Object.keys(freshIps).length;
+			if (ipLimit && ipLimit > 0 && confirmedCount >= ipLimit) {
+				admitted = false;
+				return;
+			}
+			freshIps[clientIP] = { timestamp: now, count: 1 };
+		} else {
+			// یه اتصال دیگه از همین (کاربر, IP) زودتر (مثلاً هم‌زمان) تأیید کرده بوده - فقط رفرش.
+			if (typeof freshIps[clientIP] === "object") {
+				freshIps[clientIP].timestamp = now;
+				freshIps[clientIP].count = (freshIps[clientIP].count || 0) + 1;
+			} else {
+				freshIps[clientIP] = { timestamp: now, count: 1 };
+			}
+		}
+		const activeDeviceCount = Object.keys(freshIps).length;
+		const { shouldWarn, newStreak, newPeakCount } = evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now);
+		try {
+			if (shouldWarn) {
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, newStreak, uuid).run();
+			} else {
+				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, newStreak, uuid).run();
+			}
+		} catch (e) { }
+	};
+	const prior = GLOBAL_ACTIVE_IPS_WRITE_LOCK.get(username) || Promise.resolve();
+	const chained = prior.then(run, run);
+	GLOBAL_ACTIVE_IPS_WRITE_LOCK.set(username, chained);
+	if (ctx) ctx.waitUntil(chained);
+	await chained;
+	return admitted;
+}
+// «دیده‌شده/تأییدشده» - کمک‌تابع‌های DEVICE_CONFIRM_BURST_* (شرط «اتصال‌های کوتاهِ زیاد»):
+// recordBurstBytes روی هر addBytes صدا زده می‌شه (فقط تا وقتی همون اتصال تأیید نشده)،
+// getBurstBytes فقط می‌خونه (از checkDeviceConfirmation/هیت‌بیت). کلید همیشه
+// `${username}|${clientIP}` است - نگاه کنید توضیح IP_BURST_BYTES بالای فایل.
+function recordBurstBytes(key, bytes, now) {
+	let entry = IP_BURST_BYTES.get(key);
+	if (!entry || now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) {
+		entry = { bytes: 0, windowStart: now };
+	}
+	entry.bytes += bytes;
+	IP_BURST_BYTES.set(key, entry);
+}
+function getBurstBytes(key, now) {
+	const entry = IP_BURST_BYTES.get(key);
+	if (!entry || now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) return 0;
+	return entry.bytes;
 }
 function getActiveIpCount(activeIpsJson) {
 	if (!activeIpsJson) return 0;
@@ -2791,24 +2944,33 @@ async function getPinnedLocationsSetting(env) {
 		return PINNED_DEFAULT_LOCATIONS_FALLBACK;
 	}
 }
-// Reads the admin-editable "هشدار تعداد دستگاه" (device-count warning) global
-// threshold from settings (key 'device_warning_threshold'). Used only as the
-// value auto-filled into a brand-new user's `ip_limit` column at creation time
-// (see the POST /api/users handler) - never for enforcement. Falls back to
-// DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK if never configured (fresh install)
-// or malformed; an explicitly-saved value of 0 is respected as-is (no warning
-// ever auto-set for new users, since 0/() falsy ip_limit skips the exceeded-check
-// in persistActiveIp too).
-async function getDeviceWarningThresholdSetting(env) {
-	if (!env || !env.DB) return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+// Reads the admin-editable «محدودیت کاربر» (user limit) global from settings (key
+// 'user_limit'). Used as the value auto-filled into a brand-new user's ip_limit and
+// max_connections columns at creation time when the request didn't carry one (see the
+// POST /api/users handler). The same setting is also written onto every EXISTING user by
+// POST /api/settings/bulk. Falls back to DEFAULT_USER_LIMIT_FALLBACK if never configured
+// (fresh install) or malformed; an explicitly-saved 0 is respected as-is (0 = no limit,
+// exactly like an empty per-user field).
+async function getUserLimitSetting(env) {
+	if (!env || !env.DB) return DEFAULT_USER_LIMIT_FALLBACK;
 	try {
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'device_warning_threshold'").first();
-		if (!row || row.value === null || row.value === undefined || String(row.value).trim() === "") return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'user_limit'").first();
+		if (!row || row.value === null || row.value === undefined || String(row.value).trim() === "") return DEFAULT_USER_LIMIT_FALLBACK;
 		const parsed = parseInt(row.value);
-		return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_USER_LIMIT_FALLBACK;
 	} catch (e) {
-		return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+		return DEFAULT_USER_LIMIT_FALLBACK;
 	}
+}
+// Parses the raw value of the admin-editable «هشدار تعداد دستگاه» (device-count warning)
+// global threshold (settings key 'device_warning_threshold') - persistActiveIp reads it
+// together with the user row in one query and passes the raw text here. Missing/empty/
+// malformed => DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK; an explicitly-saved 0 is respected
+// (0 = the warning is off, since persistActiveIp skips the exceeded-check for a falsy value).
+function parseDeviceWarningThreshold(raw) {
+	if (raw === null || raw === undefined || String(raw).trim() === "") return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+	const parsed = parseInt(raw);
+	return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
 }
 // Reads the admin-editable «پورت» global default from settings (key
 // 'default_port'). Used only to pre-fill a brand-new user's `port` column at
@@ -3289,6 +3451,9 @@ async function flushExpiredTraffic(env) {
 	for (const [ip, record] of LOGIN_ATTEMPTS.entries()) {
 		if (now - record.lastAttempt > 900000) LOGIN_ATTEMPTS.delete(ip);
 	}
+	for (const [key, entry] of IP_BURST_BYTES.entries()) {
+		if (now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) IP_BURST_BYTES.delete(key);
+	}
 	const allUsers = new Set([...GLOBAL_TRAFFIC_CACHE.keys(), ...USER_REQ_CACHE.keys()]);
 	// قبلاً به ازای هر کاربر یک UPDATE جدا + یک UPSERT جدای daily_traffic زده می‌شد، یعنی برای N
 	// کاربرِ در انتظار، 2N رفت‌وبرگشت پشت‌سرهم به D1. حالا همه‌ی UPDATE ها جمع می‌شن و با یک
@@ -3441,6 +3606,13 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	let validUUID = null;
 	let targetDns = "8.8.4.4";
 	let targetDoh = "https://cloudflare-dns.com/dns-query";
+	// «دیده‌شده/تأییدشده» (device seen/confirmed - نگاه کنید توضیح DEVICE_CONFIRM_* بالای
+	// فایل): وضعیتِ محلیِ همین یک اتصال، بین addBytes/هیت‌بیت/بلاکِ پارسِ هدر مشترکه.
+	// connectionStartTime همون لحظه‌ی accept شدنِ سوکته - معیار «حداقل ۱۰ ثانیه باز بمونه».
+	const connectionStartTime = Date.now();
+	let connectionBytesSoFar = 0;
+	let deviceConfirmed = false;
+	let deviceConfirmInFlight = false;
 	function addBytes(bytes) {
 		if (bytes <= 0) return;
 		if (!username) {
@@ -3450,6 +3622,11 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 		if (uncountedBytes > 0) {
 			bytes += uncountedBytes;
 			uncountedBytes = 0;
+		}
+		connectionBytesSoFar += bytes;
+		if (!deviceConfirmed && clientIP && clientIP !== "unknown") {
+			recordBurstBytes(username + "|" + clientIP, bytes, Date.now());
+			checkDeviceConfirmation();
 		}
 		let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
 		GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
@@ -3535,6 +3712,47 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			ACTIVE_CONNECTIONS_COUNT.set(uname, activeCount);
 		}
 	};
+	// «دیده‌شده/تأییدشده» (نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): فقط تصمیم
+	// می‌گیره که آیا شرایط تأیید (اتصال پایدار یا اتصال‌های کوتاهِ زیاد) رسیده یا نه -
+	// از addBytes (هر بار دیتا رد بشه) و از هیت‌بیت (هر ~۲۰-۲۵ ثانیه، برای اتصال‌های
+	// کم‌حجمی که addBytes به تنهایی زود بهشون نمی‌رسه) صدا زده می‌شه. تا وقتی شرط رد
+	// نشده کاملاً بی‌اثره - نه D1 می‌خونه/می‌نویسه، نه چیزی رو کند می‌کنه. فقط وقتی
+	// واقعاً رد بشه یک بار confirmActiveIp (تنها جایی که الان سقف ip_limit رو واقعاً
+	// اعمال می‌کنه) صدا زده می‌شه.
+	const checkDeviceConfirmation = () => {
+		if (deviceConfirmed || deviceConfirmInFlight) return;
+		if (!username || !validUUID || !clientIP || clientIP === "unknown") return;
+		const nowT = Date.now();
+		const stableOk = (nowT - connectionStartTime >= DEVICE_CONFIRM_MIN_DURATION_MS) && (connectionBytesSoFar >= DEVICE_CONFIRM_MIN_BYTES);
+		const burstOk = getBurstBytes(username + "|" + clientIP, nowT) >= DEVICE_CONFIRM_BURST_BYTES;
+		if (!stableOk && !burstOk) return;
+		deviceConfirmInFlight = true;
+		const task = (async () => {
+			try {
+				const admitted = await confirmActiveIp(env, ctx, validUUID, username, clientIP, nowT);
+				if (admitted) {
+					deviceConfirmed = true;
+					// اگه تا وقتی D1 round-trip بالا تموم بشه همین اتصال از قبل بسته شده باشه
+					// (setOffline زودتر اجرا شده)، شمارنده‌ی سوکت‌های زنده رو دست نمی‌زنیم -
+					// وگرنه یه شمارشِ اضافه‌ی «شبح» می‌مونه که هیچ‌وقت کم نمی‌شه.
+					if (!hasCountedAsActive && !isOfflineSet) {
+						let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+						ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+						hasCountedAsActive = true;
+					}
+				} else {
+					// سقف «محدودیت کاربر» پره - طبق سیاست، دقیقاً همین‌جا (لحظه‌ی تأیید) اعمال
+					// می‌شه، نه موقع هندشیک؛ نتیجه: تست‌های پینگِ کوتاه هیچ‌وقت به اینجا نمی‌رسن
+					// (رد نمی‌شن)، ولی استفاده‌ی واقعی‌ای که جا نداره همین‌جا قطع می‌شه.
+					closeSocketQuietly(serverSock);
+				}
+			} catch (e) {
+			} finally {
+				deviceConfirmInFlight = false;
+			}
+		})();
+		if (ctx) ctx.waitUntil(task);
+	};
 	let heartbeat;
 	const runHeartbeat = async () => {
 		if (serverSock.readyState === WebSocket.OPEN) {
@@ -3574,42 +3792,47 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 							}
 						}
 						if (!isExpired && clientIP && clientIP !== "unknown") {
-							let activeIps = {};
-							try {
-								activeIps = JSON.parse(user.active_ips || "{}");
-							} catch (e) { }
-							let hasChanges = false;
-							let needsDbUpdateForTimestamp = false;
-							
-							for (const [ip, data] of Object.entries(activeIps)) {
-								const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-								if (nowTime - lastSeen > 180000 && ip !== clientIP) {
-									delete activeIps[ip];
-									hasChanges = true;
-								}
-							}
-							if (!activeIps[clientIP]) {
-								activeIps[clientIP] = { timestamp: nowTime, count: 1 };
-								hasChanges = true;
+							if (!deviceConfirmed) {
+								// «دیده‌شده/تأییدشده»: این اتصال هنوز تأیید نشده - این هیت‌بیت فقط یه
+								// فرصت دیگه‌ست تا شرایط تأیید (DEVICE_CONFIRM_*) چک بشه، بدون اینکه
+								// مستقیم چیزی توی activeIps نوشته بشه یا سقف اعمال بشه (اون کار فقط
+								// با checkDeviceConfirmation/confirmActiveIp انجام می‌شه).
+								checkDeviceConfirmation();
 							} else {
-								const currentData = activeIps[clientIP];
-								const lastSeen = typeof currentData === "object" ? currentData.timestamp : currentData;
-								if (nowTime - lastSeen > 150000) {
-									if (typeof activeIps[clientIP] === "object") {
-										activeIps[clientIP].timestamp = nowTime;
-									} else {
-										activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+								let activeIps = {};
+								try {
+									activeIps = JSON.parse(user.active_ips || "{}");
+								} catch (e) { }
+								let hasChanges = false;
+								let needsDbUpdateForTimestamp = false;
+
+								for (const [ip, data] of Object.entries(activeIps)) {
+									const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+									if (nowTime - lastSeen > 180000 && ip !== clientIP) {
+										delete activeIps[ip];
+										hasChanges = true;
 									}
-									needsDbUpdateForTimestamp = true;
 								}
+								if (!activeIps[clientIP]) {
+									activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+									hasChanges = true;
+								} else {
+									const currentData = activeIps[clientIP];
+									const lastSeen = typeof currentData === "object" ? currentData.timestamp : currentData;
+									if (nowTime - lastSeen > 150000) {
+										if (typeof activeIps[clientIP] === "object") {
+											activeIps[clientIP].timestamp = nowTime;
+										} else {
+											activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+										}
+										needsDbUpdateForTimestamp = true;
+									}
+								}
+								// «سقف در لحظه‌ی تأیید، نه هندشیک/هیت‌بیت»: ip_limit دیگه اینجا (رفرشِ
+								// یه دستگاهِ از قبل تأییدشده) چک نمی‌شه - فقط توی confirmActiveIp، یه
+								// بار، موقع تأیید. نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل.
+								if (hasChanges || needsDbUpdateForTimestamp) updatedActiveIps = true;
 							}
-							const sortedIps = Object.keys(activeIps).sort((a, b) => {
-								const tA = typeof activeIps[a] === "object" ? activeIps[a].timestamp : activeIps[a];
-								const tB = typeof activeIps[b] === "object" ? activeIps[b].timestamp : activeIps[b];
-								return tB - tA;
-							});
-							/* Bypassed: if (user.ip_limit && user.ip_limit > 0 && sortedIps.indexOf(clientIP) >= user.ip_limit) isIpLimitExpired = true; */
-							if (hasChanges || needsDbUpdateForTimestamp || isIpLimitExpired) updatedActiveIps = true;
 						}
 					}
 					if (isExpired) {
@@ -3956,6 +4179,13 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				targetDoh = "https://dns.adguard-dns.com/dns-query";
 			}
 			if (clientIP && clientIP !== "unknown") {
+				// «دیده‌شده/تأییدشده» (نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): این IP فقط
+				// وقتی همین‌جا فوری «تأییدشده» حساب می‌شه که از قبل توی active_ips کاربر باشه و
+				// هنوز تازه باشه - یعنی همین دستگاه از قبل یه اتصال دیگه داشته و این یکی صرفاً
+				// reconnect/تب جدیدشه؛ دقیقاً همون رفتار قبلی، بدون تأخیر، تا سرعت یا اتصال
+				// دستگاه‌های از قبل متصل عوض نشه. اگه IP تازه باشه، هیچی اینجا روی D1 نوشته
+				// نمی‌شه و سقف «محدودیت کاربر»/ip_limit هم اینجا چک نمی‌شه؛ تصمیم می‌مونه برای
+				// checkDeviceConfirmation() (تعریف‌شده بالاتر، از addBytes/هیت‌بیت صدا زده می‌شه).
 				let activeIps = {};
 				try {
 					activeIps = JSON.parse(user.active_ips || "{}");
@@ -3965,33 +4195,28 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					const lastSeen = data && typeof data === "object" ? data.timestamp : data;
 					if (now - lastSeen > 180000) delete activeIps[ip];
 				}
-				let isNewIp = false;
-				if (!activeIps[clientIP]) {
-					const sortedIps = Object.keys(activeIps);
-					/* Bypassed: if (user.ip_limit && user.ip_limit > 0 && sortedIps.length >= user.ip_limit) { serverSock.close(); return; } */
-					activeIps[clientIP] = { timestamp: now, count: 1 };
-					isNewIp = true;
-				} else {
+				if (activeIps[clientIP]) {
+					deviceConfirmed = true;
 					if (typeof activeIps[clientIP] === "object") {
 						activeIps[clientIP].timestamp = now;
 						activeIps[clientIP].count = (activeIps[clientIP].count || 0) + 1;
 					} else {
 						activeIps[clientIP] = { timestamp: now, count: 1 };
 					}
-				}
-				let lastDbW = GLOBAL_LAST_DB_WRITE.get(username) || 0;
-				let needIpWrite = isNewIp;
-				let needTimeWrite = (now - lastDbW > 900000);
-				if (needIpWrite || needTimeWrite) {
-					GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
-					GLOBAL_LAST_DB_WRITE.set(username, now);
-					persistActiveIp(env, ctx, reqUUID, username, clientIP, now);
+					let lastDbW = GLOBAL_LAST_DB_WRITE.get(username) || 0;
+					if (now - lastDbW > 900000) {
+						GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
+						GLOBAL_LAST_DB_WRITE.set(username, now);
+						persistActiveIp(env, ctx, reqUUID, username, clientIP, now);
+					}
 				}
 			}
 			isHeaderParsed = true;
-			let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
-			ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
-			hasCountedAsActive = true;
+			if (deviceConfirmed) {
+				let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+				ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+				hasCountedAsActive = true;
+			}
 			try {
 				let isDomainAddress = (isTrojanProto && addrType === 3) || (!isTrojanProto && addrType === 2);
 				let isIpAddress = (isTrojanProto && (addrType === 1 || addrType === 4)) || (!isTrojanProto && (addrType === 1 || addrType === 3));
@@ -7068,12 +7293,6 @@ Commercial support is available at
 					</div>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
-					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🌍 مخزن پروکسی‌های VIP</h5>
-					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mb-2">تک‌تک کشورهای مخزن VIP (نه لیست عمومی که چندصد خط دارد) را می‌گیرد و در کش سرور ذخیره می‌کند تا تعویض/رول‌آور پروکسی کاربرها سریع‌تر انجام شود.</p>
-					<button type="button" onclick="syncVipProxies()" id="sync-vip-proxies-btn" class="w-full py-2 bg-teal-700 hover:bg-teal-800 dark:bg-teal-600 dark:hover:bg-teal-700 text-white font-bold rounded-md text-xs transition shadow-sm disabled:opacity-50 disabled:cursor-not-allowed">دریافت کامل لیست پروکسی‌های VIP (همه‌ی کشورها)</button>
-					<p id="vip-sync-result" class="text-[10px] text-gray-500 dark:text-zinc-400 mt-2"></p>
-				</div>
-				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
 						پورت
@@ -7122,13 +7341,23 @@ Commercial support is available at
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
+						<svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+						محدودیت کاربر
+					</label>
+					<div class="flex items-center gap-2">
+						<input type="number" id="user-limit-input" dir="ltr" min="0" step="1" placeholder="2" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+					</div>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">سقف تعداد دستگاه هم‌زمانِ هر کاربر (همون فیلد «محدودیت کاربر» توی فرم کاربر). با ذخیره‌ی تنظیمات روی همه‌ی کاربرهای فعلی اعمال می‌شه و پیش‌فرضِ کاربرهای جدیده؛ برای هر کاربر جدا هم قابل تغییره. ۰ = نامحدود.</p>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300 flex items-center gap-1.5">
 						<svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
 						هشدار تعداد دستگاه
 					</label>
 					<div class="flex items-center gap-2">
 						<input type="number" id="device-warning-threshold-input" dir="ltr" min="0" step="1" placeholder="4" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-red-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 					</div>
-					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">این عدد فقط پیش‌فرضِ فیلد «محدودیت کاربر» برای کاربرهای جدیده (اگه دستی چیزی وارد نشه)؛ برای هر کاربر جدا هم قابل تغییره و صرفاً هشدار روی کارتشه، اتصالی قطع نمی‌کنه.</p>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-1">اگه تعداد دستگاه‌های هم‌زمانِ یه کاربر از این عدد بیشتر بشه، روی کارتش هشدار قرمز نشون داده می‌شه. جدا از «محدودیت کاربر» بالاست، روی حدِ کاربرها اثری نداره و اتصالی قطع نمی‌کنه. ۰ = هشدار خاموش.</p>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🆕 پیش‌فرض کاربر جدید</h5>
@@ -7420,11 +7649,9 @@ ${COMMON_TOAST_HTML}
 				'https://testfnryjnrjrurjejne4r6uju.pages.dev/' + path,
 				'https://hoplimit.shop/' + path
 			];
-
 			if (path.includes('zeus.obfuscated.js')) {
 				urls.push('https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main/zeus.obfuscated.js' + (path.includes('?') ? path.substring(path.indexOf('?')) : ''));
 			}
-
 			for (const url of urls) {
 				try {
 					const res = await fetch(url, options);
@@ -7445,7 +7672,7 @@ ${COMMON_TOAST_HTML}
 				if (disable !== null) btnDesk.disabled = disable;
 			}
 		}
-		function showToast(message, type = 'success') {
+		function showToast(message, type = 'success', duration = 3000) {
 			const container = document.getElementById('toast-container');
 			const toast = document.createElement('div');
 			const colors = type === 'error' 
@@ -7460,7 +7687,7 @@ ${COMMON_TOAST_HTML}
 			setTimeout(() => {
 				toast.classList.add('-translate-y-full', 'opacity-0');
 				setTimeout(() => toast.remove(), 300);
-			}, 3000);
+			}, duration);
 		}
 		function customConfirm(message) {
 			return new Promise((resolve) => {
@@ -7897,8 +8124,8 @@ let activeRocketBtn = null;
 		window.applyNewUserFormDefaults = function() {
 			const ipLimitInputEl = document.getElementById('input-ip-limit');
 			if (ipLimitInputEl) {
-				const dwThreshold = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
-				ipLimitInputEl.placeholder = 'پیش‌فرض: ' + dwThreshold;
+				const defaultUserLimit = (window.USER_LIMIT !== undefined && window.USER_LIMIT !== null) ? window.USER_LIMIT : window.DEFAULT_USER_LIMIT;
+				ipLimitInputEl.placeholder = 'پیش‌فرض: ' + defaultUserLimit;
 			}
 			// پیش‌فرض‌ها از Settings (کلیدهای new_user_* - مودال «تنظیمات پـنـل» → «پیش‌فرض کاربر
 			// جدید») خوانده می‌شن، نه hardcode؛ اگه هیچ‌چیز تغییر نکرده باشه دقیقاً همون مقادیر قبلیه.
@@ -8001,7 +8228,7 @@ let activeRocketBtn = null;
 					headers: { 'Content-Type': 'application/json' },
 					body: isUpdate ? reqBody : undefined
 				});
-				const data = await res.json();
+				const data = await res.json().catch(() => ({}));
 				if (res.status === 400 && data.error === "TOKEN_REQUIRED") {
 					toggleTokenModal(true);
 					if (btn) {
@@ -8027,7 +8254,12 @@ let activeRocketBtn = null;
 						window.location.href = window.location.pathname + '?t=' + Date.now();
 					}
 				} else {
-					alert(isUpdate ? 'خطا در بروزرسانی. لطفاً با استفاده از " ربات" اقدام کنید.' : 'خطا در ری‌استارت پـنـل: ' + (data.error || 'ناشناخته'));
+					if (isUpdate) {
+						// خطای آپدیت باید آن‌قدر روی صفحه بماند که بشود دلیلش را خواند (توست پیش‌فرض ۳ ثانیه‌ای زود ناپدید می‌شد)
+						showToast('خطا در بروزرسانی: ' + (data.error || ('کد وضعیت ' + res.status)) + ' — اگر مشکل ادامه داشت با استفاده از " ربات" اقدام کنید.', 'error', 20000);
+					} else {
+						alert('خطا در ری‌استارت پـنـل: ' + (data.error || 'ناشناخته'));
+					}
 					if (btn) {
 						btn.disabled = false;
 						if (!isUpdate || isGithubUpdate) btn.classList.remove('animate-pulse');
@@ -8435,9 +8667,10 @@ let activeRocketBtn = null;
 						? '<span class="min-w-[28px] h-[28px] px-[5.6px] relative inline-flex items-center justify-center text-center leading-none text-[21px] font-bold ' + onlineBadgeColor + ' text-white rounded-full animate-pulse" style="line-height:1"><span style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:inline-block;">' + user.online_count + '</span></span>'
 						: '';
 					// «هشدار تعداد دستگاه»: user.device_warning از GET /api/users میاد (تا ۲۴ ساعت
-					// بعد از آخرین باری که تعداد دستگاه فعال از ip_limit این کاربر بیشتر شده -
-					// نگاه کنید به persistActiveIp). فقط یک هشدار بصریه، هیچ اتصالی رو قطع نمی‌کنه.
-					const deviceWarningLimitText = (user.ip_limit !== undefined && user.ip_limit !== null) ? user.ip_limit : (user.max_connections || '?');
+					// بعد از آخرین باری که تعداد دستگاه فعال از آستانه‌ی سراسری هشدار
+					// (device_warning_threshold) بیشتر شده - نگاه کنید به persistActiveIp). فقط یک
+					// هشدار بصریه، هیچ اتصالی رو قطع نمی‌کنه.
+					const deviceWarningLimitText = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
 					// «بیشترین تعداد دستگاه»: user.device_warning_peak_count از GET /api/users میاد
 					// (ستون خام، persistActiveIp پرش می‌کنه - نگاه کنید بالاتر). کنار خودِ آیکون
 					// هشدار نشون داده می‌شه، سمت چپش (آیکون اول توی سورس میاد، عدد بعدش - چون
@@ -8445,7 +8678,7 @@ let activeRocketBtn = null;
 					const deviceWarningPeakCount = user.device_warning_peak_count || null;
 					const deviceWarningBadge = user.device_warning
 						? '<span class="inline-flex items-center gap-[2.8px] shrink-0">' +
-							'<span title="تعداد دستگاه‌های متصل این کاربر بیش از حد مجازش (' + deviceWarningLimitText + ' دستگاه) بوده است' + (deviceWarningPeakCount ? ' - بیشترین تعداد همزمان: ' + deviceWarningPeakCount + ' دستگاه' : '') + '" class="inline-flex items-center justify-center w-[22.4px] h-[22.4px] text-red-500 animate-pulse shrink-0">' +
+							'<span title="تعداد دستگاه‌های متصل این کاربر بیش از آستانه‌ی هشدار (' + deviceWarningLimitText + ' دستگاه) بوده است' + (deviceWarningPeakCount ? ' - بیشترین تعداد همزمان: ' + deviceWarningPeakCount + ' دستگاه' : '') + '" class="inline-flex items-center justify-center w-[22.4px] h-[22.4px] text-red-500 animate-pulse shrink-0">' +
 								'<svg class="w-[19.6px] h-[19.6px]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>' +
 							  '</span>' +
 							(deviceWarningPeakCount ? '<span class="text-[14px] font-bold text-red-500 leading-none">' + deviceWarningPeakCount + '</span>' : '') +
@@ -9888,6 +10121,23 @@ window.loadGlobalReqLimitSetting = async function() {
 	if (input) input.value = value;
 	return value;
 };
+window.DEFAULT_USER_LIMIT = 2;
+window.USER_LIMIT = window.DEFAULT_USER_LIMIT;
+window.loadUserLimitSetting = async function() {
+	let value = window.DEFAULT_USER_LIMIT;
+	try {
+		const res = await fetch('/api/settings/bulk');
+		const data = await res.json();
+		if (data && data.user_limit !== undefined && data.user_limit !== null && String(data.user_limit).trim() !== '') {
+			const parsed = parseInt(data.user_limit);
+			if (!isNaN(parsed) && parsed >= 0) value = parsed;
+		}
+	} catch (e) {}
+	window.USER_LIMIT = value;
+	const input = document.getElementById('user-limit-input');
+	if (input) input.value = value;
+	return value;
+};
 window.DEFAULT_DEVICE_WARNING_THRESHOLD = 4;
 window.DEVICE_WARNING_THRESHOLD = window.DEFAULT_DEVICE_WARNING_THRESHOLD;
 window.loadDeviceWarningThresholdSetting = async function() {
@@ -10326,6 +10576,7 @@ window.fillPatternihaValues = function() {
 window.saveSettings = async function() {
 	const cleanIpInput = document.getElementById('global-clean-ip-input');
 	const reqLimitInput = document.getElementById('global-req-limit-input');
+	const userLimitInput = document.getElementById('user-limit-input');
 	const deviceWarningThresholdInput = document.getElementById('device-warning-threshold-input');
 	const otherIpsInput = document.getElementById('other-clean-ips-input');
 	const proxyIpInput = document.getElementById('inline-proxy-ip-input');
@@ -10334,6 +10585,8 @@ window.saveSettings = async function() {
 	const cleanIpVal = (cleanIpInput && cleanIpInput.value.trim()) ? cleanIpInput.value.trim() : window.DEFAULT_GLOBAL_CLEAN_IP;
 	const reqLimitParsed = reqLimitInput ? parseInt(reqLimitInput.value) : NaN;
 	const reqLimitVal = (!isNaN(reqLimitParsed) && reqLimitParsed >= 0) ? reqLimitParsed : window.DEFAULT_GLOBAL_REQ_LIMIT;
+	const userLimitParsed = userLimitInput ? parseInt(userLimitInput.value) : NaN;
+	const userLimitVal = (!isNaN(userLimitParsed) && userLimitParsed >= 0) ? userLimitParsed : window.DEFAULT_USER_LIMIT;
 	const deviceWarningThresholdParsed = deviceWarningThresholdInput ? parseInt(deviceWarningThresholdInput.value) : NaN;
 	const deviceWarningThresholdVal = (!isNaN(deviceWarningThresholdParsed) && deviceWarningThresholdParsed >= 0) ? deviceWarningThresholdParsed : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
 	const otherIpsRawVal = (otherIpsInput && otherIpsInput.value) ? otherIpsInput.value : '';
@@ -10355,6 +10608,7 @@ window.saveSettings = async function() {
 				settings: Object.assign({
 					global_clean_ip: cleanIpVal,
 					global_req_limit: reqLimitVal,
+					user_limit: userLimitVal,
 					device_warning_threshold: deviceWarningThresholdVal,
 					other_clean_ips: otherIpsVal,
 					inline_proxy_ip: proxyIpVal,
@@ -10364,6 +10618,7 @@ window.saveSettings = async function() {
 		});
 		window.GLOBAL_CLEAN_IP = cleanIpVal;
 		window.GLOBAL_REQ_LIMIT = reqLimitVal;
+		window.USER_LIMIT = userLimitVal;
 		window.DEVICE_WARNING_THRESHOLD = deviceWarningThresholdVal;
 		window.OTHER_CLEAN_IPS = otherIpsParsed;
 		window.INLINE_PROXY_IP = proxyIpVal;
@@ -10372,44 +10627,19 @@ window.saveSettings = async function() {
 		window.fillNewUserDefaultsInputs();
 		if (cleanIpInput) cleanIpInput.value = cleanIpVal;
 		if (reqLimitInput) reqLimitInput.value = reqLimitVal;
+		if (userLimitInput) userLimitInput.value = userLimitVal;
 		if (deviceWarningThresholdInput) deviceWarningThresholdInput.value = deviceWarningThresholdVal;
 		if (otherIpsInput) otherIpsInput.value = otherIpsVal;
 		if (proxyIpInput) proxyIpInput.value = proxyIpVal;
 		if (defaultPortInput) defaultPortInput.value = defaultPortVal;
 		if (typeof renderPortCheckboxes === 'function') renderPortCheckboxes();
-		showToast('✅ تنظیمات ذخیره شد؛ پورت همه‌ی کاربرها روی ' + defaultPortVal + ' ست شد.');
+		showToast('✅ تنظیمات ذخیره شد؛ پورت همه‌ی کاربرها روی ' + defaultPortVal + ' و محدودیت کاربر روی ' + userLimitVal + ' ست شد.');
 		toggleSettingsModal(false);
 		if (typeof loadUsers === 'function') await loadUsers(true);
 	} catch (e) {
 		showToast('❌ ذخیره‌سازی تنظیمات ناموفق بود.');
 	} finally {
 		buttons.forEach(function(b) { b.disabled = false; });
-	}
-};
-// دکمه‌ی «دریافت کامل لیست پروکسی‌های VIP» توی Settings: لیست کشورهای مخزن VIP
-// (vip-list) رو می‌گیره و تک‌تک اون‌ها رو (proxy_vip/<CC>.txt) از سرور می‌خواد؛
-// سرور همه‌شون رو تازه می‌کنه و توی REPO_FILE_CACHE نگه می‌داره تا رول‌آور/تعویض
-// پروکسی کاربرها دیگه لازم نباشه هر بار دوباره از لینک‌ها بگیره. فقط مخزن VIP -
-// نه لیست عمومی proxy/ که تعدادش به صدها می‌رسه.
-window.syncVipProxies = async function() {
-	const btn = document.getElementById('sync-vip-proxies-btn');
-	const resultEl = document.getElementById('vip-sync-result');
-	const originalLabel = 'دریافت کامل لیست پروکسی‌های VIP (همه‌ی کشورها)';
-	if (btn) { btn.disabled = true; btn.innerText = 'در حال دریافت از مخزن...'; }
-	if (resultEl) resultEl.innerText = '';
-	try {
-		const res = await fetch('/api/settings/sync-vip-proxies', { method: 'POST' });
-		const data = await res.json();
-		if (!res.ok || data.error) throw new Error(data.error || 'خطای نامشخص');
-		if (resultEl) {
-			resultEl.innerText = '✅ ' + data.totalCountries + ' کشور - مجموعاً ' + data.totalProxies + ' پروکسی VIP دریافت و در سرور کش شد.';
-		}
-		showToast('✅ مخزن VIP به‌روزرسانی شد (' + data.totalCountries + ' کشور).');
-	} catch (e) {
-		if (resultEl) resultEl.innerText = '❌ ' + (e.message || 'دریافت مخزن VIP ناموفق بود.');
-		showToast('❌ دریافت مخزن VIP ناموفق بود.', 'error');
-	} finally {
-		if (btn) { btn.disabled = false; btn.innerText = originalLabel; }
 	}
 };
 window.resetUserToDefaultPending = false;
@@ -10451,11 +10681,11 @@ window.resetUserToDefault = async function() {
 	const customPortInput = document.getElementById('input-custom-ports');
 	if (customPortInput) customPortInput.value = '';
 	document.querySelectorAll('.frag-preset-card').forEach(card => card.classList.remove('ring-2', 'ring-blue-500', 'border-blue-500', 'bg-blue-50/50', 'dark:bg-blue-950/40'));
-	// کاربر جدید بدون مقدار صریح، ip_limit = آستانه‌ی هشدار سراسری می‌گیرد؛ در ویرایش خالی یعنی نامحدود، پس صریح می‌نویسیم
+	// کاربر جدید بدون مقدار صریح، ip_limit = «محدودیت کاربر» سراسری (user_limit) می‌گیرد؛ در ویرایش خالی یعنی نامحدود، پس صریح می‌نویسیم
 	const ipLimitInputEl = document.getElementById('input-ip-limit');
 	if (ipLimitInputEl) {
 		ipLimitInputEl.placeholder = 'نامحدود';
-		ipLimitInputEl.value = (window.DEVICE_WARNING_THRESHOLD !== undefined && window.DEVICE_WARNING_THRESHOLD !== null) ? window.DEVICE_WARNING_THRESHOLD : window.DEFAULT_DEVICE_WARNING_THRESHOLD;
+		ipLimitInputEl.value = (window.USER_LIMIT !== undefined && window.USER_LIMIT !== null) ? window.USER_LIMIT : window.DEFAULT_USER_LIMIT;
 	}
 	// سرور همیشه برای لیست تازه‌ساخته‌شده auto-heal را روشن می‌کند (مثل کاربر جدید)
 	const rotateCheck = document.getElementById('input-auto-rotate-user-proxy');
@@ -11234,6 +11464,7 @@ function applySelectedIps() {
 			loadTrafficCardChart();
 			window.loadGlobalCleanIpSetting();
 			window.loadGlobalReqLimitSetting();
+			window.loadUserLimitSetting();
 			window.loadDeviceWarningThresholdSetting();
 			window.loadOtherCleanIpsSetting();
 			window.loadInlineProxyIpSetting();
