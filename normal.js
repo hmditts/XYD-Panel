@@ -5310,10 +5310,28 @@ async function connectSocks4(proxyStr, destAddr, destPort, initialData) {
 	const socket = connect({ hostname: host, port: port });
 	const reader = socket.readable.getReader();
 	const writer = socket.writable.getWriter();
-	const readWithTimeout = (r, ms) => Promise.race([
-		r.read(),
-		new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms))
-	]);
+	// همون رفع باگ «یک read ممکنه نصفه‌نیمه برسه» که در connectSocks5 اعمال شد، اینجا هم لازمه.
+	const readAtLeast = async (r, minBytes, ms) => {
+		let chunks = [];
+		let total = 0;
+		const deadline = Date.now() + ms;
+		while (total < minBytes) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) throw new Error("timeout");
+			const res = await Promise.race([
+				r.read(),
+				new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), remaining))
+			]);
+			if (res.done || !res.value) throw new Error("proxy_closed");
+			chunks.push(res.value);
+			total += res.value.byteLength;
+		}
+		if (chunks.length === 1) return chunks[0];
+		const merged = new Uint8Array(total);
+		let offset = 0;
+		for (const c of chunks) { merged.set(c, offset); offset += c.byteLength; }
+		return merged;
+	};
 	try {
 		const portHigh = (destPort >> 8) & 0xff;
 		const portLow = destPort & 0xff;
@@ -5337,8 +5355,8 @@ async function connectSocks4(proxyStr, destAddr, destPort, initialData) {
 			req[9 + hostBytes.length] = 0x00;
 		}
 		await writer.write(req);
-		let res = await readWithTimeout(reader, 4000);
-		if (res.done || !res.value || res.value[0] !== 0x00 || res.value[1] !== 0x5a) {
+		let res = await readAtLeast(reader, 2, 4000);
+		if (res[0] !== 0x00 || res[1] !== 0x5a) {
 			throw new Error("پـروکـسـی SOCKS4 وصل نشد یا اتصال را رد کرد");
 		}
 		if (initialData && initialData.byteLength > 0) {
@@ -5396,19 +5414,41 @@ async function connectSocks5(socksStr, destAddr, destPort, initialData) {
 	const socket = connect({ hostname: host, port: port });
 	const reader = socket.readable.getReader();
 	const writer = socket.writable.getWriter();
-	const readWithTimeout = (r, ms) => Promise.race([
-		r.read(),
-		new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms))
-	]);
+	// بعضی پـروکـسـی‌ها پاسخ SOCKS5 رو توی چند بسته‌ی جدا (چند تا TCP read) می‌فرستن.
+	// یک read تنها ممکنه فقط ۱ بایت برگردونه؛ چک کردن ایندکس ۱ روی همچین آرایه‌ای
+	// همیشه false می‌شه و باعث خطای الکی «وصل شد ولی دسترسی نداره» می‌شه با اینکه
+	// اتصال واقعاً سالمه و فقط باید صبر کرد بقیه‌ی بایت‌ها هم برسن. این تابع به‌جای
+	// یک read، تا وقتی حداقل تعداد بایت لازم برسه (یا تایم‌اوت بشه) صبر می‌کنه.
+	const readAtLeast = async (r, minBytes, ms) => {
+		let chunks = [];
+		let total = 0;
+		const deadline = Date.now() + ms;
+		while (total < minBytes) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) throw new Error("timeout");
+			const res = await Promise.race([
+				r.read(),
+				new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), remaining))
+			]);
+			if (res.done || !res.value) throw new Error("proxy_closed");
+			chunks.push(res.value);
+			total += res.value.byteLength;
+		}
+		if (chunks.length === 1) return chunks[0];
+		const merged = new Uint8Array(total);
+		let offset = 0;
+		for (const c of chunks) { merged.set(c, offset); offset += c.byteLength; }
+		return merged;
+	};
 	try {
 		if (auth) {
 			await writer.write(new Uint8Array([0x05, 0x02, 0x00, 0x02]));
 		} else {
 			await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
 		}
-		let res = await readWithTimeout(reader, 4000);
-		if (res.done || !res.value || res.value[0] !== 0x05) throw new Error("پاسخ نامعتبر از سرور (پـروکـسـی SOCKS5 نیست یا خاموش است)");
-		const method = res.value[1];
+		let res = await readAtLeast(reader, 2, 4000);
+		if (res[0] !== 0x05) throw new Error("پاسخ نامعتبر از سرور (پـروکـسـی SOCKS5 نیست یا خاموش است)");
+		const method = res[1];
 		if (method === 0x02) {
 			const uEnc = new TextEncoder().encode(user);
 			const pEnc = new TextEncoder().encode(pass);
@@ -5419,8 +5459,8 @@ async function connectSocks5(socksStr, destAddr, destPort, initialData) {
 			authReq[2 + uEnc.length] = pEnc.length;
 			authReq.set(pEnc, 3 + uEnc.length);
 			await writer.write(authReq);
-			let authRes = await readWithTimeout(reader, 4000);
-			if (authRes.done || !authRes.value || authRes.value[1] !== 0x00) throw new Error("نام کاربری یا رمز عبور پـروکـسـی اشتباه است");
+			let authRes = await readAtLeast(reader, 2, 4000);
+			if (authRes[1] !== 0x00) throw new Error("نام کاربری یا رمز عبور پـروکـسـی اشتباه است");
 		}
 		let addrType = 0x03;
 		let addrBytes;
@@ -5452,8 +5492,8 @@ async function connectSocks5(socksStr, destAddr, destPort, initialData) {
 		req[portOffset] = (destPort >> 8) & 0xff;
 		req[portOffset + 1] = destPort & 0xff;
 		await writer.write(req);
-		let connRes = await readWithTimeout(reader, 4000);
-		if (connRes.done || !connRes.value || connRes.value[1] !== 0x00) throw new Error("پـروکـسـی وصل شد اما دسترسی به اینترنت آزاد ندارد");
+		let connRes = await readAtLeast(reader, 2, 4000);
+		if (connRes[1] !== 0x00) throw new Error("پـروکـسـی وصل شد اما دسترسی به اینترنت آزاد ندارد");
 		if (initialData && initialData.byteLength > 0) {
 			await writer.write(convertToUint8Array(initialData));
 		}
@@ -9296,7 +9336,7 @@ window.renderProxyFieldsUI = function() {
 		if (proxyStr && proxyFlagCache[proxyStr]) {
 			countryCode = proxyFlagCache[proxyStr].toUpperCase();
 		}
-		const isVip = proxyStr.length > 0 && (proxyStr.includes('@') || proxyStr.includes('pass=') || proxyStr.includes('t.me/'));
+		const isVip = proxyStr.length > 0 && (proxyStr.includes('@') || proxyStr.includes('pass=') || proxyStr.includes('t.me/') || countryCode !== "UN");
 		let inputRow = '<div class="flex items-center gap-1 w-full">' +
 			'<button type="button" onclick="swapProxyFieldUI(' + idx + ')" class="w-7 h-7 flex-shrink-0 bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white rounded flex items-center justify-center font-bold text-xs shadow-sm transition-all" title="جا به جایی پروکسی"><svg id="swap-icon-' + idx + '" class="w-3.5 h-3.5 transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg></button>';
 		const vipBorderClass = isFocused ? "ring-2 ring-blue-500 border-blue-500" : "border-green-400 dark:border-green-600";
@@ -10187,8 +10227,29 @@ function populateUserFormFields(user) {
 			if (user.user_socks5.trim().startsWith("[")) {
 				const arr = JSON.parse(user.user_socks5);
 				window.proxyFieldsData = arr.map(x => typeof x === "object" && x !== null ? x.proxy : x);
+				// کشوری که همراه هر پروکسی توی رکورد کاربر ذخیره شده رو توی proxy_flag_cache_v2
+				// می‌ریزیم تا موقع باز کردن/ویرایش کاربر، درست مثل همه‌ی جاهای دیگه، پرچم نشون
+				// داده بشه نه خودِ آدرس خام پروکسی (قبلاً این کشور دور ریخته می‌شد).
+				try {
+					let cache = JSON.parse(localStorage.getItem('proxy_flag_cache_v2') || '{}');
+					let changed = false;
+					arr.forEach(x => {
+						if (x && typeof x === 'object' && x.proxy && x.country) {
+							cache[x.proxy] = String(x.country).toUpperCase();
+							changed = true;
+						}
+					});
+					if (changed) localStorage.setItem('proxy_flag_cache_v2', JSON.stringify(cache));
+				} catch(e) {}
 			} else {
 				window.proxyFieldsData = [user.user_socks5];
+				if (user.user_proxy_iata) {
+					try {
+						let cache = JSON.parse(localStorage.getItem('proxy_flag_cache_v2') || '{}');
+						cache[user.user_socks5] = String(user.user_proxy_iata).toUpperCase();
+						localStorage.setItem('proxy_flag_cache_v2', JSON.stringify(cache));
+					} catch(e) {}
+				}
 			}
 		} catch(e) {
 			window.proxyFieldsData = [user.user_socks5];
