@@ -547,6 +547,25 @@ const NEW_USER_FINGERPRINTS = ["chrome", "firefox", "safari", "ios", "android", 
 // Early Data (ed=): سقف مجاز سایز (بایت) برای new_user_early_data_size وقتی POST /api/settings/bulk قراره اون رو روی
 // کاربرهای *موجود* بنویسه؛ همون ۸۱۹۲ که توی مستندات xray/sing-box برای WS early data حداکثره.
 const EARLY_DATA_MAX_SIZE = 8192;
+// Early Data (ed=): سازنده‌های مشترک برای SubscriptionService.generateText (?ed= روی path) و generateSingbox
+// (فیلدهای transport). دو کپی کلاینت‌ساید (getvIeesLink پنل و صفحه‌ی Status) همین قاعده را دارند (بند ۱-۲ خلاصه).
+// خاموش/نبودن فیلد = خروجی دقیقاً مثل قبل؛ سایز نامعتبر (خارج از 1..EARLY_DATA_MAX_SIZE) = 2560.
+function getUserEarlyDataSize(user) {
+	if (!user || Number(user.early_data_enabled) !== 1) return 0;
+	const n = parseInt(user.early_data_size, 10);
+	return n >= 1 && n <= EARLY_DATA_MAX_SIZE ? n : 2560;
+}
+function buildEarlyDataPathSuffix(user) {
+	const size = getUserEarlyDataSize(user);
+	return size ? "?ed=" + size : "";
+}
+function applySingboxEarlyData(transport, user) {
+	const size = getUserEarlyDataSize(user);
+	if (size && transport) {
+		transport.max_early_data = size;
+		transport.early_data_header_name = "Sec-WebSocket-Protocol";
+	}
+}
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
 // runs automatically for every user right after the admin saves the pinned
@@ -2320,7 +2339,7 @@ const Router = {
 						if (resetUser) await invalidateUserAuthCache(ctx, resetUser.uuid, resetUser.trojan_hash);
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} else {
-						const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols } = body;
+						const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = body;
 						if (new_username && new_username !== username) {
 							if (!/^[a-zA-Z0-9_-]+$/.test(new_username)) {
 								return new Response(JSON.stringify({ error: "نام کاربری جدید غیرمجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
@@ -2401,6 +2420,16 @@ const Router = {
 							}
 							return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
 						}
+						// Early Data: فقط اگر بدنه هرکدام را فرستاده باشد نوشته می‌شود (فرستنده‌ی قدیمی مثل بک‌آپ/پنل مادر
+						// قدیمی مقدار فعلی کاربر را دست‌نخورده می‌گذارد)؛ سایز نامعتبر نادیده گرفته می‌شود.
+						try {
+							const edEnabledPut = early_data_enabled !== undefined && early_data_enabled !== null ? (early_data_enabled && early_data_enabled !== "0" && early_data_enabled !== "false" ? 1 : 0) : null;
+							const edSizePutRaw = early_data_size !== undefined && early_data_size !== null ? parseInt(early_data_size, 10) : NaN;
+							const edSizePut = edSizePutRaw >= 1 && edSizePutRaw <= EARLY_DATA_MAX_SIZE ? edSizePutRaw : null;
+							if (edEnabledPut !== null || edSizePut !== null) {
+								await env.DB.prepare("UPDATE users SET early_data_enabled = COALESCE(?, early_data_enabled), early_data_size = COALESCE(?, early_data_size) WHERE username = ?").bind(edEnabledPut, edSizePut, new_username || username).run();
+							}
+						} catch (e) { }
 						if (resetProxyToDefault) {
 							// fresh list => old per-country auto-heal cooldowns no longer apply. The auto-reset timers
 							// are restarted from today exactly like POST /api/users does for a new user: last_reset_*_time
@@ -2571,7 +2600,7 @@ const Router = {
 					}
 				}
 				if (request.method === "POST") {
-					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols } = await readJsonBody(request);
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = await readJsonBody(request);
 					if (!username) {
 						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
 					}
@@ -2636,6 +2665,10 @@ const Router = {
 						const intOf = (v, dfltStr) => (given(v) ? parseInt(v) || 0 : parseInt(dfltStr) || 0);
 						const finalFingerprint = fingerprint || nud.new_user_fingerprint;
 						const finalIps = ips !== undefined ? ips : nud.global_clean_ip;
+						// Early Data: مقدار صریح برنده است؛ نیامده = پیش‌فرض Settings (new_user_early_data_*)؛ سایز نامعتبر = 2560.
+						const finalEarlyDataEnabled = flagOf(early_data_enabled, nud.new_user_early_data_enabled);
+						const edSizeParsed = parseInt(given(early_data_size) ? early_data_size : nud.new_user_early_data_size, 10);
+						const finalEarlyDataSize = edSizeParsed >= 1 && edSizeParsed <= EARLY_DATA_MAX_SIZE ? edSizeParsed : 2560;
 						const finalTls = given(tls) && String(tls).trim() !== "" ? tls : String(finalPort).split(",").some((p) => NEW_USER_TLS_PORTS.includes(p.trim())) ? "on" : "off";
 						if (!(protocols && Array.isArray(protocols) && protocols.length > 0) && !connection_type) finalConnType = nud.new_user_connection_type;
 						// Every new user is always pinned to whatever the current
@@ -2646,8 +2679,8 @@ const Router = {
 						// the background right after insert (see ctx.waitUntil below) so
 						// this request doesn't have to wait on a full round of live
 						// proxy testing.
-						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct))
+						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, early_data_enabled, early_data_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct), finalEarlyDataEnabled, finalEarlyDataSize)
 							.run();
 						// Clears any stale negative-cache ("no such user") entry that might exist for
 						// this uuid/hash from an earlier probe or connection attempt with this UUID.
@@ -2770,10 +2803,8 @@ const DbService = {
 					{ name: "device_warning_at", def: "INTEGER DEFAULT NULL" },
 					{ name: "device_warning_peak_count", def: "INTEGER DEFAULT NULL" },
 					{ name: "device_warning_streak", def: "INTEGER DEFAULT 0" },
-					// Early Data (فاز ۱): ستون‌های خام کاربر. تا فاز ۲ (POST/PUT /api/users و
-					// SubscriptionService) این دو ستون رو نمی‌خونه/نمی‌نویسه؛ فقط با DEFAULT
-					// ساخته می‌شن تا کاربرهای موجود هم early_data_enabled=0 داشته باشن (نه NULL)
-					// و شرط‌های آینده (user.early_data_enabled) بدون نیاز به fallback جدا درست کار کنن.
+					// Early Data: ستون‌های خام کاربر؛ با DEFAULT ساخته می‌شن تا کاربرهای موجود هم
+					// early_data_enabled=0 داشته باشن (نه NULL) و user.early_data_enabled بدون fallback جدا کار کنه.
 					{ name: "early_data_enabled", def: "INTEGER DEFAULT 0" },
 					{ name: "early_data_size", def: "INTEGER DEFAULT 2560" },
 				];
@@ -3319,7 +3350,7 @@ const SubscriptionService = {
 					flagEmoji = String.fromCodePoint(...codePoints);
 				} catch (e) { }
 			}
-			const currentDynPath = encodeURIComponent(rawPath + (proxyItem !== null && proxyItem !== "" ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment));
+			const currentDynPath = encodeURIComponent(rawPath + (proxyItem !== null && proxyItem !== "" ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment) + buildEarlyDataPathSuffix(user));
 			resolvedProxies.push({ flagEmoji, currentDynPath });
 		}
 		const connType = String(user.connection_type || "vless").toLowerCase();
@@ -3360,7 +3391,7 @@ const SubscriptionService = {
 			if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
 			if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
 			const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
-			const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment);
+			const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + buildEarlyDataPathSuffix(user));
 			otherCleanIps.forEach((otherIp, otherIdx) => {
 				const remark = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
 				if (enableVless) {
@@ -3475,6 +3506,7 @@ const SubscriptionService = {
 								utls: { enabled: true, fingerprint: safeFp }
 							};
 						}
+						applySingboxEarlyData(outbound.transport, user);
 						outbounds.push(outbound);
 					}
 					if (enableTrojan) {
@@ -3499,6 +3531,7 @@ const SubscriptionService = {
 								utls: { enabled: true, fingerprint: safeFp }
 							};
 						}
+						applySingboxEarlyData(outbound.transport, user);
 						outbounds.push(outbound);
 					}
 				});
@@ -3528,6 +3561,7 @@ const SubscriptionService = {
 					if (isTlsPort) {
 						outbound.tls = { enabled: true, server_name: sni, insecure: false, utls: { enabled: true, fingerprint: safeFp } };
 					}
+					applySingboxEarlyData(outbound.transport, user);
 					outbounds.push(outbound);
 				}
 				if (enableTrojan) {
@@ -3542,6 +3576,7 @@ const SubscriptionService = {
 					if (isTlsPort) {
 						outbound.tls = { enabled: true, server_name: sni, insecure: false, utls: { enabled: true, fingerprint: safeFp } };
 					}
+					applySingboxEarlyData(outbound.transport, user);
 					outbounds.push(outbound);
 				}
 			});
@@ -11708,7 +11743,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '3.32.8';
+const CURRENT_VERSION = '3.32.9';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
