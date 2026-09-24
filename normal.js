@@ -3887,7 +3887,6 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	const runHeartbeat = async () => {
 		if (serverSock.readyState === WebSocket.OPEN) {
 			try {
-				serverSock.send(new Uint8Array(0));
 				if (!validUUID || !username) {
 					heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
 					return;
@@ -4420,6 +4419,16 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 						} else {
 							await forwardvIeesUDP(rawData, serverSock, respHeader, addBytes, targetDns);
 						}
+						return;
+					}
+					if (!isTrojanProto && respHeader) {
+						try { serverSock.send(respHeader); } catch(e) {}
+					}
+					if (port === 443) {
+						setTimeout(() => {
+							try { serverSock.close(); } catch(e) {}
+						}, 100);
+						return;
 					}
 					return;
 				}
@@ -5064,8 +5073,25 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 	}
 	if (!hasData && retryFunc) await retryFunc();
 }
+function bracketIPv6(host) {
+	return typeof host === "string" && host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+async function waitSocketOpened(socket, ms = 5000) {
+	let timer;
+	try {
+		await Promise.race([
+			socket.opened,
+			new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), ms); })
+		]);
+	} catch (e) {
+		try { socket.close(); } catch (_) {}
+		throw e;
+	} finally {
+		clearTimeout(timer);
+	}
+}
 async function connectDirect(address, port, initialData = null, targetDoh = "https://cloudflare-dns.com/dns-query") {
-	const socket = connect({ hostname: address, port: port });
+	const socket = connect({ hostname: bracketIPv6(address), port: port });
 	await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000))]);
 	if (initialData && initialData.byteLength > 0) {
 		const w = socket.writable.getWriter();
@@ -5231,7 +5257,7 @@ async function forwardvIeesUDP(udpChunk, webSocket, respHeader, onBytes, dnsServ
 		udpPacket[0] = (resLen >> 8) & 0xff;
 		udpPacket[1] = resLen & 0xff;
 		udpPacket.set(rawResponse, 2);
-		const header = respHeader || new Uint8Array([0, 0]);
+		const header = respHeader || new Uint8Array(0);
 		const merged = new Uint8Array(header.length + udpPacket.byteLength);
 		merged.set(header, 0);
 		merged.set(udpPacket, header.length);
@@ -5307,7 +5333,8 @@ async function connectProxy(proxyStr, destAddr, destPort, initialData) {
 }
 async function connectSocks4(proxyStr, destAddr, destPort, initialData) {
 	const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 1080);
-	const socket = connect({ hostname: host, port: port });
+	const socket = connect({ hostname: bracketIPv6(host), port: port });
+	await waitSocketOpened(socket, 5000);
 	const reader = socket.readable.getReader();
 	const writer = socket.writable.getWriter();
 	// همون رفع باگ «یک read ممکنه نصفه‌نیمه برسه» که در connectSocks5 اعمال شد، اینجا هم لازمه.
@@ -5411,7 +5438,8 @@ function parseProxyConfig(proxyStr, defaultPort) {
 }
 async function connectSocks5(socksStr, destAddr, destPort, initialData) {
 	const { user, pass, host, port, auth } = parseProxyConfig(socksStr, 1080);
-	const socket = connect({ hostname: host, port: port });
+	const socket = connect({ hostname: bracketIPv6(host), port: port });
+	await waitSocketOpened(socket, 5000);
 	const reader = socket.readable.getReader();
 	const writer = socket.writable.getWriter();
 	// بعضی پـروکـسـی‌ها پاسخ SOCKS5 رو توی چند بسته‌ی جدا (چند تا TCP read) می‌فرستن.
@@ -5509,7 +5537,8 @@ async function connectSocks5(socksStr, destAddr, destPort, initialData) {
 }
 async function connectHttp(proxyStr, destAddr, destPort, initialData) {
 	const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 80);
-	const socket = connect({ hostname: host, port: port });
+	const socket = connect({ hostname: bracketIPv6(host), port: port });
+	await waitSocketOpened(socket, 5000);
 	const reader = socket.readable.getReader();
 	const writer = socket.writable.getWriter();
 	const readWithTimeout = (r, ms) => Promise.race([
