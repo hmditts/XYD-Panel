@@ -6251,9 +6251,9 @@ Commercial support is available at
 		.zdock {
 			display: inline-flex;
 			align-items: center;
-			gap: 6px;
-			padding: 6px;
-			border-radius: 22px;
+			gap: 5.1px;
+			padding: 5.1px;
+			border-radius: 18.7px;
 			background: linear-gradient(160deg, rgba(255,255,255,0.85), rgba(255,255,255,0.5));
 			border: 1px solid rgba(255,255,255,0.9);
 			box-shadow: 0 14px 32px -14px rgba(67,56,202,0.45), 0 0 0 0.5px rgba(100,116,139,0.14), inset 0 1px 0 rgba(255,255,255,1);
@@ -6267,7 +6267,7 @@ Commercial support is available at
 		}
 		.zdock-sep {
 			width: 1px;
-			height: 24px;
+			height: 20.4px;
 			border-radius: 1px;
 			background: rgba(100,116,139,0.32);
 			margin: 0 1px;
@@ -6276,10 +6276,10 @@ Commercial support is available at
 		.zdock-btn {
 			--c: 79, 70, 229;
 			position: relative;
-			width: 40px;
-			height: 40px;
+			width: 34px;
+			height: 34px;
 			padding: 0;
-			border-radius: 14px;
+			border-radius: 11.9px;
 			display: inline-flex;
 			align-items: center;
 			justify-content: center;
@@ -6297,7 +6297,7 @@ Commercial support is available at
 		.zdock-btn:active { transform: scale(0.92); }
 		.zdock-btn:focus-visible { outline: 2px solid rgba(var(--c), 0.8); outline-offset: 2px; }
 		.zdock-btn:disabled { opacity: 0.55; cursor: wait; transform: none; box-shadow: none; }
-		.zdock-btn svg { width: 21px; height: 21px; }
+		.zdock-btn svg { width: 17.85px; height: 17.85px; }
 		.zb-logout { --c: 225, 29, 72; }
 		.zb-settings { --c: 2, 132, 199; }
 		.zb-theme { --c: 217, 119, 6; }
@@ -11508,7 +11508,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '3.32.3';
+const CURRENT_VERSION = '3.32.4';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
