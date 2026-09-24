@@ -6136,9 +6136,88 @@ Commercial support is available at
 			0%, 100% { stroke-dashoffset: var(--cf-offset); filter: drop-shadow(0 0 0 transparent); }
 			50% { stroke-dashoffset: var(--cf-offset-reach); filter: drop-shadow(0 0 3px currentColor); }
 		}
+		/* ============================================================
+		   تم شیشه‌ای (Glass) - فقط در حالت تاریک؛ بکگراند و کارت‌ها از Sample.html
+		   (بکگراند: سه orb محو و متحرک روی زمینه‌ی تیره - کارت: بلور + saturate + خط نور)
+		   ============================================================ */
+		.ambient { display: none; }
+		.dark .ambient {
+			display: block;
+			position: fixed;
+			inset: 0;
+			z-index: -1;
+			background: #050508;
+			overflow: hidden;
+			pointer-events: none;
+		}
+		.dark .ambient .orb {
+			position: absolute;
+			border-radius: 50%;
+			filter: blur(90px);
+			opacity: 0.65;
+			animation: zyxAmbientFloat 20s ease-in-out infinite alternate;
+		}
+		.dark .ambient .o1 { width: 85vmin; height: 85vmin; top: -25%; right: -30%; background: #1e3a8a; }
+		.dark .ambient .o2 { width: 70vmin; height: 70vmin; bottom: 10%; left: -35%; background: #5b21b6; animation-delay: -8s; }
+		.dark .ambient .o3 { width: 50vmin; height: 50vmin; top: 40%; left: 20%; background: #0e7490; opacity: 0.35; animation-delay: -4s; }
+		@keyframes zyxAmbientFloat { to { transform: translate(4%, 6%) scale(1.08); } }
+		@media (prefers-reduced-motion: reduce) {
+			.dark .ambient .orb { animation: none; }
+		}
+		.dark {
+			--glass-stroke: rgba(255, 255, 255, 0.15);
+			--glass-stroke-soft: rgba(255, 255, 255, 0.06);
+			--glass-specular: rgba(255, 255, 255, 0.28);
+			--glass-fill: rgba(255, 255, 255, 0.045);
+			--glass-shadow: 0 14px 36px rgba(0, 0, 0, 0.4);
+		}
+		.dark #card-cf-requests,
+		.dark #card-traffic,
+		.dark #card-d1-usage,
+		.dark #users-toolbar,
+		.dark .uc-card {
+			background: linear-gradient(145deg, rgba(255,255,255,0.1) 0%, transparent 38%);
+			-webkit-backdrop-filter: blur(40px) saturate(200%) brightness(0.96);
+			backdrop-filter: blur(40px) saturate(200%) brightness(0.96);
+			border: 0.5px solid var(--glass-stroke);
+			box-shadow: var(--glass-shadow), inset 0 1px 0 var(--glass-specular), inset 0 -1px 0 rgba(255,255,255,0.04);
+		}
+		/* کارت کاربران تعدادشان زیاد می‌شود؛ بلور سبک‌تر برای روان‌ماندن اسکرول */
+		.dark .uc-card {
+			-webkit-backdrop-filter: blur(24px) saturate(200%) brightness(0.96);
+			backdrop-filter: blur(24px) saturate(200%) brightness(0.96);
+		}
+		.dark #card-cf-requests:hover { border-color: rgba(251,146,60,0.5); }
+		.dark #card-traffic:hover { border-color: rgba(96,165,250,0.5); }
+		.dark #card-d1-usage:hover { border-color: rgba(192,132,252,0.5); }
+		/* حلقه‌ی نئون روی کارت شیشه‌ای: لایه‌ی ::after مات حذف می‌شود و حلقه‌ی ۲ پیکسلی فقط با clip-path
+		   (بدون mask) از همان ::before بریده می‌شود؛ پس شفافیت شیشه حفظ می‌شود. */
+		.dark .neon-orbit::after { display: none; }
+		.dark .neon-orbit::before {
+			clip-path: polygon(evenodd, 0 0, 100% 0, 100% 100%, 0 100%, 0 0, 2px 2px, 2px calc(100% - 2px), calc(100% - 2px) calc(100% - 2px), calc(100% - 2px) 2px, 2px 2px);
+		}
+		.dark header.z-10 {
+			background: var(--glass-fill);
+			-webkit-backdrop-filter: blur(40px) saturate(200%) brightness(0.96);
+			backdrop-filter: blur(40px) saturate(200%) brightness(0.96);
+			border-color: var(--glass-stroke-soft);
+		}
+		.dark #users-toolbar input,
+		.dark #users-toolbar select {
+			background: var(--glass-fill);
+			border-color: var(--glass-stroke-soft);
+		}
+		.dark #users-toolbar select option { background: #0b0f1a; color: #e4e4e7; }
+		.dark svg.cf-ring-svg .cf-ring-track { color: rgba(255,255,255,0.12); }
+		.dark .uc-actions-overlay { background: rgba(6,8,14,0.94); }
 	</style>
 </head>
 <body class="bg-gray-100 dark:bg-amoled-bg text-gray-900 dark:text-zinc-100 min-h-screen transition-colors duration-200">
+	<div class="ambient" aria-hidden="true">
+		<div class="orb o1"></div>
+		<div class="orb o2"></div>
+		<div class="orb o3"></div>
+	</div>
 	<header class="border-b border-gray-200 dark:border-amoled-border bg-gray-50/95 dark:bg-amoled-card/95 px-4 py-4 relative z-10">
 		<div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-2 md:gap-4">
 			<div class="flex flex-wrap items-center justify-center gap-3 w-full max-w-[260px] mx-auto md:max-w-none md:mx-0 md:w-auto mt-3 md:mt-0">
@@ -6247,24 +6326,20 @@ Commercial support is available at
 					<span class="text-[8px] font-medium text-gray-500 dark:text-zinc-400 mt-1 whitespace-nowrap" dir="ltr">30d</span>
 				</div>
 			</div>
-			<div class="flex items-center justify-center gap-2 mt-1.5">
-				<div class="relative w-11 h-11 shrink-0">
-					<svg class="cf-ring-svg w-11 h-11" viewBox="0 0 40 40">
+			<div class="flex items-center justify-center mt-1.5">
+				<div class="relative w-[52.8px] h-[52.8px] shrink-0">
+					<svg class="cf-ring-svg w-[52.8px] h-[52.8px]" viewBox="0 0 40 40">
 						<circle class="cf-ring-track text-gray-200 dark:text-zinc-800" cx="20" cy="20" r="16" fill="none" stroke-width="3.5"></circle>
 						<circle id="stat-cf-progress" class="cf-ring-bar" cx="20" cy="20" r="16" fill="none" stroke-width="3.5" stroke-dasharray="100.53" style="--cf-offset:100.53; --cf-offset-reach:100.53; stroke-dashoffset:100.53;"></circle>
 					</svg>
-					<span id="stat-cf-progress-pct" class="absolute inset-0 flex items-center justify-center text-[9px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
-				</div>
-				<div class="flex flex-col justify-center gap-1 text-[8px] text-gray-500 dark:text-zinc-400 font-medium">
-					<span dir="ltr">مصرف: <span id="stat-cf-progress-used" class="font-bold text-gray-800 dark:text-zinc-200">0</span></span>
-					<span dir="ltr">سقف: <span class="font-bold text-gray-800 dark:text-zinc-200">100k</span></span>
+					<span id="stat-cf-progress-pct" class="absolute inset-0 flex items-center justify-center text-[10.8px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
 				</div>
 			</div>
 		</div>
 	</div>
 	<div id="card-traffic" onclick="openUsageChart('traffic')" class="neon-orbit neon-orbit-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-sm hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[128px] cursor-pointer">
 		<div id="traffic-card-chart" class="absolute inset-[2px] rounded-[6px] overflow-hidden pointer-events-none"></div>
-		<div class="absolute inset-[2px] rounded-[6px] flex flex-col justify-between p-2.5 bg-gradient-to-b from-white/90 via-white/60 to-white/10 dark:from-amoled-card/90 dark:via-amoled-card/60 dark:to-amoled-card/10">
+		<div class="absolute inset-[2px] rounded-[6px] flex flex-col justify-between p-2.5 bg-gradient-to-b from-white/90 via-white/60 to-white/10 dark:from-black/30 dark:via-black/15 dark:to-transparent">
 			<div class="flex items-center justify-center gap-1.5">
 				<span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap text-center">Traffic</span>
 				<div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0">
@@ -6345,8 +6420,8 @@ Commercial support is available at
 					<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
 				</div>
 			</div>
-			<div class="flex items-center gap-2 w-full md:w-auto flex-wrap">
-				<select id="filter-status" onchange="filterAndRenderUsers()" class="w-full md:w-auto shrink-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
+			<div class="grid grid-cols-1 md:grid-cols-2 gap-2 w-full md:w-auto">
+				<select id="filter-status" onchange="filterAndRenderUsers()" class="w-full min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
 					<option value="all">🔍 همه</option>
 					<option value="active">✅ فعال</option>
 					<option value="inactive">❌ غیرفعال</option>
@@ -6354,7 +6429,7 @@ Commercial support is available at
 					<option value="offline">💤 آفلاین</option>
 					<option value="expired">⏳ منقضی</option>
 				</select>
-				<select id="sort-users" onchange="filterAndRenderUsers()" class="w-auto shrink-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
+				<select id="sort-users" onchange="filterAndRenderUsers()" class="w-full min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
 					<option value="newest">📅 جدیدترین</option>
 					<option value="name">🔤 نام کاربری (الفبا)</option>
 					<option value="usage-desc" selected>📊 بیشترین مصرف</option>
@@ -8596,7 +8671,6 @@ let activeRocketBtn = null;
 					cfRing.style.setProperty('--cf-offset-reach', cfCirc - (cfCirc * progressPercentReach / 100));
 				}
 				document.getElementById('stat-cf-progress-pct').innerText = progressPercent.toFixed(0) + '٪';
-				document.getElementById('stat-cf-progress-used').innerText = formatReqShort(cfRequests);
 				filterAndRenderUsers();
 			} catch (err) {
 				document.getElementById('loading-state').innerHTML = '<span class="text-red-500">خطا در پردازش اطلاعات کاربران</span>';
@@ -11383,7 +11457,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '3.32.1';
+const CURRENT_VERSION = '3.32.2';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
