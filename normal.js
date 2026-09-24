@@ -532,6 +532,12 @@ const NEW_USER_DEFAULTS_FALLBACK = {
 	new_user_auto_rotate_ip: "0",
 	new_user_start_on_first_connect: "0",
 	new_user_connection_type: "vless",
+	// Early Data (فاز ۱ از تغییر ed=): پیش‌فرض *خاموش* (new_user_early_data_enabled: "0")
+	// تا فاز ۳ (پشتیبانی واقعی سمت handlevIees از هدر Sec-WebSocket-Protocol) کامل نشده،
+	// هیچ لینکی ed= تبلیغ نکنه. new_user_early_data_size بایت early data است (مقدار
+	// پیشنهادی 2560، حداکثر معقول 8192 طبق مستندات xray/sing-box WS early data).
+	new_user_early_data_enabled: "0",
+	new_user_early_data_size: "2560",
 };
 // فقط این دو کلید مجازند خالی ذخیره شوند (خالی = فرگمنت خاموش)؛ برای بقیه، مقدار
 // خالی/نامعتبر یعنی «از NEW_USER_DEFAULTS_FALLBACK استفاده کن».
@@ -540,6 +546,9 @@ const NEW_USER_TLS_PORTS = ["443", "2053", "2083", "2087", "2096", "8443"];
 // Same list as the Fingerprint <select> of the panel (fingerprint-select / nud-fingerprint) — the only
 // values POST /api/settings/bulk accepts when it is asked to write a fingerprint onto existing users.
 const NEW_USER_FINGERPRINTS = ["chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized", "unsafe"];
+// Early Data (ed=): سقف مجاز سایز (بایت) برای new_user_early_data_size وقتی POST /api/settings/bulk قراره اون رو روی
+// کاربرهای *موجود* بنویسه؛ همون ۸۱۹۲ که توی مستندات xray/sing-box برای WS early data حداکثره.
+const EARLY_DATA_MAX_SIZE = 8192;
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
 // runs automatically for every user right after the admin saves the pinned
@@ -1406,6 +1415,8 @@ const Router = {
 				start_on_first_connect: user.start_on_first_connect,
 				first_connection_time: user.first_connection_time,
 				enable_direct: user.enable_direct !== 0 ? 1 : 0,
+				early_data_enabled: Number(user.early_data_enabled) === 1 ? 1 : 0,
+				early_data_size: user.early_data_size,
 			});
 			const html = HTML_TEMPLATES.status.replace("/* {{USER_DATA_PLACEHOLDER}} */", `window.statusUser = ${userJson}; window.INLINE_PROXY_IP = ${JSON.stringify(inlineProxyIpForStatusPage)}; window.OTHER_CLEAN_IPS = ${JSON.stringify(otherCleanIpsForStatusPage)};`);
 			const finalHtml = html + "\n<!-- HIDDEN_CONFIGS -->\n<div style='display:none; white-space:pre-wrap;'>\n" + plainLinks + "\n</div>";
@@ -1862,6 +1873,7 @@ const Router = {
 				const body = await readJsonBody(request);
 				let unpinRemoval = { countries: [], usersUpdated: 0 };
 				let fragApplied = false;
+				let earlyDataApplied = false;
 				let userLimitApplied = false;
 				let fingerprintApplied = false;
 				let connTypeApplied = false;
@@ -1946,6 +1958,28 @@ const Router = {
 						const ctFinal = ["vless", "trojan"].filter((x) => ctParts.includes(x));
 						if (ctFinal.length > 0) overrideConnType = ctFinal.join(",");
 					}
+					// «Early Data» (new_user_early_data_enabled / new_user_early_data_size): مثل فرگمنت،
+					// این دو کلید هم فقط پیش‌فرضِ کاربر *تازه‌ساز*ند؛ لینک‌ها از ستون‌های
+					// early_data_enabled/early_data_size خودِ هر کاربر ساخته می‌شوند، نه از settings. فقط وقتی
+					// فراخواننده صریحاً apply_early_data_to_existing_users: true بفرستد (فلگ بیرون از
+					// body.settings، مثل apply_frag_to_existing_users) هر دو مقدار روی ستون‌های همه‌ی کاربرهای
+					// *موجود* هم نوشته می‌شود. «ذخیره‌ی تنظیمات» همین پنل این فلگ را فقط وقتی می‌فرستد که
+					// چک‌باکس «اعمال روی کاربرهای موجود» تیک خورده باشد. هر دو کلید باید در درخواست باشند؛
+					// enabled فقط "0"/"1" و size فقط عدد صحیح 1..EARLY_DATA_MAX_SIZE؛ مقدار نامعتبر = نادیده
+					// گرفته می‌شود (و چون early_data_applied برنمی‌گردد، فراخواننده آن را به‌عنوان خطا می‌بیند).
+					let overrideEarlyData = undefined;
+					if (
+						body.apply_early_data_to_existing_users === true &&
+						Object.prototype.hasOwnProperty.call(body.settings, "new_user_early_data_enabled") &&
+						Object.prototype.hasOwnProperty.call(body.settings, "new_user_early_data_size")
+					) {
+						const edEnabledRaw = String(body.settings.new_user_early_data_enabled == null ? "" : body.settings.new_user_early_data_enabled).trim();
+						const edSizeRaw = String(body.settings.new_user_early_data_size == null ? "" : body.settings.new_user_early_data_size).trim();
+						const edSize = /^[0-9]+$/.test(edSizeRaw) ? parseInt(edSizeRaw, 10) : NaN;
+						if ((edEnabledRaw === "0" || edEnabledRaw === "1") && edSize >= 1 && edSize <= EARLY_DATA_MAX_SIZE) {
+							overrideEarlyData = { enabled: edEnabledRaw === "1" ? 1 : 0, size: edSize };
+						}
+					}
 					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
 					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
 					// «لیست لوکیشن‌های پین‌شده»: اگه این کلید توی همین درخواست هست، لیست قبلی رو
@@ -1992,6 +2026,10 @@ const Router = {
 						await env.DB.prepare("UPDATE users SET frag_len = ?, frag_int = ?").bind(overrideFrag.len, overrideFrag.int).run();
 						fragApplied = true;
 					}
+					if (overrideEarlyData !== undefined) {
+						await env.DB.prepare("UPDATE users SET early_data_enabled = ?, early_data_size = ?").bind(overrideEarlyData.enabled, overrideEarlyData.size).run();
+						earlyDataApplied = true;
+					}
 					if (overrideFingerprint !== undefined) {
 						await env.DB.prepare("UPDATE users SET fingerprint = ?").bind(overrideFingerprint).run();
 						fingerprintApplied = true;
@@ -2008,7 +2046,7 @@ const Router = {
 						} catch (e) { /* best-effort: the cache expires by itself within seconds */ }
 					}
 				}
-				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, early_data_applied: earlyDataApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/settings/sync-vip-proxies") {
@@ -2734,6 +2772,12 @@ const DbService = {
 					{ name: "device_warning_at", def: "INTEGER DEFAULT NULL" },
 					{ name: "device_warning_peak_count", def: "INTEGER DEFAULT NULL" },
 					{ name: "device_warning_streak", def: "INTEGER DEFAULT 0" },
+					// Early Data (فاز ۱): ستون‌های خام کاربر. تا فاز ۲ (POST/PUT /api/users و
+					// SubscriptionService) این دو ستون رو نمی‌خونه/نمی‌نویسه؛ فقط با DEFAULT
+					// ساخته می‌شن تا کاربرهای موجود هم early_data_enabled=0 داشته باشن (نه NULL)
+					// و شرط‌های آینده (user.early_data_enabled) بدون نیاز به fallback جدا درست کار کنن.
+					{ name: "early_data_enabled", def: "INTEGER DEFAULT 0" },
+					{ name: "early_data_size", def: "INTEGER DEFAULT 2560" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
@@ -7153,6 +7197,31 @@ Commercial support is available at
 								</div>
 							</div>
 							
+							<div class="border border-sky-200 dark:border-amoled-border rounded-xl overflow-hidden shadow-sm">
+								<div class="flex items-center justify-between p-3.5 bg-sky-50/60 dark:bg-amoled-input/30 cursor-pointer" onclick="document.getElementById('input-early-data-toggle').click()">
+									<div class="flex items-center gap-2">
+										<svg class="w-4 h-4 text-sky-600 dark:text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 5l7 7-7 7M5 5l7 7-7 7"></path></svg>
+										<div>
+											<span class="text-xs font-black text-sky-900 dark:text-sky-300">Early Data (ed=)</span>
+											<span class="text-[10px] text-gray-500 dark:text-zinc-400 block font-normal mt-0.5">ارسال اولین بسته همراه هندشیک WebSocket؛ اتصال سریع‌تر (یک رفت‌وبرگشت کمتر)</span>
+										</div>
+									</div>
+									<div class="flex items-center gap-2" onclick="event.stopPropagation()">
+										<label class="relative inline-flex items-center cursor-pointer select-none">
+											<input type="checkbox" id="input-early-data-toggle" onchange="toggleEarlyDataInputs(this.checked)" class="sr-only peer">
+											<div class="w-10 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-sky-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[20px]"></div>
+										</label>
+									</div>
+								</div>
+								<div id="early-data-inputs-container" class="hidden opacity-50 pointer-events-none p-4 border-t border-sky-100 dark:border-amoled-border">
+									<label class="block text-[10px] font-bold text-gray-600 dark:text-zinc-300 mb-1 flex items-center justify-between">
+										<span>سایز Early Data (بایت)</span>
+										<span class="text-[9px] text-gray-400">پیشنهادی ۲۵۶۰ | حداکثر ۸۱۹۲</span>
+									</label>
+									<input type="text" inputmode="numeric" id="input-early-data-size" value="2560" dir="ltr" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-sky-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition shadow-sm">
+								</div>
+							</div>
+							
 							<div class="border border-purple-200 dark:border-amoled-border rounded-xl overflow-hidden shadow-sm">
 								<div class="flex items-center justify-between p-3.5 bg-purple-50/60 dark:bg-amoled-input/30 cursor-pointer" onclick="document.getElementById('input-advanced-settings-toggle').click()">
 									<div class="flex items-center gap-2">
@@ -7697,7 +7766,7 @@ Commercial support is available at
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🆕 پیش‌فرض کاربر جدید</h5>
-					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mb-3">مقدارهایی که فرم «ایجاد کاربر جدید»، Import Users و کاربرهایی که از پنل مادر (API) ساخته می‌شن به‌صورت پیش‌فرض می‌گیرن. روی کاربرهای موجود اثری نداره. پورت و آیپی تمیز از بخش‌های بالا خونده می‌شن.</p>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mb-3">مقدارهایی که فرم «ایجاد کاربر جدید»، Import Users و کاربرهایی که از پنل مادر (API) ساخته می‌شن به‌صورت پیش‌فرض می‌گیرن. روی کاربرهای موجود اثری نداره (به‌جز Early Data که با تیک پایین همین بخش می‌شه روی کاربرهای موجود هم اعمال کرد). پورت و آیپی تمیز از بخش‌های بالا خونده می‌شن.</p>
 					<div class="grid grid-cols-2 gap-3">
 						<div>
 							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">Fingerprint</label>
@@ -7748,6 +7817,17 @@ Commercial support is available at
 							<input type="text" id="nud-frag-int" dir="ltr" placeholder="خالی = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 						</div>
 						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">Early Data (ed=)</label>
+							<select id="nud-early-data-enabled" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">سایز Early Data (بایت)</label>
+							<input type="number" id="nud-early-data-size" dir="ltr" min="1" max="8192" step="1" placeholder="2560" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
 							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">اتصال مستقیم</label>
 							<select id="nud-enable-direct" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
 								<option value="1">روشن</option>
@@ -7790,6 +7870,10 @@ Commercial support is available at
 							</select>
 						</div>
 					</div>
+					<label class="mt-3 flex items-start gap-2 cursor-pointer">
+						<input type="checkbox" id="nud-apply-early-data-existing" class="w-4 h-4 mt-0.5 rounded focus:ring-green-500/50 bg-white dark:bg-amoled-input border-gray-300 dark:border-amoled-border cursor-pointer text-green-600" style="filter: none !important; accent-color: #16a34a !important;">
+						<span class="text-[11px] text-gray-600 dark:text-zinc-400">اعمال Early Data (روشن/خاموش + سایز) روی کاربرهای موجود هم <span class="text-gray-400 dark:text-zinc-500">— فقط برای همین بار ذخیره؛ تنظیم Early Data همه‌ی کاربرها با مقدار بالا جایگزین می‌شه.</span></span>
+					</label>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🔐 امنیت و یکپارچه‌سازی</h5>
@@ -8385,6 +8469,15 @@ ${COMMON_TOAST_HTML}
 				}
 			}
 		};
+		window.toggleEarlyDataInputs = function(show) {
+			const container = document.getElementById('early-data-inputs-container');
+			if (!container) return;
+			if (show) {
+				container.classList.remove('hidden', 'opacity-50', 'pointer-events-none');
+			} else {
+				container.classList.add('hidden', 'opacity-50', 'pointer-events-none');
+			}
+		};
 		window.switchUserTab = function(tabId) {
 			const tabs = [
 				{ id: 'tab-user-info', btn: 'tab-btn-user-info' },
@@ -8449,6 +8542,11 @@ ${COMMON_TOAST_HTML}
 				const fragToggle = document.getElementById('input-frag-toggle');
 				if (fragToggle) fragToggle.checked = false;
 				if (typeof window.toggleFragInputs === 'function') window.toggleFragInputs(false);
+				const edToggleReset = document.getElementById('input-early-data-toggle');
+				if (edToggleReset) edToggleReset.checked = false;
+				const edSizeReset = document.getElementById('input-early-data-size');
+				if (edSizeReset) edSizeReset.value = '2560';
+				if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(false);
 				const customPortInput = document.getElementById('input-custom-ports');
 				if (customPortInput) customPortInput.value = '';
 				const advFragInput = document.getElementById('input-advanced-frag');
@@ -8513,6 +8611,11 @@ let activeRocketBtn = null;
 			if (fragOn && fragLenInput && nud.frag_len !== '') fragLenInput.value = nud.frag_len;
 			if (fragOn && fragIntInput && nud.frag_int !== '') fragIntInput.value = nud.frag_int;
 			if (typeof window.toggleFragInputs === 'function') window.toggleFragInputs(fragOn);
+			const edToggle = document.getElementById('input-early-data-toggle');
+			if (edToggle) edToggle.checked = nud.early_data_enabled;
+			const edSizeInput = document.getElementById('input-early-data-size');
+			if (edSizeInput) edSizeInput.value = String(nud.early_data_size);
+			if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(nud.early_data_enabled);
 			const autoResetOn = nud.auto_reset_vol_days > 0 || nud.auto_reset_req_days > 0;
 			const autoResetToggle = document.getElementById('input-auto-reset-toggle');
 			if (autoResetToggle) autoResetToggle.checked = autoResetOn;
@@ -9396,6 +9499,8 @@ let activeRocketBtn = null;
 			const advanced_frag = (isAdvancedSettingsOn && document.getElementById('input-advanced-frag')) ? document.getElementById('input-advanced-frag').value.trim() : "";
 			const cipher_suites = (isAdvancedSettingsOn && document.getElementById('input-cipher-suites')) ? document.getElementById('input-cipher-suites').value.trim() : "";
 			const tls_mask = (isAdvancedSettingsOn && document.getElementById('input-tls-mask')) ? document.getElementById('input-tls-mask').value.trim() : "";
+			const early_data_enabled = (document.getElementById('input-early-data-toggle') && document.getElementById('input-early-data-toggle').checked) ? 1 : 0;
+			const early_data_size = Math.min(8192, Math.max(1, parseInt(document.getElementById('input-early-data-size') ? document.getElementById('input-early-data-size').value : '', 10) || 2560));
 			const isAutoReset = document.getElementById('input-auto-reset-toggle').checked;
 			const auto_reset_vol_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-vol').value) || 0 : 0;
 			const auto_reset_req_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-req').value) || 0 : 0;
@@ -9434,6 +9539,7 @@ let activeRocketBtn = null;
 					body: JSON.stringify({ 
 						username, uuid, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int,
 						advanced_frag: advanced_frag || null, cipher_suites: cipher_suites || null, tls_mask: tls_mask || null,
+						early_data_enabled: early_data_enabled, early_data_size: early_data_size,
 						user_proxy_iata: null,
 						user_socks5: userSocks5 || null,
 						reset_user_to_default: isEditMode && window.resetUserToDefaultPending === true,
@@ -10036,6 +10142,14 @@ function downloadZeusSource() {
 			}
 			var ports = String(user.port || '443').split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
 			var fp = user.fingerprint || 'chrome';
+			// Early Data (ed=): همان منطق سمت سرور (SubscriptionService.generateText) و صفحه‌ی Status - فقط وقتی
+			// early_data_enabled روشن باشد، ?ed=<size> به انتهای path اضافه می‌شود (قبل از encodeURIComponent)؛
+			// سایز نامعتبر (خارج از 1..8192) = 2560. خاموش/نبودن فیلد = path دقیقاً مثل قبل.
+			let edSuffix = "";
+			if (Number(user.early_data_enabled) === 1) {
+				const edSizeRaw = parseInt(user.early_data_size, 10);
+				edSuffix = "?ed=" + ((edSizeRaw >= 1 && edSizeRaw <= 8192) ? edSizeRaw : 2560);
+			}
 			const links = [];
 			let remVol = "Unlimited";
 			if (user.limit_gb) {
@@ -10147,7 +10261,7 @@ function downloadZeusSource() {
 				} else if (proxyStr && proxyFlagCache[proxyStr] && typeof getFlagEmojiText === 'function') {
 					flagEmoji = getFlagEmojiText(proxyFlagCache[proxyStr]);
 				}
-				const currentDynPath = encodeURIComponent(rawPath + ((proxyItem !== null && proxyItem !== "") ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment));
+				const currentDynPath = encodeURIComponent(rawPath + ((proxyItem !== null && proxyItem !== "") ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment) + edSuffix);
 				resolvedProxies.push({ flagEmoji, currentDynPath });
 			}
 			const userConnType = String(user.connection_type || 'vless').toLowerCase();
@@ -10188,7 +10302,7 @@ function downloadZeusSource() {
 				if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
 				if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
 				const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
-				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment);
+				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + edSuffix);
 				otherCleanIps.forEach(function(otherIp, otherIdx) {
 					const remark = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
 					if (enableVless) {
@@ -10341,6 +10455,13 @@ function populateUserFormFields(user) {
 	const fragToggle = document.getElementById('input-frag-toggle');
 	if (fragToggle) fragToggle.checked = hasFrag;
 	if (typeof window.toggleFragInputs === 'function') window.toggleFragInputs(hasFrag);
+	const edUserOn = Number(user.early_data_enabled) === 1;
+	const edUserSize = parseInt(user.early_data_size, 10);
+	const edToggleEdit = document.getElementById('input-early-data-toggle');
+	if (edToggleEdit) edToggleEdit.checked = edUserOn;
+	const edSizeEdit = document.getElementById('input-early-data-size');
+	if (edSizeEdit) edSizeEdit.value = String((edUserSize >= 1 && edUserSize <= 8192) ? edUserSize : 2560);
+	if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(edUserOn);
 	const advFragInput = document.getElementById('input-advanced-frag');
 	if (advFragInput) advFragInput.value = user.advanced_frag || '';
 	const csInput = document.getElementById('input-cipher-suites');
@@ -10832,7 +10953,9 @@ window.NEW_USER_DEFAULTS_FALLBACK = {
 	new_user_ip_count: '999999', // no count cap
 	new_user_auto_rotate_ip: '0',
 	new_user_start_on_first_connect: '0',
-	new_user_connection_type: 'vless'
+	new_user_connection_type: 'vless',
+	new_user_early_data_enabled: '0',
+	new_user_early_data_size: '2560'
 };
 window.NEW_USER_DEFAULTS = Object.assign({}, window.NEW_USER_DEFAULTS_FALLBACK);
 window.NEW_USER_INPUT_IDS = {
@@ -10849,7 +10972,9 @@ window.NEW_USER_INPUT_IDS = {
 	new_user_ip_count: 'nud-ip-count',
 	new_user_auto_rotate_ip: 'nud-auto-rotate-ip',
 	new_user_start_on_first_connect: 'nud-start-on-first-connect',
-	new_user_connection_type: 'nud-connection-type'
+	new_user_connection_type: 'nud-connection-type',
+	new_user_early_data_enabled: 'nud-early-data-enabled',
+	new_user_early_data_size: 'nud-early-data-size'
 };
 window.NEW_USER_EMPTY_OK = { new_user_frag_len: true, new_user_frag_int: true };
 window.fillNewUserDefaultsInputs = function() {
@@ -10859,6 +10984,9 @@ window.fillNewUserDefaultsInputs = function() {
 		const v = window.NEW_USER_DEFAULTS[k];
 		el.value = (k === 'new_user_auto_reset_vol_days' || k === 'new_user_auto_reset_req_days') && (parseInt(v) || 0) <= 0 ? '0' : v;
 	});
+	// چک‌باکس «اعمال روی کاربرهای موجود» هیچ‌وقت ماندگار نیست: هر بار که فرم پر می‌شود (باز شدن Settings / بعد از ذخیره) خاموش برمی‌گردد.
+	const applyEdEl = document.getElementById('nud-apply-early-data-existing');
+	if (applyEdEl) applyEdEl.checked = false;
 };
 window.loadNewUserDefaultsSetting = async function() {
 	let data = null;
@@ -10891,6 +11019,8 @@ window.collectNewUserDefaultsFromInputs = function() {
 			v = String(Math.max(0, parseInt(v) || 0));
 		} else if (k === 'new_user_ip_count') {
 			v = String(Math.max(1, parseInt(v) || parseInt(window.NEW_USER_DEFAULTS_FALLBACK[k])));
+		} else if (k === 'new_user_early_data_size') {
+			v = String(Math.min(8192, Math.max(1, parseInt(v) || parseInt(window.NEW_USER_DEFAULTS_FALLBACK[k]))));
 		} else if (v === '' && !window.NEW_USER_EMPTY_OK[k]) {
 			v = window.NEW_USER_DEFAULTS_FALLBACK[k];
 		}
@@ -10918,6 +11048,8 @@ window.getNewUserDefaultsTyped = function() {
 		ip_count: Math.max(1, toInt(d.new_user_ip_count, 15)),
 		auto_rotate_ip: d.new_user_auto_rotate_ip === '1',
 		start_on_first_connect: d.new_user_start_on_first_connect === '1',
+		early_data_enabled: d.new_user_early_data_enabled === '1',
+		early_data_size: (function() { const n = parseInt(d.new_user_early_data_size, 10); return (n >= 1 && n <= 8192) ? n : 2560; })(),
 		connection_type: protocols.join(','),
 		protocols: protocols
 	};
@@ -10976,12 +11108,14 @@ window.saveSettings = async function() {
 	const defaultPortParsed = defaultPortInput ? parseInt(defaultPortInput.value) : NaN;
 	const defaultPortVal = (!isNaN(defaultPortParsed) && defaultPortParsed > 0 && defaultPortParsed <= 65535) ? String(defaultPortParsed) : window.DEFAULT_PORT_SETTING_FALLBACK;
 	const nudSettings = window.collectNewUserDefaultsFromInputs();
+	const applyEarlyDataEl = document.getElementById('nud-apply-early-data-existing');
+	const applyEarlyData = !!(applyEarlyDataEl && applyEarlyDataEl.checked);
 
 	const buttons = [document.getElementById('save-settings-btn'), document.getElementById('save-settings-fab-btn')].filter(Boolean);
 	buttons.forEach(function(b) { b.disabled = true; });
 
 	try {
-		await fetch('/api/settings/bulk', {
+		const saveRes = await fetch('/api/settings/bulk', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
@@ -10993,9 +11127,12 @@ window.saveSettings = async function() {
 					other_clean_ips: otherIpsVal,
 					inline_proxy_ip: proxyIpVal,
 					default_port: defaultPortVal
-				}, nudSettings)
+				}, nudSettings),
+				apply_early_data_to_existing_users: applyEarlyData
 			})
 		});
+		let saveData = null;
+		try { saveData = await saveRes.json(); } catch (e) {}
 		window.GLOBAL_CLEAN_IP = cleanIpVal;
 		window.GLOBAL_REQ_LIMIT = reqLimitVal;
 		window.USER_LIMIT = userLimitVal;
@@ -11014,6 +11151,13 @@ window.saveSettings = async function() {
 		if (defaultPortInput) defaultPortInput.value = defaultPortVal;
 		if (typeof renderPortCheckboxes === 'function') renderPortCheckboxes();
 		showToast('✅ تنظیمات ذخیره شد؛ پورت همه‌ی کاربرها روی ' + defaultPortVal + ' و محدودیت کاربر روی ' + userLimitVal + ' ست شد.');
+		if (applyEarlyData) {
+			if (saveData && saveData.early_data_applied) {
+				showToast('✅ Early Data روی همه‌ی کاربرهای موجود هم اعمال شد.');
+			} else {
+				showToast('⚠️ تنظیمات ذخیره شد ولی اعمال Early Data روی کاربرهای موجود انجام نشد (نسخه‌ی پنل قدیمیه یا مقدار نامعتبره).', 'error');
+			}
+		}
 		toggleSettingsModal(false);
 		if (typeof loadUsers === 'function') await loadUsers(true);
 	} catch (e) {
@@ -11434,6 +11578,8 @@ async function testUserSocksProxy() {
 							advanced_frag: u.advanced_frag,
 							cipher_suites: u.cipher_suites,
 							tls_mask: u.tls_mask,
+							early_data_enabled: u.early_data_enabled,
+							early_data_size: u.early_data_size,
 							user_proxy_iata: u.user_proxy_iata,
 							user_socks5: u.user_socks5,
 							user_proxy_ip: u.user_proxy_ip,
@@ -11537,7 +11683,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '3.32.4';
+const CURRENT_VERSION = '3.32.7';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
@@ -12877,6 +13023,14 @@ ${COMMON_TOAST_HTML}
 			}
 			var ports = String(u.port || '443').split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
 			var fp = u.fingerprint || 'chrome';
+			// Early Data (ed=): همان منطق سمت سرور (SubscriptionService.generateText) و صفحه‌ی Status - فقط وقتی
+			// early_data_enabled روشن باشد، ?ed=<size> به انتهای path اضافه می‌شود (قبل از encodeURIComponent)؛
+			// سایز نامعتبر (خارج از 1..8192) = 2560. خاموش/نبودن فیلد = path دقیقاً مثل قبل.
+			let edSuffix = "";
+			if (Number(u.early_data_enabled) === 1) {
+				const edSizeRaw = parseInt(u.early_data_size, 10);
+				edSuffix = "?ed=" + ((edSizeRaw >= 1 && edSizeRaw <= 8192) ? edSizeRaw : 2560);
+			}
 			const links = [];
 			let remVol = "Unlimited";
 			if (u.limit_gb) {
@@ -12988,7 +13142,7 @@ ${COMMON_TOAST_HTML}
 				} else if (proxyStr && proxyFlagCache[proxyStr] && typeof getFlagEmojiText === 'function') {
 					flagEmoji = getFlagEmojiText(proxyFlagCache[proxyStr]);
 				}
-				const currentDynPath = encodeURIComponent(rawPath + ((proxyItem !== null && proxyItem !== "") ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment));
+				const currentDynPath = encodeURIComponent(rawPath + ((proxyItem !== null && proxyItem !== "") ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment) + edSuffix);
 				resolvedProxies.push({ flagEmoji, currentDynPath });
 			}
 			const userConnType = String(u.connection_type || 'vless').toLowerCase();
@@ -13029,7 +13183,7 @@ ${COMMON_TOAST_HTML}
 				if (isTlsPort && u.cipher_suites) userFrag += "&cs=" + encodeURIComponent(u.cipher_suites);
 				if (u.tls_mask) userFrag += "&mask=" + encodeURIComponent(u.tls_mask);
 				const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
-				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment);
+				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + edSuffix);
 				otherCleanIps.forEach(function(otherIp, otherIdx) {
 					const remark = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
 					if (enableVless) {
