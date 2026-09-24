@@ -11939,7 +11939,7 @@ function applySelectedIps() {
 			}, 36000000);
 			
 			const versionBadge = document.getElementById('panel-version');
-			if (versionBadge) versionBadge.innerText = 'v' + CURRENT_VERSION;
+			if (versionBadge) versionBadge.innerText = 'v' + CURRENT_VERSION + ' beta';
 			renderPortCheckboxes();
 			initVipCache();
 			loadUsers();
