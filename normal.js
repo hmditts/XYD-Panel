@@ -6137,33 +6137,73 @@ Commercial support is available at
 			50% { stroke-dashoffset: var(--cf-offset-reach); filter: drop-shadow(0 0 3px currentColor); }
 		}
 		/* ============================================================
-		   تم شیشه‌ای (Glass) - فقط در حالت تاریک؛ بکگراند و کارت‌ها از Sample.html
-		   (بکگراند: سه orb محو و متحرک روی زمینه‌ی تیره - کارت: بلور + saturate + خط نور)
+		   تم شیشه‌ای (Glass) - هم حالت تاریک (برگرفته از Sample.html) و هم حالت روشن
+		   بکگراند: سه orb محو و متحرک روی زمینه (تاریک: رنگ‌های عمیق / روشن: رنگ‌های پاستلی)
+		   کارت: بلور + saturate + خط نور
 		   ============================================================ */
-		.ambient { display: none; }
-		.dark .ambient {
-			display: block;
+		.ambient {
 			position: fixed;
 			inset: 0;
 			z-index: -1;
-			background: #050508;
+			background: #f2f5fc;
 			overflow: hidden;
 			pointer-events: none;
 		}
-		.dark .ambient .orb {
+		.ambient .orb {
 			position: absolute;
 			border-radius: 50%;
 			filter: blur(90px);
-			opacity: 0.65;
+			opacity: 0.7;
 			animation: zyxAmbientFloat 20s ease-in-out infinite alternate;
 		}
-		.dark .ambient .o1 { width: 85vmin; height: 85vmin; top: -25%; right: -30%; background: #1e3a8a; }
-		.dark .ambient .o2 { width: 70vmin; height: 70vmin; bottom: 10%; left: -35%; background: #5b21b6; animation-delay: -8s; }
-		.dark .ambient .o3 { width: 50vmin; height: 50vmin; top: 40%; left: 20%; background: #0e7490; opacity: 0.35; animation-delay: -4s; }
+		.ambient .o1 { width: 85vmin; height: 85vmin; top: -25%; right: -30%; background: #93c5fd; }
+		.ambient .o2 { width: 70vmin; height: 70vmin; bottom: 10%; left: -35%; background: #c4b5fd; animation-delay: -8s; }
+		.ambient .o3 { width: 50vmin; height: 50vmin; top: 40%; left: 20%; background: #67e8f9; opacity: 0.45; animation-delay: -4s; }
+		.dark .ambient { background: #050508; }
+		.dark .ambient .o1 { background: #1e3a8a; opacity: 0.65; }
+		.dark .ambient .o2 { background: #5b21b6; opacity: 0.65; }
+		.dark .ambient .o3 { background: #0e7490; opacity: 0.35; }
 		@keyframes zyxAmbientFloat { to { transform: translate(4%, 6%) scale(1.08); } }
 		@media (prefers-reduced-motion: reduce) {
-			.dark .ambient .orb { animation: none; }
+			.ambient .orb { animation: none; }
 		}
+		/* ---- کارت‌های شیشه‌ای: حالت روشن ---- */
+		#card-cf-requests,
+		#card-traffic,
+		#card-d1-usage,
+		#users-toolbar,
+		.uc-card {
+			background: linear-gradient(145deg, rgba(255,255,255,0.82) 0%, rgba(255,255,255,0.42) 100%);
+			-webkit-backdrop-filter: blur(40px) saturate(180%);
+			backdrop-filter: blur(40px) saturate(180%);
+			border: 1px solid rgba(255,255,255,0.8);
+			box-shadow: 0 12px 32px -14px rgba(51,65,130,0.32), 0 0 0 0.5px rgba(100,116,139,0.14), inset 0 1px 0 rgba(255,255,255,0.95);
+		}
+		.uc-card {
+			-webkit-backdrop-filter: blur(24px) saturate(180%);
+			backdrop-filter: blur(24px) saturate(180%);
+		}
+		#card-cf-requests:hover { border-color: rgba(251,146,60,0.6); }
+		#card-traffic:hover { border-color: rgba(96,165,250,0.6); }
+		#card-d1-usage:hover { border-color: rgba(192,132,252,0.6); }
+		/* حلقه‌ی نئون روی کارت شیشه‌ای: لایه‌ی ::after مات حذف می‌شود و حلقه‌ی ۲ پیکسلی فقط با clip-path
+		   (بدون mask) از همان ::before بریده می‌شود؛ پس شفافیت شیشه حفظ می‌شود. */
+		.neon-orbit::after { display: none; }
+		.neon-orbit::before {
+			clip-path: polygon(evenodd, 0 0, 100% 0, 100% 100%, 0 100%, 0 0, 2px 2px, 2px calc(100% - 2px), calc(100% - 2px) calc(100% - 2px), calc(100% - 2px) 2px, 2px 2px);
+		}
+		header.z-10 {
+			background: linear-gradient(180deg, rgba(255,255,255,0.7), rgba(255,255,255,0.45));
+			-webkit-backdrop-filter: blur(40px) saturate(180%);
+			backdrop-filter: blur(40px) saturate(180%);
+			border-color: rgba(255,255,255,0.8);
+		}
+		#users-toolbar input,
+		#users-toolbar select {
+			background: rgba(255,255,255,0.6);
+			border-color: rgba(148,163,184,0.35);
+		}
+		/* ---- کارت‌های شیشه‌ای: حالت تاریک ---- */
 		.dark {
 			--glass-stroke: rgba(255, 255, 255, 0.15);
 			--glass-stroke-soft: rgba(255, 255, 255, 0.06);
@@ -6190,12 +6230,6 @@ Commercial support is available at
 		.dark #card-cf-requests:hover { border-color: rgba(251,146,60,0.5); }
 		.dark #card-traffic:hover { border-color: rgba(96,165,250,0.5); }
 		.dark #card-d1-usage:hover { border-color: rgba(192,132,252,0.5); }
-		/* حلقه‌ی نئون روی کارت شیشه‌ای: لایه‌ی ::after مات حذف می‌شود و حلقه‌ی ۲ پیکسلی فقط با clip-path
-		   (بدون mask) از همان ::before بریده می‌شود؛ پس شفافیت شیشه حفظ می‌شود. */
-		.dark .neon-orbit::after { display: none; }
-		.dark .neon-orbit::before {
-			clip-path: polygon(evenodd, 0 0, 100% 0, 100% 100%, 0 100%, 0 0, 2px 2px, 2px calc(100% - 2px), calc(100% - 2px) calc(100% - 2px), calc(100% - 2px) 2px, 2px 2px);
-		}
 		.dark header.z-10 {
 			background: var(--glass-fill);
 			-webkit-backdrop-filter: blur(40px) saturate(200%) brightness(0.96);
@@ -6210,6 +6244,70 @@ Commercial support is available at
 		.dark #users-toolbar select option { background: #0b0f1a; color: #e4e4e7; }
 		.dark svg.cf-ring-svg .cf-ring-track { color: rgba(255,255,255,0.12); }
 		.dark .uc-actions-overlay { background: rgba(6,8,14,0.94); }
+
+		/* ============================================================
+		   دُک (Dock) پنج‌آیکون بالای صفحه: یک کپسول شیشه‌ای با کاشی‌های رنگی و آیکون‌های دوتونه
+		   ============================================================ */
+		.zdock {
+			display: inline-flex;
+			align-items: center;
+			gap: 6px;
+			padding: 6px;
+			border-radius: 22px;
+			background: linear-gradient(160deg, rgba(255,255,255,0.85), rgba(255,255,255,0.5));
+			border: 1px solid rgba(255,255,255,0.9);
+			box-shadow: 0 14px 32px -14px rgba(67,56,202,0.45), 0 0 0 0.5px rgba(100,116,139,0.14), inset 0 1px 0 rgba(255,255,255,1);
+			-webkit-backdrop-filter: blur(24px) saturate(180%);
+			backdrop-filter: blur(24px) saturate(180%);
+		}
+		.dark .zdock {
+			background: rgba(255,255,255,0.05);
+			border: 0.5px solid rgba(255,255,255,0.16);
+			box-shadow: 0 14px 34px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.28);
+		}
+		.zdock-sep {
+			width: 1px;
+			height: 24px;
+			border-radius: 1px;
+			background: rgba(100,116,139,0.32);
+			margin: 0 1px;
+		}
+		.dark .zdock-sep { background: rgba(255,255,255,0.16); }
+		.zdock-btn {
+			--c: 79, 70, 229;
+			position: relative;
+			width: 40px;
+			height: 40px;
+			padding: 0;
+			border-radius: 14px;
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			cursor: pointer;
+			color: rgb(var(--c));
+			background: linear-gradient(160deg, rgba(var(--c), 0.2), rgba(var(--c), 0.06));
+			border: 1px solid rgba(var(--c), 0.28);
+			transition: transform 0.2s cubic-bezier(0.3, 1.5, 0.5, 1), box-shadow 0.2s ease, background 0.2s ease;
+		}
+		.zdock-btn:hover {
+			transform: translateY(-3px) scale(1.1);
+			background: linear-gradient(160deg, rgba(var(--c), 0.34), rgba(var(--c), 0.12));
+			box-shadow: 0 10px 18px -8px rgba(var(--c), 0.75);
+		}
+		.zdock-btn:active { transform: scale(0.92); }
+		.zdock-btn:focus-visible { outline: 2px solid rgba(var(--c), 0.8); outline-offset: 2px; }
+		.zdock-btn:disabled { opacity: 0.55; cursor: wait; transform: none; box-shadow: none; }
+		.zdock-btn svg { width: 21px; height: 21px; }
+		.zb-logout { --c: 225, 29, 72; }
+		.zb-settings { --c: 2, 132, 199; }
+		.zb-theme { --c: 217, 119, 6; }
+		.zb-update { --c: 124, 58, 237; }
+		.zb-import { --c: 5, 150, 105; }
+		.dark .zb-logout { --c: 251, 113, 133; }
+		.dark .zb-settings { --c: 56, 189, 248; }
+		.dark .zb-theme { --c: 251, 191, 36; }
+		.dark .zb-update { --c: 167, 139, 250; }
+		.dark .zb-import { --c: 52, 211, 153; }
 	</style>
 </head>
 <body class="bg-gray-100 dark:bg-amoled-bg text-gray-900 dark:text-zinc-100 min-h-screen transition-colors duration-200">
@@ -6220,73 +6318,26 @@ Commercial support is available at
 	</div>
 	<header class="border-b border-gray-200 dark:border-amoled-border bg-gray-50/95 dark:bg-amoled-card/95 px-4 py-4 relative z-10">
 		<div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-2 md:gap-4">
-			<div class="flex flex-wrap items-center justify-center gap-3 w-full max-w-[260px] mx-auto md:max-w-none md:mx-0 md:w-auto mt-3 md:mt-0">
-				<button onclick="logoutAdmin()"
-				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-red-50 dark:bg-red-950/30
-				           border border-red-200 dark:border-red-900
-				           hover:bg-red-100 dark:hover:bg-red-900/50
-				           transition-all duration-200
-				           text-red-600 dark:text-red-400
-				           shadow-sm hover:shadow-md"
-				    title="خروج">
-				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
-				    </svg>
-				</button>
-				
-				<button onclick="toggleSettingsModal(true)"
-				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-gray-50 dark:bg-zinc-800/50
-				           border border-gray-200 dark:border-zinc-700
-				           hover:bg-gray-100 dark:hover:bg-zinc-700/80
-				           transition-all duration-200
-				           text-gray-600 dark:text-zinc-400 shadow-sm"
-				    title="تنظیمات">
-				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
-				    </svg>
-				</button>
-				<button id="theme-toggle"
-				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-amber-50 dark:bg-amber-950/30
-				           border border-amber-200 dark:border-amber-900
-				           hover:bg-amber-100 dark:hover:bg-amber-900/50
-				           transition-all duration-200
-				           text-amber-500 dark:text-amber-400 shadow-sm"
-				    title="تغییر تم">
-				    <svg id="sun-icon" class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707m12.728 0l-.707-.707M6.343 6.343l-.707-.707M14 12a2 2 0 11-4 0 2 2 0 014 0z"></path>
-				    </svg>
-				    <svg id="moon-icon" class="w-5 h-5 block dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path>
-				    </svg>
-				</button>
-				<button id="github-update-toggle" onclick="applyGithubUpdate()"
-				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-indigo-50 dark:bg-indigo-950/30
-				           border border-indigo-200 dark:border-indigo-900
-				           hover:bg-indigo-100 dark:hover:bg-indigo-900/50
-				           transition-all duration-200
-				           text-indigo-600 dark:text-indigo-400 shadow-sm"
-				    title="Update">
-				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"></path>
-				    </svg>
-				</button>
-				<button onclick="toggleImportModal(true)"
-				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-teal-50 dark:bg-teal-950/30
-				           border border-teal-200 dark:border-teal-900
-				           hover:bg-teal-100 dark:hover:bg-teal-900/50
-				           transition-all duration-200
-				           text-teal-600 dark:text-teal-400 shadow-sm"
-				    title="ایمپورت کاربران">
-				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
-				    </svg>
-				</button>
+			<div class="flex items-center justify-center w-full md:w-auto mt-3 md:mt-0">
+				<div class="zdock">
+					<button onclick="logoutAdmin()" class="zdock-btn zb-logout" title="خروج">
+						<svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="13" r="8" fill="currentColor" fill-opacity="0.18" stroke="none"></circle><path d="M12 3.5v8"></path><path d="M7 7.2a7.6 7.6 0 1 0 10 0"></path></svg>
+					</button>
+					<span class="zdock-sep"></span>
+					<button onclick="toggleSettingsModal(true)" class="zdock-btn zb-settings" title="تنظیمات">
+						<svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4 6.5h16M4 12h16M4 17.5h16" stroke-opacity="0.4"></path><circle cx="9" cy="6.5" r="2.4" fill="currentColor"></circle><circle cx="15.5" cy="12" r="2.4" fill="currentColor"></circle><circle cx="8" cy="17.5" r="2.4" fill="currentColor"></circle></svg>
+					</button>
+					<button id="theme-toggle" class="zdock-btn zb-theme" title="تغییر تم">
+						<svg id="sun-icon" class="hidden dark:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2" fill="currentColor" fill-opacity="0.25"></circle><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M5.5 18.5l1.7-1.7M16.8 7.2l1.7-1.7"></path></svg>
+						<svg id="moon-icon" class="block dark:hidden" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" fill="currentColor" fill-opacity="0.25"></path><path d="M17 3.5v3M15.5 5h3"></path></svg>
+					</button>
+					<button id="github-update-toggle" onclick="applyGithubUpdate()" class="zdock-btn zb-update" title="Update">
+						<svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2" fill="currentColor" fill-opacity="0.25" stroke="none"></circle><path d="M23 4v6h-6M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+					</button>
+					<button onclick="toggleImportModal(true)" class="zdock-btn zb-import" title="ایمپورت کاربران">
+						<svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="10" cy="8" r="3.6" fill="currentColor" fill-opacity="0.25"></circle><path d="M3.5 20.5a6.5 6.5 0 0 1 13 0"></path><path d="M19.5 7.5v6M16.5 10.5h6"></path></svg>
+					</button>
+				</div>
 			</div>
 			<div id="global-location-badges" class="hidden flex-1 flex flex-col items-center justify-center gap-1 w-full md:w-auto"></div>
 			<div class="flex flex-row flex-wrap justify-center items-center gap-3 w-full md:w-auto">
@@ -11457,7 +11508,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '3.32.2';
+const CURRENT_VERSION = '3.32.3';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
