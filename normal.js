@@ -532,10 +532,8 @@ const NEW_USER_DEFAULTS_FALLBACK = {
 	new_user_auto_rotate_ip: "0",
 	new_user_start_on_first_connect: "0",
 	new_user_connection_type: "vless",
-	// Early Data (فاز ۱ از تغییر ed=): پیش‌فرض *خاموش* (new_user_early_data_enabled: "0")
-	// تا فاز ۳ (پشتیبانی واقعی سمت handlevIees از هدر Sec-WebSocket-Protocol) کامل نشده،
-	// هیچ لینکی ed= تبلیغ نکنه. new_user_early_data_size بایت early data است (مقدار
-	// پیشنهادی 2560، حداکثر معقول 8192 طبق مستندات xray/sing-box WS early data).
+	// Early Data (ed=): پیش‌فرض خاموش. new_user_early_data_size بایت early data است (مقدار
+	// پیشنهادی 2560، حداکثر 8192 طبق مستندات xray/sing-box WS early data).
 	new_user_early_data_enabled: "0",
 	new_user_early_data_size: "2560",
 };
@@ -4602,7 +4600,34 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	serverSock.addEventListener("error", (err) => {
 		handleWsError(err);
 	});
-	return new Response(null, { status: 101, webSocket: clientSock });
+	// Early Data (?ed=): وقتی path کانفیگ ed داشته باشد، کلاینت بایت‌های اول اتصال (هدر VLESS/Trojan + اولین دیتا)
+	// را به‌جای پیام WebSocket، داخل هدر Sec-WebSocket-Protocol و به‌صورت base64url می‌فرستد. اینجا همان
+	// بایت‌ها را دیکد می‌کنیم و قبل از هر پیام واقعی وارد همان زنجیره‌ی processWsMessage می‌کنیم (پارس هدر
+	// دست‌نخورده می‌ماند). هدر همین مقدار در پاسخ ۱۰۱ هم echo می‌شود. اگر کلاینت این هدر را نفرستد
+	// (لینک بدون ed) هیچ فرقی با قبل نمی‌کند؛ وابسته به فلگ دیتابیس هم نیست.
+	const earlyDataToken = request ? (request.headers.get("Sec-WebSocket-Protocol") || "").split(",")[0].trim() : "";
+	let earlyDataAccepted = false;
+	if (earlyDataToken && /^[A-Za-z0-9_-]+$/.test(earlyDataToken)) {
+		try {
+			let b64 = earlyDataToken.replace(/-/g, "+").replace(/_/g, "/");
+			b64 += "=".repeat((4 - (b64.length % 4)) % 4);
+			const bin = atob(b64);
+			const earlyBytes = new Uint8Array(bin.length);
+			for (let i = 0; i < bin.length; i++) earlyBytes[i] = bin.charCodeAt(i);
+			if (earlyBytes.byteLength > 0) {
+				earlyDataAccepted = true;
+				pushToChain(async () => {
+					if (wsFailed) return;
+					await processWsMessage(earlyBytes.buffer);
+				});
+			}
+		} catch (e) { }
+	}
+	return new Response(null, {
+		status: 101,
+		webSocket: clientSock,
+		headers: earlyDataAccepted ? { "Sec-WebSocket-Protocol": earlyDataToken } : undefined,
+	});
 }
 let CF_USAGE_CACHE = null;
 let CF_USAGE_LAST_FETCH = 0;
@@ -11683,7 +11708,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '3.32.7';
+const CURRENT_VERSION = '3.32.8';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
