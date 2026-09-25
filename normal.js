@@ -1157,6 +1157,33 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 		GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
 	}
 }
+// ===== xhttp.md — فاز ۱: اسکلت خالی Durable Object (بدون منطق واقعی) =====
+// این کلاس قراره در فازهای ۹ تا ۱۵ هماهنگ‌کننده‌ی GET/POST سشن XHTTP بشه (یک instance به‌ازای هر
+// sessionId). فعلاً فقط یک fetch تستی داره تا مسیر «بایندینگ + دیپلوی» تایید بشه؛ منطق واقعی
+// (state سشن، رله‌ی دوطرفه‌ی سوکت و...) عمداً اینجا نیست.
+//
+// ⚠️ نکته‌ی معماری مهم (این فایل خودش ماژول دیپلوی‌شونده نیست): طبق بند ۲ خلاصه‌ی پروژه، کل محتوای
+// همین فایل بدنه‌ی همون `new Function("connect", view)` است که در stub بیرونی (obfuscated) اجرا
+// می‌شود؛ یعنی اینجا هیچ `export` معتبر نیست (چه `export class`، چه هر export دیگه) - داخل بدنه‌ی
+// Function Constructor غیرمجازه و SyntaxError می‌ده. به همین دلیل این کلاس به‌جای export، به‌عنوان
+// یک property روی خودِ __WORKER_EXPORT__ برگردانده می‌شود (پایین‌تر: `XhttpSession,`).
+// **برای این‌که بایندینگ Durable Object واقعاً روی کلودفلر کار کنه، stub بیرونی (بیرون از این فایل،
+// همونی که مطابق بند ۲ خلاصه با ENCODE ساخته می‌شه) باید کنار `export default name;` این خط هم
+// اضافه بشه:**
+//     export const XhttpSession = name.XhttpSession;
+// بدون این خط، بایندینگ `class_name: "XhttpSession"` که دو هندلر آپدیت خودکار پایین‌تر اضافه
+// می‌کنند موقع دیپلوی روی کلودفلر شکست می‌خورد ("class not exported"). این رو حتماً قبل از فاز ۲
+// روی یک اکانت واقعی تست کنید (کنار همون ریسک شناخته‌شده‌ی «فعال‌سازی اولین DO ممکنه دستی باشه»
+// که در خودِ xhttp.md فاز ۱ هشدار داده شده) - تست با درخواست GET به /api/xhttp-do-test.
+class XhttpSession {
+	constructor(state, env) {
+		this.state = state;
+		this.env = env;
+	}
+	async fetch(request) {
+		return new Response("ok");
+	}
+}
 const __WORKER_EXPORT__ = {
 	async fetch(request, env, ctx) {
 		if (!env.DB) {
@@ -1235,6 +1262,9 @@ const __WORKER_EXPORT__ = {
 			return new Response("Internal Server Error", { status: 500 });
 		}
 	},
+	// xhttp.md فاز ۱ - نگاه کنید به کامنت بالای کلاس XhttpSession برای این‌که چرا export مستقیم
+	// اینجا ممکن نیست و stub بیرونی چه کاری باید بکنه.
+	XhttpSession,
 };
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
@@ -1660,6 +1690,34 @@ const Router = {
 				return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
 			}
 		}
+		if (url.pathname === "/api/xhttp-do-test" && request.method === "GET") {
+			// xhttp.md فاز ۱ - تست پذیرش (acceptance test): فقط تایید می‌کنه بایندینگ DO رسیده و
+			// fetch تستی جواب می‌ده؛ هیچ ربطی به منطق واقعی سشن xhttp (فازهای ۹+) نداره. بعد از
+			// این‌که فاز ۱۶ روتینگ واقعی رو اضافه کرد، این مسیر رو می‌تونید نگه دارید (health-check
+			// بی‌ضرره) یا حذف کنید.
+			if (!env.XHTTP_SESSION) {
+				return new Response(
+					JSON.stringify({
+						error: "بایندینگ XHTTP_SESSION هنوز روی این Worker تنظیم نشده. یک‌بار از /api/update-panel (یا update-panel-github) دیپلوی بزنید تا بایندینگ + migration کلاس XhttpSession اضافه بشه، بعد دوباره امتحان کنید.",
+					}),
+					{ status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } }
+				);
+			}
+			try {
+				const id = env.XHTTP_SESSION.idFromName("phase1-test");
+				const stub = env.XHTTP_SESSION.get(id);
+				const doResp = await stub.fetch("https://internal.zeus/xhttp-do-test");
+				const doText = await doResp.text();
+				return new Response(JSON.stringify({ success: true, do_response: doText }), {
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			} catch (err) {
+				return new Response(JSON.stringify({ error: err.message }), {
+					status: 500,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+		}
 		if (url.pathname === "/api/update-panel" && request.method === "POST") {
 			const body = await request.json().catch(() => ({}));
 			const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
@@ -1689,6 +1747,8 @@ const Router = {
 				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
 				const newCode = await githubRes.text();
 				assertDeployableWorkerModule(newCode, "zeus.obfuscated.js");
+				// xhttp.md فاز ۱: اگه stub بیرونی هنوز آپدیت نشده (نگاه کنید به کامنت بالای کلاس
+				// XhttpSession)، همین‌جا هم رد می‌شه چون کلاس export نشده - قبل از دیپلوی واقعی چک شود.
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
@@ -1715,12 +1775,25 @@ const Router = {
 				}
 				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
 				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
+				// xhttp.md فاز ۱: بایندینگ Durable Object فقط وقتی که هنوز روی کلودفلر ثبت نشده اضافه
+				// می‌شه (دفعات بعدی از همون حلقه‌ی بالا - شاخه‌ی `else if (b.type !== "secret_text")`
+				// - دست‌نخورده حفظ می‌شه). migration هم فقط همون بار اول فرستاده می‌شه تا کلودفلر
+				// دوباره برای یک کلاس از قبل موجود خطا نده.
+				// ⚠️ تست‌نشده روی یک اکانت واقعی - طبق هشدار خودِ فاز ۱، قبل از فاز ۲ حتماً تایید کنید
+				// (این‌که آیا کلودفلر بدون old_tag/new_tag صریح این migration رو قبول می‌کنه یا نه).
+				const hasXhttpDoBinding = newBindings.some((b) => b.type === "durable_object_namespace" && b.name === "XHTTP_SESSION");
+				if (!hasXhttpDoBinding) {
+					newBindings.push({ type: "durable_object_namespace", name: "XHTTP_SESSION", class_name: "XhttpSession" });
+				}
 				const metadata = {
 					main_module: "zeus.js",
 					compatibility_date: "2026-07-10",
 					compatibility_flags: ["nodejs_compat"],
 					bindings: newBindings,
 				};
+				if (!hasXhttpDoBinding) {
+					metadata.migrations = { new_classes: ["XhttpSession"] };
+				}
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
 				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
@@ -1776,6 +1849,8 @@ const Router = {
 				const newCode = await githubRes.text();
 				if (!newCode || newCode.trim().length < 100) throw new Error("فایل دریافتی از گیت‌هاب خالی یا نامعتبر است.");
 				assertDeployableWorkerModule(newCode, "worker.js");
+				// xhttp.md فاز ۱: اگه stub بیرونی هنوز آپدیت نشده (نگاه کنید به کامنت بالای کلاس
+				// XhttpSession)، همین‌جا هم رد می‌شه چون کلاس export نشده - قبل از دیپلوی واقعی چک شود.
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
@@ -1802,12 +1877,25 @@ const Router = {
 				}
 				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
 				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
+				// xhttp.md فاز ۱: بایندینگ Durable Object فقط وقتی که هنوز روی کلودفلر ثبت نشده اضافه
+				// می‌شه (دفعات بعدی از همون حلقه‌ی بالا - شاخه‌ی `else if (b.type !== "secret_text")`
+				// - دست‌نخورده حفظ می‌شه). migration هم فقط همون بار اول فرستاده می‌شه تا کلودفلر
+				// دوباره برای یک کلاس از قبل موجود خطا نده.
+				// ⚠️ تست‌نشده روی یک اکانت واقعی - طبق هشدار خودِ فاز ۱، قبل از فاز ۲ حتماً تایید کنید
+				// (این‌که آیا کلودفلر بدون old_tag/new_tag صریح این migration رو قبول می‌کنه یا نه).
+				const hasXhttpDoBinding = newBindings.some((b) => b.type === "durable_object_namespace" && b.name === "XHTTP_SESSION");
+				if (!hasXhttpDoBinding) {
+					newBindings.push({ type: "durable_object_namespace", name: "XHTTP_SESSION", class_name: "XhttpSession" });
+				}
 				const metadata = {
 					main_module: "zeus.js",
 					compatibility_date: "2026-07-10",
 					compatibility_flags: ["nodejs_compat"],
 					bindings: newBindings,
 				};
+				if (!hasXhttpDoBinding) {
+					metadata.migrations = { new_classes: ["XhttpSession"] };
+				}
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
 				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
