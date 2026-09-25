@@ -3877,6 +3877,112 @@ function getSelectedUserProxy(userSocks5, request) {
 	const selected = proxyList[idx] || proxyList[0];
 	return typeof selected === "object" ? selected.proxy || "" : String(selected || "");
 }
+// xhttp.md فاز ۲ (گروه A) — پارسر مستقل هدر VLESS/Trojan.
+// قبلاً این منطق inline داخل handlevIees بود؛ به این تابع خالص منتقل شده تا فاز ۹+ (Durable
+// Object سشن XHTTP) بتونه دقیقاً همین پارسر رو دوباره صدا بزنه، بدون یک پیاده‌سازی موازی/تکراری.
+// این تابع فقط از روی یک بافر بایت خام تصمیم می‌گیره - هیچ سوکتی نمی‌بنده، هیچ DB/کشی صدا
+// نمی‌زنه؛ فقط سه‌جور خروجی ممکنه:
+//   - null                → بافر هنوز ناقصه (بایت کافی نرسیده)، فراخوان باید صبر کنه (chunk بعدی)
+//   - { invalid: true }    → پروتکل بدفرم/نامعتبره، فراخوان باید سوکت رو ببنده
+//   - آبجکت کامل زیر       → پارس موفق:
+//     { isTrojan, uuidOrHash, cmd, addrType, address, port, respHeader, remainingPayload }
+function parseVlessTrojanHeader(chunkBuffer) {
+	let isTrojan = false;
+	if (chunkBuffer.byteLength >= 58 && chunkBuffer[56] === 0x0D && chunkBuffer[57] === 0x0A) {
+		const checkHex = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
+		if (/^[0-9a-f]{56}$/.test(checkHex)) {
+			isTrojan = true;
+		}
+	}
+	let cmd = 0;
+	let port = 0;
+	let addrType = 0;
+	let addr = "";
+	let rawData = null;
+	let respHeader = null;
+	let uuidOrHash = null;
+	if (isTrojan) {
+		if (chunkBuffer.byteLength < 60) return null;
+		const hexHash = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
+		uuidOrHash = hexHash;
+		let offset = 58;
+		cmd = chunkBuffer[offset++];
+		addrType = chunkBuffer[offset++];
+		if (addrType === 1) {
+			if (chunkBuffer.byteLength < offset + 4 + 2 + 2) return null;
+			addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
+		} else if (addrType === 3) {
+			if (chunkBuffer.byteLength < offset + 1) return null;
+			const domainLen = chunkBuffer[offset++];
+			if (chunkBuffer.byteLength < offset + domainLen + 2 + 2) return null;
+			addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
+			offset += domainLen;
+		} else if (addrType === 4) {
+			if (chunkBuffer.byteLength < offset + 16 + 2 + 2) return null;
+			const v6 = [];
+			for (let i = 0; i < 8; i++) {
+				v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
+			}
+			addr = v6.join(":");
+		} else {
+			return { invalid: true };
+		}
+		port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
+		if (chunkBuffer.byteLength < offset + 2) return null;
+		if (chunkBuffer[offset] !== 0x0D || chunkBuffer[offset + 1] !== 0x0A) {
+			return { invalid: true };
+		}
+		offset += 2;
+		rawData = chunkBuffer.slice(offset);
+		respHeader = null;
+	} else {
+		if (chunkBuffer.byteLength < 24) return null;
+		let optLen = chunkBuffer[17];
+		let requiredLen = 18 + optLen + 4;
+		if (chunkBuffer.byteLength < requiredLen) return null;
+		addrType = chunkBuffer[18 + optLen + 3];
+		if (addrType === 1) {
+			requiredLen += 4;
+		} else if (addrType === 2) {
+			requiredLen += 1;
+			if (chunkBuffer.byteLength < requiredLen) return null;
+			requiredLen += chunkBuffer[18 + optLen + 4];
+		} else if (addrType === 3) {
+			requiredLen += 16;
+		} else {
+			return { invalid: true };
+		}
+		if (chunkBuffer.byteLength < requiredLen) return null;
+		const reqUUID = extractUUIDFromvIees(chunkBuffer);
+		if (!reqUUID) {
+			return { invalid: true };
+		}
+		uuidOrHash = reqUUID;
+		let offset = 17;
+		optLen = chunkBuffer[offset++];
+		offset += optLen;
+		cmd = chunkBuffer[offset++];
+		port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
+		addrType = chunkBuffer[offset++];
+		if (addrType === 1) {
+			addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
+		} else if (addrType === 2) {
+			const domainLen = chunkBuffer[offset++];
+			addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
+			offset += domainLen;
+		} else if (addrType === 3) {
+			const v6 = [];
+			for (let i = 0; i < 8; i++) {
+				v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
+			}
+			addr = v6.join(":");
+		}
+		rawData = chunkBuffer.slice(offset);
+		respHeader = new Uint8Array([chunkBuffer[0], 0]);
+	}
+	return { isTrojan, uuidOrHash, cmd, addrType, address: addr, port, respHeader, remainingPayload: rawData };
+}
+
 async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	let rawClientIP = request ? request.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
 	let clientIP = rawClientIP;
@@ -4238,104 +4344,23 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 		}
 		if (!isHeaderParsed) {
 			chunkBuffer = concatBytes(chunkBuffer, chunk);
-			
-			let isTrojan = false;
-			if (chunkBuffer.byteLength >= 58 && chunkBuffer[56] === 0x0D && chunkBuffer[57] === 0x0A) {
-				const checkHex = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
-				if (/^[0-9a-f]{56}$/.test(checkHex)) {
-					isTrojan = true;
-				}
+			// xhttp.md فاز ۲: پارس هدر VLESS/Trojan از این‌جا به تابع مستقل parseVlessTrojanHeader
+			// منتقل شده (تعریف بالای handlevIees) - چون فاز ۹+ (Durable Object سشن XHTTP) دقیقاً
+			// همین پارسر رو دوباره لازم داره؛ این‌جا فقط نتیجه‌ش dispatch می‌شه، منطق عوض نشده.
+			const parsedHeader = parseVlessTrojanHeader(chunkBuffer);
+			if (parsedHeader === null) return; // بایت کافی هنوز نرسیده، منتظر chunk بعدی
+			if (parsedHeader.invalid) {
+				serverSock.close();
+				return;
 			}
-			let cmd = 0;
-			let port = 0;
-			let addrType = 0;
-			let addr = "";
-			let rawData = null;
-			let respHeader = null;
-			let userLookupKey = null;
-			if (isTrojan) {
-				if (chunkBuffer.byteLength < 60) return;
-				const hexHash = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
-				userLookupKey = hexHash;
-				let offset = 58;
-				cmd = chunkBuffer[offset++];
-				addrType = chunkBuffer[offset++];
-				if (addrType === 1) {
-					if (chunkBuffer.byteLength < offset + 4 + 2 + 2) return;
-					addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
-				} else if (addrType === 3) {
-					if (chunkBuffer.byteLength < offset + 1) return;
-					const domainLen = chunkBuffer[offset++];
-					if (chunkBuffer.byteLength < offset + domainLen + 2 + 2) return;
-					addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
-					offset += domainLen;
-				} else if (addrType === 4) {
-					if (chunkBuffer.byteLength < offset + 16 + 2 + 2) return;
-					const v6 = [];
-					for (let i = 0; i < 8; i++) {
-						v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
-					}
-					addr = v6.join(":");
-				} else {
-					serverSock.close();
-					return;
-				}
-				port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
-				if (chunkBuffer.byteLength < offset + 2) return;
-				if (chunkBuffer[offset] !== 0x0D || chunkBuffer[offset + 1] !== 0x0A) {
-					serverSock.close();
-					return;
-				}
-				offset += 2;
-				rawData = chunkBuffer.slice(offset);
-				respHeader = null;
-			} else {
-				if (chunkBuffer.byteLength < 24) return;
-				let optLen = chunkBuffer[17];
-				let requiredLen = 18 + optLen + 4;
-				if (chunkBuffer.byteLength < requiredLen) return;
-				addrType = chunkBuffer[18 + optLen + 3];
-				if (addrType === 1) {
-					requiredLen += 4;
-				} else if (addrType === 2) {
-					requiredLen += 1;
-					if (chunkBuffer.byteLength < requiredLen) return;
-					requiredLen += chunkBuffer[18 + optLen + 4];
-				} else if (addrType === 3) {
-					requiredLen += 16;
-				} else {
-					serverSock.close();
-					return;
-				}
-				if (chunkBuffer.byteLength < requiredLen) return;
-				reqUUID = extractUUIDFromvIees(chunkBuffer);
-				if (!reqUUID) {
-					serverSock.close();
-					return;
-				}
-				userLookupKey = reqUUID;
-				let offset = 17;
-				optLen = chunkBuffer[offset++];
-				offset += optLen;
-				cmd = chunkBuffer[offset++];
-				port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
-				addrType = chunkBuffer[offset++];
-				if (addrType === 1) {
-					addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
-				} else if (addrType === 2) {
-					const domainLen = chunkBuffer[offset++];
-					addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
-					offset += domainLen;
-				} else if (addrType === 3) {
-					const v6 = [];
-					for (let i = 0; i < 8; i++) {
-						v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
-					}
-					addr = v6.join(":");
-				}
-				rawData = chunkBuffer.slice(offset);
-				respHeader = new Uint8Array([chunkBuffer[0], 0]);
-			}
+			let isTrojan = parsedHeader.isTrojan;
+			let cmd = parsedHeader.cmd;
+			let port = parsedHeader.port;
+			let addrType = parsedHeader.addrType;
+			let addr = parsedHeader.address;
+			let rawData = parsedHeader.remainingPayload;
+			let respHeader = parsedHeader.respHeader;
+			let userLookupKey = parsedHeader.uuidOrHash;
 			if (isHeaderParsing) return;
 			isHeaderParsing = true;
 			isTrojanProto = isTrojan;
