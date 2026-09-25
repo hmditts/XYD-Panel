@@ -2895,6 +2895,10 @@ const DbService = {
 					// early_data_enabled=0 داشته باشن (نه NULL) و user.early_data_enabled بدون fallback جدا کار کنه.
 					{ name: "early_data_enabled", def: "INTEGER DEFAULT 0" },
 					{ name: "early_data_size", def: "INTEGER DEFAULT 2560" },
+					// xhttp.md فاز ۳: نوع ترنسپورت هر کاربر - 'ws' (پیش‌فرض، رفتار فعلی)، 'xhttp'، یا
+					// 'ws+xhttp' (تناوبی). دقیقاً هم‌الگو با early_data_enabled: DEFAULT ساخته می‌شه تا
+					// کاربرهای موجود هم 'ws' داشته باشن (نه NULL).
+					{ name: "transport_type", def: "TEXT DEFAULT 'ws'" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
