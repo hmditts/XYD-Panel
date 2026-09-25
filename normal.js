@@ -18,6 +18,10 @@ const IP_BURST_BYTES = new Map();
 const DNS_CACHE = new Map();
 const USER_REQ_CACHE = new Map();
 const LOGIN_ATTEMPTS = new Map();
+// xhttp.md فاز ۱۰ - ابزار موقت تست wire format واقعی. فقط برای تایید دستی با v2rayNG/NekoBox؛
+// هیچ auth/سوکت/رله‌ای نداره. **بعد از تایید فاز ۱۰ باید هم این آرایه هم مسیرهای
+// handleXhttpWireDebugCapture/`/api/xhttp-wire-debug-log` حذف بشن - جزو منطق تولیدی نیستن.**
+const XHTTP_WIRE_DEBUG_LOG = [];
 let GLOBAL_REQ_COUNT = 0;
 let GLOBAL_LAST_REQ_WRITE = 0;
 const DNS_CACHE_TTL = 5 * 60 * 1000;
@@ -1399,6 +1403,47 @@ const Router = {
 	isSubscriptionPath(pathname) {
 		return pathname.startsWith("/notes/") || pathname.startsWith("/bundle/");
 	},
+	// xhttp.md فاز ۱۰ - موقتی، بدون auth/سوکت/رله: فقط GET/POستهای واقعی که کلاینت xhttp (v2rayNG/
+	// NekoBox) با path=/api/xhttp-wire-capture می‌فرسته رو کامل لاگ می‌کنه (مسیر دقیق شامل سگمنت‌های
+	// بعدی که خودِ کلاینت اضافه می‌کنه، همه‌ی هدرها، و ۶۴ بایت اول بدنه‌ی POST به‌صورت hex) تا بند ۳
+	// سند (seq، محل x_padding، Content-Type واقعی) بدون حدس تایید بشه. جواب واقعی رله نمی‌ده -
+	// یعنی اتصال از دید کلاینت "کار نمی‌کنه"، ولی خودِ درخواست‌ها قبل از قطع‌شدن لاگ می‌شن.
+	// بعد از فاز ۱۰ حذف بشه (هم این متد، هم دو مسیر api مرتبطش، هم XHTTP_WIRE_DEBUG_LOG).
+	async handleXhttpWireDebugCapture(request, url) {
+		const headersObj = {};
+		for (const [k, v] of request.headers.entries()) headersObj[k] = v;
+		let bodyLength = 0;
+		let bodyPreviewHex = null;
+		if (request.method === "POST") {
+			try {
+				const buf = await request.arrayBuffer();
+				bodyLength = buf.byteLength;
+				bodyPreviewHex = Array.from(new Uint8Array(buf).slice(0, 64))
+					.map((b) => b.toString(16).padStart(2, "0"))
+					.join(" ");
+			} catch (e) {
+				bodyPreviewHex = "خطا در خوندن بدنه: " + e.message;
+			}
+		}
+		XHTTP_WIRE_DEBUG_LOG.unshift({
+			time: new Date().toISOString(),
+			method: request.method,
+			path: url.pathname,
+			search: url.search,
+			headers: headersObj,
+			bodyLength,
+			bodyPreviewHex,
+		});
+		if (XHTTP_WIRE_DEBUG_LOG.length > 20) XHTTP_WIRE_DEBUG_LOG.length = 20;
+		if (request.method === "GET") {
+			return new Response("debug-capture-ok\n", {
+				headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store" },
+			});
+		}
+		return new Response(JSON.stringify({ captured: true }), {
+			headers: { "Content-Type": "application/json; charset=utf-8" },
+		});
+	},
 	async handleWebSocket(request, env, ctx) {
 		try {
 			return handlevIees(env, null, ctx, request);
@@ -1517,6 +1562,13 @@ const Router = {
 		}
 	},
 	async handleApi(request, url, env, ctx) {
+		// xhttp.md فاز ۱۰ - عمداً قبل از چک رمز/auth: کلاینت واقعی (v2rayNG/NekoBox) هیچ کوکی پنلی
+		// نمی‌فرسته. این مسیر رو به‌عنوان "path" ترنسپورت XHTTP توی کلاینت بذارید تا شکل واقعیِ
+		// درخواست‌ها (مسیر دقیق، seq، هدرها، x_padding) بدون حدس دیده بشه. موقتیه - نگاه کنید به
+		// کامنت بالای XHTTP_WIRE_DEBUG_LOG.
+		if (url.pathname.startsWith("/api/xhttp-wire-capture")) {
+			return await Router.handleXhttpWireDebugCapture(request, url);
+		}
 		const hasPassword = await DbService.getPanelPassword(env.DB);
 		if (url.pathname === "/api/setup-password" && request.method === "POST") {
 			if (hasPassword) {
@@ -1725,6 +1777,13 @@ const Router = {
 			} catch (err) {
 				return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
 			}
+		}
+		if (url.pathname === "/api/xhttp-wire-debug-log" && request.method === "GET") {
+			// xhttp.md فاز ۱۰ - نمایش آخرین درخواست‌هایی که handleXhttpWireDebugCapture لاگ کرده
+			// (احتیاج به لاگین پنل داره، بر‌خلاف خودِ مسیر capture). بعد از فاز ۱۰ حذف بشه.
+			return new Response(JSON.stringify({ log: XHTTP_WIRE_DEBUG_LOG }, null, 2), {
+				headers: { "Content-Type": "application/json; charset=utf-8" },
+			});
 		}
 		if (url.pathname === "/api/xhttp-do-test" && request.method === "GET") {
 			// xhttp.md فاز ۱ - تست پذیرش (acceptance test): فقط تایید می‌کنه بایندینگ DO رسیده و
