@@ -8038,6 +8038,14 @@ Commercial support is available at
 							</select>
 						</div>
 						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">نوع ترنسپورت</label>
+							<select id="nud-transport-type" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="ws">WebSocket (ws)</option>
+								<option value="xhttp">XHTTP</option>
+								<option value="ws+xhttp">WS + XHTTP (متناوب)</option>
+							</select>
+						</div>
+						<div>
 							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">تمدید خودکار حجم (روز)</label>
 							<input type="number" id="nud-auto-reset-vol" dir="ltr" min="0" step="1" placeholder="۰ = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 						</div>
@@ -8118,6 +8126,10 @@ Commercial support is available at
 					<label class="mt-3 flex items-start gap-2 cursor-pointer">
 						<input type="checkbox" id="nud-apply-early-data-existing" class="w-4 h-4 mt-0.5 rounded focus:ring-green-500/50 bg-white dark:bg-amoled-input border-gray-300 dark:border-amoled-border cursor-pointer text-green-600" style="filter: none !important; accent-color: #16a34a !important;">
 						<span class="text-[11px] text-gray-600 dark:text-zinc-400">اعمال Early Data (روشن/خاموش + سایز) روی کاربرهای موجود هم <span class="text-gray-400 dark:text-zinc-500">— فقط برای همین بار ذخیره؛ تنظیم Early Data همه‌ی کاربرها با مقدار بالا جایگزین می‌شه.</span></span>
+					</label>
+					<label class="mt-2 flex items-start gap-2 cursor-pointer">
+						<input type="checkbox" id="nud-apply-transport-existing" class="w-4 h-4 mt-0.5 rounded focus:ring-green-500/50 bg-white dark:bg-amoled-input border-gray-300 dark:border-amoled-border cursor-pointer text-green-600" style="filter: none !important; accent-color: #16a34a !important;">
+						<span class="text-[11px] text-gray-600 dark:text-zinc-400">اعمال نوع ترنسپورت روی کاربرهای موجود هم <span class="text-gray-400 dark:text-zinc-500">— فقط برای همین بار ذخیره؛ نوع ترنسپورت همه‌ی کاربرها با مقدار بالا جایگزین می‌شه.</span></span>
 					</label>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
@@ -11242,6 +11254,8 @@ window.fillNewUserDefaultsInputs = function() {
 	// چک‌باکس «اعمال روی کاربرهای موجود» هیچ‌وقت ماندگار نیست: هر بار که فرم پر می‌شود (باز شدن Settings / بعد از ذخیره) خاموش برمی‌گردد.
 	const applyEdEl = document.getElementById('nud-apply-early-data-existing');
 	if (applyEdEl) applyEdEl.checked = false;
+	const applyTtEl = document.getElementById('nud-apply-transport-existing');
+	if (applyTtEl) applyTtEl.checked = false;
 };
 window.loadNewUserDefaultsSetting = async function() {
 	let data = null;
@@ -11368,6 +11382,8 @@ window.saveSettings = async function() {
 	const nudSettings = window.collectNewUserDefaultsFromInputs();
 	const applyEarlyDataEl = document.getElementById('nud-apply-early-data-existing');
 	const applyEarlyData = !!(applyEarlyDataEl && applyEarlyDataEl.checked);
+	const applyTransportEl = document.getElementById('nud-apply-transport-existing');
+	const applyTransport = !!(applyTransportEl && applyTransportEl.checked);
 
 	const buttons = [document.getElementById('save-settings-btn'), document.getElementById('save-settings-fab-btn')].filter(Boolean);
 	buttons.forEach(function(b) { b.disabled = true; });
@@ -11386,7 +11402,8 @@ window.saveSettings = async function() {
 					inline_proxy_ip: proxyIpVal,
 					default_port: defaultPortVal
 				}, nudSettings),
-				apply_early_data_to_existing_users: applyEarlyData
+				apply_early_data_to_existing_users: applyEarlyData,
+				apply_transport_to_existing_users: applyTransport
 			})
 		});
 		let saveData = null;
@@ -11941,7 +11958,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '3.32.9';
+const CURRENT_VERSION = '4.0.6';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
