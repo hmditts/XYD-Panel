@@ -536,6 +536,8 @@ const NEW_USER_DEFAULTS_FALLBACK = {
 	// پیشنهادی 2560، حداکثر 8192 طبق مستندات xray/sing-box WS early data).
 	new_user_early_data_enabled: "0",
 	new_user_early_data_size: "2560",
+	// xhttp.md فاز ۵: پیش‌فرض ترنسپورت کاربر تازه‌ساز - دقیقاً هم‌الگو با کلیدهای Early Data بالا.
+	new_user_transport_type: "ws",
 };
 // فقط این دو کلید مجازند خالی ذخیره شوند (خالی = فرگمنت خاموش)؛ برای بقیه، مقدار
 // خالی/نامعتبر یعنی «از NEW_USER_DEFAULTS_FALLBACK استفاده کن».
@@ -565,6 +567,23 @@ function applySingboxEarlyData(transport, user) {
 		transport.max_early_data = size;
 		transport.early_data_header_name = "Sec-WebSocket-Protocol";
 	}
+}
+// xhttp.md فاز ۴: ثابت و توابع کمکی مشترک برای ترنسپورت هر کاربر - دقیقاً هم‌الگو با
+// EARLY_DATA_MAX_SIZE/getUserEarlyDataSize بالا (یک منبع مشترک، نه تکرار در ۴ محل تولید لینک).
+// ⚠️ تفاوت مهم با connection_type: connection_type چندانتخابی‌ست (هر پروتکل = یک لینک جدا)؛
+// transport_type این‌جوری نیست - "ws+xhttp" یعنی حالت سوم با رفتار *متناوب* روی کل خروجی یک
+// کاربر (نه تولید دوتایی برای هر مقصد)، پس UI‌ش (فاز ۶) باید یک select تک‌مقداری باشه.
+const VALID_TRANSPORT_TYPES = ["ws", "xhttp", "ws+xhttp"];
+function getUserTransportMode(user) {
+	const t = String((user && user.transport_type) || "ws").toLowerCase();
+	return VALID_TRANSPORT_TYPES.includes(t) ? t : "ws";
+}
+// index = شمارنده‌ی پیوسته‌ی همون کاربر در کل حلقه‌ی تولید لینک (بند فاز ۱۶/۱۷ - یک شمارنده‌ی
+// مشترک بین حلقه‌ی اصلی و شاخه‌ی otherCleanIps، نه دوتا شمارنده‌ی جدا).
+function resolveConfigTransport(user, index) {
+	const mode = getUserTransportMode(user);
+	if (mode === "ws+xhttp") return index % 2 === 0 ? "ws" : "xhttp";
+	return mode; // "ws" یا "xhttp"
 }
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
@@ -1979,6 +1998,7 @@ const Router = {
 				let unpinRemoval = { countries: [], usersUpdated: 0 };
 				let fragApplied = false;
 				let earlyDataApplied = false;
+				let transportTypeApplied = false;
 				let userLimitApplied = false;
 				let fingerprintApplied = false;
 				let connTypeApplied = false;
@@ -2085,6 +2105,22 @@ const Router = {
 							overrideEarlyData = { enabled: edEnabledRaw === "1" ? 1 : 0, size: edSize };
 						}
 					}
+					// xhttp.md فاز ۵ (transport_type): دقیقاً هم‌الگو با بلوک Early Data بالا - فقط پیش‌فرضِ کاربر
+					// *تازه‌ساز*ه؛ لینک‌ها از ستون transport_type خودِ هر کاربر ساخته می‌شوند (resolveConfigTransport،
+					// فاز ۴)، نه از settings. فقط وقتی apply_transport_to_existing_users: true بفرستند (فلگ بیرون از
+					// body.settings) روی ستون همه‌ی کاربرهای *موجود* هم نوشته می‌شود. مقدار باید دقیقاً یکی از
+					// VALID_TRANSPORT_TYPES باشد؛ نامعتبر = نادیده گرفته می‌شود (و چون transport_type_applied
+					// برنمی‌گردد، فراخواننده آن را به‌عنوان خطا می‌بیند).
+					let overrideTransportType = undefined;
+					if (
+						body.apply_transport_to_existing_users === true &&
+						Object.prototype.hasOwnProperty.call(body.settings, "new_user_transport_type")
+					) {
+						const ttRaw = String(body.settings.new_user_transport_type == null ? "" : body.settings.new_user_transport_type).trim().toLowerCase();
+						if (VALID_TRANSPORT_TYPES.includes(ttRaw)) {
+							overrideTransportType = ttRaw;
+						}
+					}
 					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
 					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
 					// «لیست لوکیشن‌های پین‌شده»: اگه این کلید توی همین درخواست هست، لیست قبلی رو
@@ -2135,6 +2171,10 @@ const Router = {
 						await env.DB.prepare("UPDATE users SET early_data_enabled = ?, early_data_size = ?").bind(overrideEarlyData.enabled, overrideEarlyData.size).run();
 						earlyDataApplied = true;
 					}
+					if (overrideTransportType !== undefined) {
+						await env.DB.prepare("UPDATE users SET transport_type = ?").bind(overrideTransportType).run();
+						transportTypeApplied = true;
+					}
 					if (overrideFingerprint !== undefined) {
 						await env.DB.prepare("UPDATE users SET fingerprint = ?").bind(overrideFingerprint).run();
 						fingerprintApplied = true;
@@ -2151,7 +2191,7 @@ const Router = {
 						} catch (e) { /* best-effort: the cache expires by itself within seconds */ }
 					}
 				}
-				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, early_data_applied: earlyDataApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, early_data_applied: earlyDataApplied, transport_type_applied: transportTypeApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/settings/sync-vip-proxies") {
@@ -2427,7 +2467,7 @@ const Router = {
 						if (resetUser) await invalidateUserAuthCache(ctx, resetUser.uuid, resetUser.trojan_hash);
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} else {
-						const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = body;
+						const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size, transport_type } = body;
 						if (new_username && new_username !== username) {
 							if (!/^[a-zA-Z0-9_-]+$/.test(new_username)) {
 								return new Response(JSON.stringify({ error: "نام کاربری جدید غیرمجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
@@ -2516,6 +2556,15 @@ const Router = {
 							const edSizePut = edSizePutRaw >= 1 && edSizePutRaw <= EARLY_DATA_MAX_SIZE ? edSizePutRaw : null;
 							if (edEnabledPut !== null || edSizePut !== null) {
 								await env.DB.prepare("UPDATE users SET early_data_enabled = COALESCE(?, early_data_enabled), early_data_size = COALESCE(?, early_data_size) WHERE username = ?").bind(edEnabledPut, edSizePut, new_username || username).run();
+							}
+						} catch (e) { }
+						// xhttp.md فاز ۵ (transport_type): دقیقاً هم‌الگو با بلوک Early Data بالا - فقط اگر بدنه
+						// فرستاده باشد نوشته می‌شود (نیامده = بدون تغییر)؛ مقدار نامعتبر هم نادیده گرفته می‌شود.
+						try {
+							const ttPut = transport_type !== undefined && transport_type !== null ? String(transport_type).trim().toLowerCase() : null;
+							const finalTtPut = ttPut !== null && VALID_TRANSPORT_TYPES.includes(ttPut) ? ttPut : null;
+							if (finalTtPut !== null) {
+								await env.DB.prepare("UPDATE users SET transport_type = COALESCE(?, transport_type) WHERE username = ?").bind(finalTtPut, new_username || username).run();
 							}
 						} catch (e) { }
 						if (resetProxyToDefault) {
@@ -2688,7 +2737,7 @@ const Router = {
 					}
 				}
 				if (request.method === "POST") {
-					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = await readJsonBody(request);
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size, transport_type } = await readJsonBody(request);
 					if (!username) {
 						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
 					}
@@ -2757,6 +2806,17 @@ const Router = {
 						const finalEarlyDataEnabled = flagOf(early_data_enabled, nud.new_user_early_data_enabled);
 						const edSizeParsed = parseInt(given(early_data_size) ? early_data_size : nud.new_user_early_data_size, 10);
 						const finalEarlyDataSize = edSizeParsed >= 1 && edSizeParsed <= EARLY_DATA_MAX_SIZE ? edSizeParsed : 2560;
+						// xhttp.md فاز ۵ (transport_type): مقدار صریح برنده است؛ نیامده = پیش‌فرض Settings
+						// (new_user_transport_type)؛ نامعتبر (نه در VALID_TRANSPORT_TYPES) = 'ws'.
+						const requestedTransportType = given(transport_type) ? String(transport_type).trim().toLowerCase() : null;
+						const finalTransportType =
+							requestedTransportType !== null
+								? VALID_TRANSPORT_TYPES.includes(requestedTransportType)
+									? requestedTransportType
+									: "ws"
+								: VALID_TRANSPORT_TYPES.includes(nud.new_user_transport_type)
+									? nud.new_user_transport_type
+									: "ws";
 						const finalTls = given(tls) && String(tls).trim() !== "" ? tls : String(finalPort).split(",").some((p) => NEW_USER_TLS_PORTS.includes(p.trim())) ? "on" : "off";
 						if (!(protocols && Array.isArray(protocols) && protocols.length > 0) && !connection_type) finalConnType = nud.new_user_connection_type;
 						// Every new user is always pinned to whatever the current
@@ -2767,8 +2827,8 @@ const Router = {
 						// the background right after insert (see ctx.waitUntil below) so
 						// this request doesn't have to wait on a full round of live
 						// proxy testing.
-						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, early_data_enabled, early_data_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct), finalEarlyDataEnabled, finalEarlyDataSize)
+						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, early_data_enabled, early_data_size, transport_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct), finalEarlyDataEnabled, finalEarlyDataSize, finalTransportType)
 							.run();
 						// Clears any stale negative-cache ("no such user") entry that might exist for
 						// this uuid/hash from an earlier probe or connection attempt with this UUID.
@@ -7009,6 +7069,14 @@ Commercial support is available at
 										<input type="checkbox" id="input-proto-trojan" onchange="handleProtocolChange(this)" class="w-4 h-4 rounded focus:ring-green-500/50 bg-white dark:bg-amoled-input border-gray-300 dark:border-amoled-border cursor-pointer text-green-600" style="filter: none !important; accent-color: #16a34a !important;">
 									</label>
 								</div>
+								<div class="pt-3 border-t border-gray-200/70 dark:border-amoled-border">
+									<label class="block text-[10px] font-bold text-gray-600 dark:text-zinc-300 mb-1">نوع ترنسپورت</label>
+									<select id="input-transport-type" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-bold text-gray-800 dark:text-zinc-100 transition shadow-sm cursor-pointer">
+										<option value="ws" selected>WebSocket (ws)</option>
+										<option value="xhttp">XHTTP</option>
+										<option value="ws+xhttp">WS + XHTTP (متناوب)</option>
+									</select>
+								</div>
 							</div>
 							
 							<div class="p-4 bg-gray-50/70 dark:bg-amoled-input/30 border border-gray-200/70 dark:border-amoled-border rounded-xl space-y-3">
@@ -8793,6 +8861,8 @@ let activeRocketBtn = null;
 			const edSizeInput = document.getElementById('input-early-data-size');
 			if (edSizeInput) edSizeInput.value = String(nud.early_data_size);
 			if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(nud.early_data_enabled);
+			const transportTypeSelect = document.getElementById('input-transport-type');
+			if (transportTypeSelect) transportTypeSelect.value = nud.transport_type;
 			const autoResetOn = nud.auto_reset_vol_days > 0 || nud.auto_reset_req_days > 0;
 			const autoResetToggle = document.getElementById('input-auto-reset-toggle');
 			if (autoResetToggle) autoResetToggle.checked = autoResetOn;
@@ -9678,6 +9748,7 @@ let activeRocketBtn = null;
 			const tls_mask = (isAdvancedSettingsOn && document.getElementById('input-tls-mask')) ? document.getElementById('input-tls-mask').value.trim() : "";
 			const early_data_enabled = (document.getElementById('input-early-data-toggle') && document.getElementById('input-early-data-toggle').checked) ? 1 : 0;
 			const early_data_size = Math.min(8192, Math.max(1, parseInt(document.getElementById('input-early-data-size') ? document.getElementById('input-early-data-size').value : '', 10) || 2560));
+			const transport_type = document.getElementById('input-transport-type') ? document.getElementById('input-transport-type').value : 'ws';
 			const isAutoReset = document.getElementById('input-auto-reset-toggle').checked;
 			const auto_reset_vol_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-vol').value) || 0 : 0;
 			const auto_reset_req_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-req').value) || 0 : 0;
@@ -9717,6 +9788,7 @@ let activeRocketBtn = null;
 						username, uuid, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int,
 						advanced_frag: advanced_frag || null, cipher_suites: cipher_suites || null, tls_mask: tls_mask || null,
 						early_data_enabled: early_data_enabled, early_data_size: early_data_size,
+						transport_type: transport_type,
 						user_proxy_iata: null,
 						user_socks5: userSocks5 || null,
 						reset_user_to_default: isEditMode && window.resetUserToDefaultPending === true,
@@ -10639,6 +10711,10 @@ function populateUserFormFields(user) {
 	const edSizeEdit = document.getElementById('input-early-data-size');
 	if (edSizeEdit) edSizeEdit.value = String((edUserSize >= 1 && edUserSize <= 8192) ? edUserSize : 2560);
 	if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(edUserOn);
+	// xhttp.md فاز ۶: مقدار نامعتبر/خالی توی ستون transport_type یعنی 'ws' - همون الگوی connection_type بالا.
+	const userTransportType = ['ws', 'xhttp', 'ws+xhttp'].indexOf(user.transport_type) !== -1 ? user.transport_type : 'ws';
+	const transportTypeEdit = document.getElementById('input-transport-type');
+	if (transportTypeEdit) transportTypeEdit.value = userTransportType;
 	const advFragInput = document.getElementById('input-advanced-frag');
 	if (advFragInput) advFragInput.value = user.advanced_frag || '';
 	const csInput = document.getElementById('input-cipher-suites');
@@ -11132,7 +11208,8 @@ window.NEW_USER_DEFAULTS_FALLBACK = {
 	new_user_start_on_first_connect: '0',
 	new_user_connection_type: 'vless',
 	new_user_early_data_enabled: '0',
-	new_user_early_data_size: '2560'
+	new_user_early_data_size: '2560',
+	new_user_transport_type: 'ws'
 };
 window.NEW_USER_DEFAULTS = Object.assign({}, window.NEW_USER_DEFAULTS_FALLBACK);
 window.NEW_USER_INPUT_IDS = {
@@ -11151,7 +11228,8 @@ window.NEW_USER_INPUT_IDS = {
 	new_user_start_on_first_connect: 'nud-start-on-first-connect',
 	new_user_connection_type: 'nud-connection-type',
 	new_user_early_data_enabled: 'nud-early-data-enabled',
-	new_user_early_data_size: 'nud-early-data-size'
+	new_user_early_data_size: 'nud-early-data-size',
+	new_user_transport_type: 'nud-transport-type'
 };
 window.NEW_USER_EMPTY_OK = { new_user_frag_len: true, new_user_frag_int: true };
 window.fillNewUserDefaultsInputs = function() {
@@ -11228,7 +11306,10 @@ window.getNewUserDefaultsTyped = function() {
 		early_data_enabled: d.new_user_early_data_enabled === '1',
 		early_data_size: (function() { const n = parseInt(d.new_user_early_data_size, 10); return (n >= 1 && n <= 8192) ? n : 2560; })(),
 		connection_type: protocols.join(','),
-		protocols: protocols
+		protocols: protocols,
+		// xhttp.md فاز ۶: همون الگوی اعتبارسنجی ed - مقدار نامعتبر/خالی یعنی 'ws'. لیست معتبرها
+		// اینجا دوباره inline نوشته شده چون VALID_TRANSPORT_TYPES سمت Worker است، نه مرورگر.
+		transport_type: (['ws', 'xhttp', 'ws+xhttp'].indexOf(d.new_user_transport_type) !== -1) ? d.new_user_transport_type : 'ws'
 	};
 };
 window.generateMasterKey = async function() {
