@@ -8,3 +8,4 @@ for (let i = 0; i < score.length; i++) { score[i] ^= utils[i % utils.length]; }
 const view = new TextDecoder().decode(score);
 const name = new Function("connect", view)(connect);
 export default name;
+export const XhttpSession = name.XhttpSession;
