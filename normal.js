@@ -1247,23 +1247,38 @@ class StateStore {
 			});
 			if (this.debugLog.length > 20) this.debugLog.length = 20;
 			if (request.method === "GET") {
-	const stream = new ReadableStream({
-		start(controller) {
-			controller.enqueue(new TextEncoder().encode("debug-capture-ok\n"));
-			const iv = setInterval(() => {
-				try { controller.enqueue(new TextEncoder().encode(": ping\n\n")); }
-				catch (e) { clearInterval(iv); }
-			}, 3000);
-			setTimeout(() => {
-				clearInterval(iv);
-				try { controller.close(); } catch (e) { }
-			}, 25000);
-		},
-	});
-	return new Response(stream, {
-		headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store", "X-Accel-Buffering": "no" },
-	});
-}
+				// xhttp.md فاز ۱۰ - قبلاً اینجا یه پاسخ کوتاه و فوری برمی‌گشت و می‌بست؛ از دید کلاینت
+				// یعنی استریم دانلود همون لحظه fail می‌شد و کلاینت هیچ‌وقت فرصت نمی‌کرد سمت POST
+				// (آپلود) رو باز کنه - فقط sessionId جدید می‌ساخت و از اول retry می‌کرد (دقیقاً همون
+				// چیزی که توی اولین دور تست دیدیم: ۶ تا GET با sessionId متفاوت، بدون هیچ POST).
+				// اینجا استریم رو واقعاً باز نگه می‌داریم (heartbeat هر ۳ ثانیه، حداکثر ۲۵ ثانیه) تا
+				// کلاینت واقعی فرصت کنه سمت POST رو هم امتحان کنه و اون هم capture بشه.
+				const stream = new ReadableStream({
+					start(controller) {
+						controller.enqueue(new TextEncoder().encode("debug-capture-ok\n"));
+						const iv = setInterval(() => {
+							try {
+								controller.enqueue(new TextEncoder().encode(": ping\n\n"));
+							} catch (e) {
+								clearInterval(iv);
+							}
+						}, 3000);
+						setTimeout(() => {
+							clearInterval(iv);
+							try {
+								controller.close();
+							} catch (e) { }
+						}, 25000);
+					},
+				});
+				return new Response(stream, {
+					headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store", "X-Accel-Buffering": "no" },
+				});
+			}
+			return new Response(JSON.stringify({ captured: true }), {
+				headers: { "Content-Type": "application/json; charset=utf-8" },
+			});
+		}
 		// xhttp.md فاز ۹: فقط خوندن و نگه‌داشتن sessionId - هنوز هیچ auth/سوکت/رله‌ای اینجا نیست
 		// (فازهای ۱۱-۱۲). فرمت دقیق مسیر (`<path>/<sessionId>` طبق بند ۳ سند در برابر query param)
 		// با فاز ۱۰ روی یک کلاینت واقعی تایید می‌شه؛ فعلاً هر دو حالت پوشش داده می‌شه تا فاز ۱۶
