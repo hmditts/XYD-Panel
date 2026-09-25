@@ -1166,16 +1166,16 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 // همین فایل بدنه‌ی همون `new Function("connect", view)` است که در stub بیرونی (obfuscated) اجرا
 // می‌شود؛ یعنی اینجا هیچ `export` معتبر نیست (چه `export class`، چه هر export دیگه) - داخل بدنه‌ی
 // Function Constructor غیرمجازه و SyntaxError می‌ده. به همین دلیل این کلاس به‌جای export، به‌عنوان
-// یک property روی خودِ __WORKER_EXPORT__ برگردانده می‌شود (پایین‌تر: `XhttpSession,`).
+// یک property روی خودِ __WORKER_EXPORT__ برگردانده می‌شود (پایین‌تر: `StateStore,`).
 // **برای این‌که بایندینگ Durable Object واقعاً روی کلودفلر کار کنه، stub بیرونی (بیرون از این فایل،
 // همونی که مطابق بند ۲ خلاصه با ENCODE ساخته می‌شه) باید کنار `export default name;` این خط هم
 // اضافه بشه:**
-//     export const XhttpSession = name.XhttpSession;
-// بدون این خط، بایندینگ `class_name: "XhttpSession"` که دو هندلر آپدیت خودکار پایین‌تر اضافه
+//     export const StateStore = name.StateStore;
+// بدون این خط، بایندینگ `class_name: "StateStore"` که دو هندلر آپدیت خودکار پایین‌تر اضافه
 // می‌کنند موقع دیپلوی روی کلودفلر شکست می‌خورد ("class not exported"). این رو حتماً قبل از فاز ۲
 // روی یک اکانت واقعی تست کنید (کنار همون ریسک شناخته‌شده‌ی «فعال‌سازی اولین DO ممکنه دستی باشه»
 // که در خودِ xhttp.md فاز ۱ هشدار داده شده) - تست با درخواست GET به /api/xhttp-do-test.
-class XhttpSession {
+class StateStore {
 	constructor(state, env) {
 		this.state = state;
 		this.env = env;
@@ -1262,9 +1262,9 @@ const __WORKER_EXPORT__ = {
 			return new Response("Internal Server Error", { status: 500 });
 		}
 	},
-	// xhttp.md فاز ۱ - نگاه کنید به کامنت بالای کلاس XhttpSession برای این‌که چرا export مستقیم
+	// xhttp.md فاز ۱ - نگاه کنید به کامنت بالای کلاس StateStore برای این‌که چرا export مستقیم
 	// اینجا ممکن نیست و stub بیرونی چه کاری باید بکنه.
-	XhttpSession,
+	StateStore,
 };
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
@@ -1698,7 +1698,7 @@ const Router = {
 			if (!env.XHTTP_SESSION) {
 				return new Response(
 					JSON.stringify({
-						error: "بایندینگ XHTTP_SESSION هنوز روی این Worker تنظیم نشده. یک‌بار از /api/update-panel (یا update-panel-github) دیپلوی بزنید تا بایندینگ + migration کلاس XhttpSession اضافه بشه، بعد دوباره امتحان کنید.",
+						error: "بایندینگ XHTTP_SESSION هنوز روی این Worker تنظیم نشده. یک‌بار از /api/update-panel (یا update-panel-github) دیپلوی بزنید تا بایندینگ + migration کلاس StateStore اضافه بشه، بعد دوباره امتحان کنید.",
 					}),
 					{ status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } }
 				);
@@ -1748,7 +1748,7 @@ const Router = {
 				const newCode = await githubRes.text();
 				assertDeployableWorkerModule(newCode, "zeus.obfuscated.js");
 				// xhttp.md فاز ۱: اگه stub بیرونی هنوز آپدیت نشده (نگاه کنید به کامنت بالای کلاس
-				// XhttpSession)، همین‌جا هم رد می‌شه چون کلاس export نشده - قبل از دیپلوی واقعی چک شود.
+				// StateStore)، همین‌جا هم رد می‌شه چون کلاس export نشده - قبل از دیپلوی واقعی چک شود.
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
@@ -1783,7 +1783,7 @@ const Router = {
 				// (این‌که آیا کلودفلر بدون old_tag/new_tag صریح این migration رو قبول می‌کنه یا نه).
 				const hasXhttpDoBinding = newBindings.some((b) => b.type === "durable_object_namespace" && b.name === "XHTTP_SESSION");
 				if (!hasXhttpDoBinding) {
-					newBindings.push({ type: "durable_object_namespace", name: "XHTTP_SESSION", class_name: "XhttpSession" });
+					newBindings.push({ type: "durable_object_namespace", name: "XHTTP_SESSION", class_name: "StateStore" });
 				}
 				const metadata = {
 					main_module: "zeus.js",
@@ -1792,7 +1792,7 @@ const Router = {
 					bindings: newBindings,
 				};
 				if (!hasXhttpDoBinding) {
-					metadata.migrations = { new_classes: ["XhttpSession"] };
+					metadata.migrations = { new_sqlite_classes: ["StateStore"] };
 				}
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
@@ -1850,7 +1850,7 @@ const Router = {
 				if (!newCode || newCode.trim().length < 100) throw new Error("فایل دریافتی از گیت‌هاب خالی یا نامعتبر است.");
 				assertDeployableWorkerModule(newCode, "worker.js");
 				// xhttp.md فاز ۱: اگه stub بیرونی هنوز آپدیت نشده (نگاه کنید به کامنت بالای کلاس
-				// XhttpSession)، همین‌جا هم رد می‌شه چون کلاس export نشده - قبل از دیپلوی واقعی چک شود.
+				// StateStore)، همین‌جا هم رد می‌شه چون کلاس export نشده - قبل از دیپلوی واقعی چک شود.
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
@@ -1885,7 +1885,7 @@ const Router = {
 				// (این‌که آیا کلودفلر بدون old_tag/new_tag صریح این migration رو قبول می‌کنه یا نه).
 				const hasXhttpDoBinding = newBindings.some((b) => b.type === "durable_object_namespace" && b.name === "XHTTP_SESSION");
 				if (!hasXhttpDoBinding) {
-					newBindings.push({ type: "durable_object_namespace", name: "XHTTP_SESSION", class_name: "XhttpSession" });
+					newBindings.push({ type: "durable_object_namespace", name: "XHTTP_SESSION", class_name: "StateStore" });
 				}
 				const metadata = {
 					main_module: "zeus.js",
@@ -1894,7 +1894,7 @@ const Router = {
 					bindings: newBindings,
 				};
 				if (!hasXhttpDoBinding) {
-					metadata.migrations = { new_classes: ["XhttpSession"] };
+					metadata.migrations = { new_sqlite_classes: ["StateStore"] };
 				}
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
