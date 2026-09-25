@@ -1247,14 +1247,23 @@ class StateStore {
 			});
 			if (this.debugLog.length > 20) this.debugLog.length = 20;
 			if (request.method === "GET") {
-				return new Response("debug-capture-ok\n", {
-					headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store" },
-				});
-			}
-			return new Response(JSON.stringify({ captured: true }), {
-				headers: { "Content-Type": "application/json; charset=utf-8" },
-			});
-		}
+	const stream = new ReadableStream({
+		start(controller) {
+			controller.enqueue(new TextEncoder().encode("debug-capture-ok\n"));
+			const iv = setInterval(() => {
+				try { controller.enqueue(new TextEncoder().encode(": ping\n\n")); }
+				catch (e) { clearInterval(iv); }
+			}, 3000);
+			setTimeout(() => {
+				clearInterval(iv);
+				try { controller.close(); } catch (e) { }
+			}, 25000);
+		},
+	});
+	return new Response(stream, {
+		headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store", "X-Accel-Buffering": "no" },
+	});
+}
 		// xhttp.md فاز ۹: فقط خوندن و نگه‌داشتن sessionId - هنوز هیچ auth/سوکت/رله‌ای اینجا نیست
 		// (فازهای ۱۱-۱۲). فرمت دقیق مسیر (`<path>/<sessionId>` طبق بند ۳ سند در برابر query param)
 		// با فاز ۱۰ روی یک کلاینت واقعی تایید می‌شه؛ فعلاً هر دو حالت پوشش داده می‌شه تا فاز ۱۶
