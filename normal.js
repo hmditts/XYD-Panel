@@ -5180,7 +5180,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 function bracketIPv6(host) {
 	return typeof host === "string" && host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
-async function waitSocketOpened(socket, ms = 5000) {
+async function waitSocketOpened(socket, ms = 12000) {
 	let timer;
 	try {
 		await Promise.race([
@@ -5438,7 +5438,7 @@ async function connectProxy(proxyStr, destAddr, destPort, initialData) {
 async function connectSocks4(proxyStr, destAddr, destPort, initialData) {
 	const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 1080);
 	const socket = connect({ hostname: bracketIPv6(host), port: port });
-	await waitSocketOpened(socket, 5000);
+	await waitSocketOpened(socket, 12000);
 	const reader = socket.readable.getReader();
 	const writer = socket.writable.getWriter();
 	// همون رفع باگ «یک read ممکنه نصفه‌نیمه برسه» که در connectSocks5 اعمال شد، اینجا هم لازمه.
@@ -5543,7 +5543,7 @@ function parseProxyConfig(proxyStr, defaultPort) {
 async function connectSocks5(socksStr, destAddr, destPort, initialData) {
 	const { user, pass, host, port, auth } = parseProxyConfig(socksStr, 1080);
 	const socket = connect({ hostname: bracketIPv6(host), port: port });
-	await waitSocketOpened(socket, 5000);
+	await waitSocketOpened(socket, 12000);
 	const reader = socket.readable.getReader();
 	const writer = socket.writable.getWriter();
 	// بعضی پـروکـسـی‌ها پاسخ SOCKS5 رو توی چند بسته‌ی جدا (چند تا TCP read) می‌فرستن.
@@ -5642,7 +5642,7 @@ async function connectSocks5(socksStr, destAddr, destPort, initialData) {
 async function connectHttp(proxyStr, destAddr, destPort, initialData) {
 	const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 80);
 	const socket = connect({ hostname: bracketIPv6(host), port: port });
-	await waitSocketOpened(socket, 5000);
+	await waitSocketOpened(socket, 12000);
 	const reader = socket.readable.getReader();
 	const writer = socket.writable.getWriter();
 	const readWithTimeout = (r, ms) => Promise.race([
