@@ -1215,12 +1215,21 @@ class StateStore {
 		const instanceName = this.state && this.state.id && this.state.id.name;
 		if (instanceName === "wire-debug-log") {
 			if (!this.debugLog) this.debugLog = [];
+			// xhttp.md فاز ۱۰ - این دو شمارنده هیچ‌وقت trim نمی‌شن (برخلاف this.debugLog که سقف
+			// دارد)؛ اگه کلاینت خیلی سریع retry کنه (که داریم می‌بینیم) و بیشتر از سقف this.debugLog
+			// درخواست بزنه، یه POST قدیمی‌تر ممکنه از آرایه بیفته بیرون - ولی این شمارنده‌ها همچنان
+			// نشون می‌دن که آیا اصلاً تا حالا یه POST واقعی رسیده یا نه.
+			if (this.debugTotalGet === undefined) this.debugTotalGet = 0;
+			if (this.debugTotalPost === undefined) this.debugTotalPost = 0;
 			const debugUrl = new URL(request.url);
 			if (debugUrl.pathname === "/__wire_debug_view__") {
-				return new Response(JSON.stringify({ log: this.debugLog }, null, 2), {
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
+				return new Response(
+					JSON.stringify({ totalGet: this.debugTotalGet, totalPost: this.debugTotalPost, log: this.debugLog }, null, 2),
+					{ headers: { "Content-Type": "application/json; charset=utf-8" } }
+				);
 			}
+			if (request.method === "GET") this.debugTotalGet++;
+			if (request.method === "POST") this.debugTotalPost++;
 			const headersObj = {};
 			for (const [k, v] of request.headers.entries()) headersObj[k] = v;
 			let bodyLength = 0;
@@ -1245,7 +1254,7 @@ class StateStore {
 				bodyLength,
 				bodyPreviewHex,
 			});
-			if (this.debugLog.length > 20) this.debugLog.length = 20;
+			if (this.debugLog.length > 150) this.debugLog.length = 150;
 			if (request.method === "GET") {
 				// xhttp.md فاز ۱۰ - قبلاً اینجا یه پاسخ کوتاه و فوری برمی‌گشت و می‌بست؛ از دید کلاینت
 				// یعنی استریم دانلود همون لحظه fail می‌شد و کلاینت هیچ‌وقت فرصت نمی‌کرد سمت POST
