@@ -1178,8 +1178,8 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 }
 // ===== xhttp.md — فاز ۱: اسکلت خالی Durable Object (بدون منطق واقعی) =====
 // این کلاس قراره در فازهای ۹ تا ۱۵ هماهنگ‌کننده‌ی GET/POST سشن XHTTP بشه (یک instance به‌ازای هر
-// sessionId). فعلاً فقط یک fetch تستی داره تا مسیر «بایندینگ + دیپلوی» تایید بشه؛ منطق واقعی
-// (state سشن، رله‌ی دوطرفه‌ی سوکت و...) عمداً اینجا نیست.
+// sessionId). فاز ۹ فقط اسکلت state رو اضافه کرده (فیلدهای اولیه‌ی سشن + خوندن sessionId از URL)؛
+// رله‌ی واقعی سوکت، auth، حسابداری ترافیک و بستن سشن هنوز نیستن - اونا فازهای ۱۱ تا ۱۵ هستن.
 //
 // ⚠️ نکته‌ی معماری مهم (این فایل خودش ماژول دیپلوی‌شونده نیست): طبق بند ۲ خلاصه‌ی پروژه، کل محتوای
 // همین فایل بدنه‌ی همون `new Function("connect", view)` است که در stub بیرونی (obfuscated) اجرا
@@ -1198,8 +1198,25 @@ class StateStore {
 	constructor(state, env) {
 		this.state = state;
 		this.env = env;
+		// xhttp.md فاز ۹ - اسکلت state سشن. این فیلدها هنوز جایی واقعاً relay/auth نمی‌شن؛
+		// فقط جای رزروشده‌ی فازهای بعدی گروه C هستن:
+		this.sessionId = null; // پایین‌تر توی fetch از URL خونده می‌شه
+		this.socket = null; // فاز ۱۱: سوکت connect() مقصد، وقتی POST بازش می‌کنه
+		this.status = "awaiting-header"; // 'awaiting-header' | 'connected' | 'closed' - فازهای ۱۱/۱۲/۱۵ عوضش می‌کنن
+		this.headerBuffer = []; // فاز ۱۱: بافر بایت خام تا رسیدن به اندازه‌ی کافی برای parseVlessTrojanHeader (فاز ۲)
+		this.lastActivity = Date.now(); // فاز ۱۵: مبنای Alarm API برای timeout بی‌فعالیتی
 	}
 	async fetch(request) {
+		// xhttp.md فاز ۹: فقط خوندن و نگه‌داشتن sessionId - هنوز هیچ auth/سوکت/رله‌ای اینجا نیست
+		// (فازهای ۱۱-۱۲). فرمت دقیق مسیر (`<path>/<sessionId>` طبق بند ۳ سند در برابر query param)
+		// با فاز ۱۰ روی یک کلاینت واقعی تایید می‌شه؛ فعلاً هر دو حالت پوشش داده می‌شه تا فاز ۱۶
+		// (روتینگ واقعی سمت Worker) به هرکدوم که تایید شد راحت وایر بشه، بدون نیاز به تغییر اینجا.
+		if (!this.sessionId) {
+			const url = new URL(request.url);
+			const segments = url.pathname.split("/").filter(Boolean);
+			this.sessionId = url.searchParams.get("sessionId") || (segments.length ? segments[segments.length - 1] : null);
+		}
+		this.lastActivity = Date.now();
 		return new Response("ok");
 	}
 }
@@ -11958,7 +11975,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '4.0.6';
+const CURRENT_VERSION = '4.0.9';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
