@@ -362,6 +362,40 @@ function addUserTrafficBytes(env, ctx, username, bytes) {
 		else writeTask();
 	}
 }
+// باگ‌فیکس فاز ۱۳ (گزارش کاربر: MB/آنلاین صفر، Request خیلی کمتر از واقعی): addUserTrafficBytes
+// فقط وقتی به آستانه‌ی دبانس می‌رسیم (۵۰۰ مگابایت طی ۳ دقیقه، یا هر مقدار>۰ بعد از ۱۵ دقیقه از
+// آخرین نوشتن) واقعاً به D1 می‌نویسه - در غیر این صورت فقط توی GLOBAL_TRAFFIC_CACHE/USER_REQ_CACHE
+// می‌مونه. برای WS این بی‌خطره چون همون Map توی کل عمر Worker (بین همه‌ی کاربرها/اتصال‌ها) زنده
+// می‌مونه و هم به‌مرور با اتصال‌های بعدی، هم با سوئیپ دوره‌ای flushExpiredTraffic (که پنل ادمین
+// صداش می‌زنه) جمع می‌شه. برای XHTTP این فرض غلطه: هر سشن یک Durable Object جداست، یعنی یک
+// JS isolate کاملاً مجزا از Worker اصلی و از بقیه‌ی سشن‌ها - GLOBAL_TRAFFIC_CACHE/USER_REQ_CACHE
+// این‌جا یک Map خصوصیِ همون instance‌ان، نه همون Mapی که Worker اصلی/flushExpiredTraffic می‌بینه.
+// اگه سشن قبل از رسیدن به آستانه‌ی بالا بسته بشه (خیلی از اتصال‌های کوتاه xhttp همین‌طورن)، هر
+// بایت/ریکوئستی که هنوز commit نشده با از بین رفتن instance این DO برای همیشه گم می‌شه - هیچ
+// سوئیپ بیرونی‌ای نمی‌تونه بهش برسه. این تابع همون منطق commit بالا رو بدون شرط آستانه اجرا
+// می‌کنه؛ _closeSession باید همیشه صداش بزنه تا این نشتی جمع بشه.
+function forceFlushUserTraffic(env, ctx, username) {
+	if (!username) return;
+	let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+	let toCommitReq = USER_REQ_CACHE.get(username) || 0;
+	if (toCommit <= 0 && toCommitReq <= 0) return;
+	GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) - toCommit);
+	USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) - toCommitReq);
+	let deltaGb = toCommit / (1024 * 1024 * 1024);
+	let now = Date.now();
+	let writeTask = async () => {
+		try {
+			await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, now, username).run();
+			await recordDailyTraffic(env, ctx, deltaGb);
+		} catch (e) {
+			console.error(e.message);
+			GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) + toCommit);
+			USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) + toCommitReq);
+		}
+	};
+	if (ctx) ctx.waitUntil(writeTask());
+	else writeTask();
+}
 // ---- Per-connection user-auth cache (D1 read reduction) --------------------------------------
 // Same caches.default (edge Cache API) pattern as checkAutoResets() above, applied to the
 // single hottest D1 read in this file: "which user does this uuid / trojan-hash belong to" -
@@ -1368,7 +1402,7 @@ class StateStore {
 					bytesToAdd += this.uncountedBytes;
 					this.uncountedBytes = 0;
 				}
-				addUserTrafficBytes(this.env, null, this.username, bytesToAdd);
+				addUserTrafficBytes(this.env, this.state, this.username, bytesToAdd);
 			}
 		}
 		if (this.status === "connected") {
@@ -1536,6 +1570,12 @@ class StateStore {
 		try { this.socket?.close(); } catch (e) { }
 		try { this.uploadQueue?.clear(); } catch (e) { }
 		this.pendingPackets.clear();
+		// باگ‌فیکس فاز ۱۳: بدون این خط، هر بایت/ریکوئستی که هنوز به آستانه‌ی دبانسِ
+		// addUserTrafficBytes نرسیده بود، همین‌جا با بسته‌شدنِ سشن برای همیشه گم می‌شد (توضیح
+		// کامل بالای تعریف forceFlushUserTraffic). این‌جا تنها نقطه‌ایه که همه‌ی مسیرهای بسته‌شدنِ
+		// سشن (auth رد شد، limit، connect() شکست خورد، سوکت مقصد بست، خطای غیرمنتظره) از توش رد
+		// می‌شن، پس بهترین جا برای فلاش اجباریه.
+		try { forceFlushUserTraffic(this.env, this.state, this.username); } catch (e) { }
 		// اگه هیچ‌وقت به "connected" نرسیده بودیم، هر GET منتظرِ readyPromise باید با خطا تموم
 		// بشه؛ اگه قبلاً resolve شده بود، این reject بی‌اثره (یک Promise فقط یک‌بار settle می‌شه).
 		if (this._readyReject) {
@@ -1587,7 +1627,7 @@ class StateStore {
 					// xhttp.md فاز ۱۳: دقیقاً هم‌الگو با addBytes صدا زده شده از connectStreams (WS، مسیر
 					// دانلود) - اینجا status از قبل "connected"ه (چک شده قبل از ساختن این استریم)، پس
 					// username همیشه معلومه، نیازی به منطق uncountedBytes نیست.
-					if (value && value.byteLength) addUserTrafficBytes(store.env, null, store.username, value.byteLength);
+					if (value && value.byteLength) addUserTrafficBytes(store.env, store.state, store.username, value.byteLength);
 				} catch (e) {
 					try { controller.error(e); } catch (_e) { }
 					store._closeSession("download_relay_error:" + (e && e.message));
