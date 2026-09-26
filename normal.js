@@ -1316,11 +1316,16 @@ class StateStore {
 		// status === "awaiting-header": فاز ۲ - همون پارسر مشترکی که handlevIees هم استفاده می‌کنه
 		this.headerBuffer = concatBytes(this.headerBuffer, chunk);
 		const parsedHeader = parseVlessTrojanHeader(this.headerBuffer);
-		if (parsedHeader === null) return; // بایت کافی هنوز نرسیده، منتظر بسته‌ی بعدی
+		if (parsedHeader === null) {
+			console.log("[XHTTP-DEBUG] header parse: not enough bytes yet, have", this.headerBuffer.byteLength);
+			return; // بایت کافی هنوز نرسیده، منتظر بسته‌ی بعدی
+		}
 		if (parsedHeader.invalid) {
+			console.log("[XHTTP-DEBUG] closing: header parse returned invalid, bytes=", this.headerBuffer.byteLength);
 			this._closeSession();
 			return;
 		}
+		console.log("[XHTTP-DEBUG] header parsed ok:", JSON.stringify({ isTrojan: parsedHeader.isTrojan, cmd: parsedHeader.cmd, address: parsedHeader.address, port: parsedHeader.port }));
 		this.headerBuffer = new Uint8Array(0); // دیگه لازم نیست
 		await this._tryOpenConnection(parsedHeader);
 	}
@@ -1349,20 +1354,25 @@ class StateStore {
 					}
 					putCachedAuthUser(null, authCacheKind, uuidOrHash, user || null);
 				}
-			} catch (e) { }
+			} catch (e) {
+				console.log("[XHTTP-DEBUG] auth lookup threw:", e && e.message);
+			}
 			if (!user) {
+				console.log("[XHTTP-DEBUG] closing: no user found for", isTrojan ? "trojan_hash" : "uuid", "=", uuidOrHash);
 				this._closeSession();
 				return;
 			}
+			console.log("[XHTTP-DEBUG] user found:", user.username, "is_active=", user.is_active, "connection_type=", user.connection_type);
 			const userConn = String(user.connection_type || "vless").toLowerCase();
 			if (isTrojan) {
-				if (!userConn.includes("trojan")) { this._closeSession(); return; }
+				if (!userConn.includes("trojan")) { console.log("[XHTTP-DEBUG] closing: connection_type mismatch (expected trojan, got", userConn, ")"); this._closeSession(); return; }
 			} else {
-				if (!userConn.includes("vless") && userConn !== "vl" + "e" + "ss") { this._closeSession(); return; }
+				if (!userConn.includes("vless") && userConn !== "vl" + "e" + "ss") { console.log("[XHTTP-DEBUG] closing: connection_type mismatch (expected vless, got", userConn, ")"); this._closeSession(); return; }
 			}
 			// UDP/DNS از طریق xhttp فعلاً پشتیبانی نمی‌شه - فقط TCP؛ این محدودیتِ آگاهانه‌ایه،
 			// جزو هیچ‌کدوم از فازهای فعلی xhttp.md نیست.
 			if ((isTrojan && cmd === 3) || (!isTrojan && cmd === 2)) {
+				console.log("[XHTTP-DEBUG] closing: UDP/DNS cmd not supported, cmd=", cmd);
 				this._closeSession();
 				return;
 			}
@@ -1370,11 +1380,11 @@ class StateStore {
 			// ⚠️ این بلوک عیناً از handlevIees کپی شده (نه یک تابع مشترک - استخراجش جزو فازهای
 			// فعلی نبود)؛ طبق هشدار بند ۱-۲ خلاصه‌ی پروژه، هر تغییری در این شرط‌ها داخل
 			// handlevIees باید دستی اینجا هم اعمال بشه.
-			if (user.is_active === 0) { this._closeSession(); return; }
+			if (user.is_active === 0) { console.log("[XHTTP-DEBUG] closing: is_active === 0"); this._closeSession(); return; }
 			const liveGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024));
-			if (user.limit_gb && liveGb >= user.limit_gb) { this._closeSession(); return; }
-			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(user.username) || 0) >= user.limit_req) { this._closeSession(); return; }
-			if (await isGlobalReqLimitReached(this.env, null)) { this._closeSession(); return; }
+			if (user.limit_gb && liveGb >= user.limit_gb) { console.log("[XHTTP-DEBUG] closing: limit_gb reached", liveGb, ">=", user.limit_gb); this._closeSession(); return; }
+			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(user.username) || 0) >= user.limit_req) { console.log("[XHTTP-DEBUG] closing: limit_req reached"); this._closeSession(); return; }
+			if (await isGlobalReqLimitReached(this.env, null)) { console.log("[XHTTP-DEBUG] closing: global req limit reached"); this._closeSession(); return; }
 			if (user.expiry_days) {
 				let isTimeExpired = false;
 				if (user.start_on_first_connect === 1) {
@@ -1388,6 +1398,7 @@ class StateStore {
 					if (new Date() > expiryDate) isTimeExpired = true;
 				}
 				if (isTimeExpired) {
+					console.log("[XHTTP-DEBUG] closing: user expired");
 					try {
 						await this.env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(user.uuid).run();
 						await invalidateUserAuthCache(null, user.uuid, user.trojan_hash);
@@ -1400,13 +1411,16 @@ class StateStore {
 			this.validUUID = user.uuid;
 			this.respHeader = respHeader;
 			let socket;
+			console.log("[XHTTP-DEBUG] all checks passed, connecting to", address, ":", port);
 			try {
 				socket = connect({ hostname: bracketIPv6(address), port: port });
 				await waitSocketOpened(socket, 12000);
 			} catch (e) {
+				console.log("[XHTTP-DEBUG] closing: connect()/waitSocketOpened failed:", e && e.message);
 				this._closeSession();
 				return;
 			}
+			console.log("[XHTTP-DEBUG] socket opened successfully");
 			this.socket = socket;
 			this.writer = socket.writable.getWriter();
 			// فاز ۱۱: همون createUpstreamQueue مشترکی که صف آپلود WS استفاده می‌کنه، نه یک
