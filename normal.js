@@ -362,6 +362,40 @@ function addUserTrafficBytes(env, ctx, username, bytes) {
 		else writeTask();
 	}
 }
+// باگ‌فیکس فاز ۱۳ (گزارش کاربر: MB/آنلاین صفر، Request خیلی کمتر از واقعی): addUserTrafficBytes
+// فقط وقتی به آستانه‌ی دبانس می‌رسیم (۵۰۰ مگابایت طی ۳ دقیقه، یا هر مقدار>۰ بعد از ۱۵ دقیقه از
+// آخرین نوشتن) واقعاً به D1 می‌نویسه - در غیر این صورت فقط توی GLOBAL_TRAFFIC_CACHE/USER_REQ_CACHE
+// می‌مونه. برای WS این بی‌خطره چون همون Map توی کل عمر Worker (بین همه‌ی کاربرها/اتصال‌ها) زنده
+// می‌مونه و هم به‌مرور با اتصال‌های بعدی، هم با سوئیپ دوره‌ای flushExpiredTraffic (که پنل ادمین
+// صداش می‌زنه) جمع می‌شه. برای XHTTP این فرض غلطه: هر سشن یک Durable Object جداست، یعنی یک
+// JS isolate کاملاً مجزا از Worker اصلی و از بقیه‌ی سشن‌ها - GLOBAL_TRAFFIC_CACHE/USER_REQ_CACHE
+// این‌جا یک Map خصوصیِ همون instance‌ان، نه همون Mapی که Worker اصلی/flushExpiredTraffic می‌بینه.
+// اگه سشن قبل از رسیدن به آستانه‌ی بالا بسته بشه (خیلی از اتصال‌های کوتاه xhttp همین‌طورن)، هر
+// بایت/ریکوئستی که هنوز commit نشده با از بین رفتن instance این DO برای همیشه گم می‌شه - هیچ
+// سوئیپ بیرونی‌ای نمی‌تونه بهش برسه. این تابع همون منطق commit بالا رو بدون شرط آستانه اجرا
+// می‌کنه؛ _closeSession باید همیشه صداش بزنه تا این نشتی جمع بشه.
+function forceFlushUserTraffic(env, ctx, username) {
+	if (!username) return;
+	let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+	let toCommitReq = USER_REQ_CACHE.get(username) || 0;
+	if (toCommit <= 0 && toCommitReq <= 0) return;
+	GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) - toCommit);
+	USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) - toCommitReq);
+	let deltaGb = toCommit / (1024 * 1024 * 1024);
+	let now = Date.now();
+	let writeTask = async () => {
+		try {
+			await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, now, username).run();
+			await recordDailyTraffic(env, ctx, deltaGb);
+		} catch (e) {
+			console.error(e.message);
+			GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) + toCommit);
+			USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) + toCommitReq);
+		}
+	};
+	if (ctx) ctx.waitUntil(writeTask());
+	else writeTask();
+}
 // ---- Per-connection user-auth cache (D1 read reduction) --------------------------------------
 // Same caches.default (edge Cache API) pattern as checkAutoResets() above, applied to the
 // single hottest D1 read in this file: "which user does this uuid / trojan-hash belong to" -
@@ -1221,6 +1255,15 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 		GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
 	}
 }
+// xhttp.md فاز ۱۵: تایم‌اوت بی‌فعالیتِ سشن‌های xhttp، از طریق Alarm API.
+// بدون این، سشنی که سوکت مقصدش باز مونده ولی نه مقصد چیزی می‌فرسته نه کلاینت GET/POST جدیدی
+// می‌زنه هیچ‌وقت بسته نمی‌شه (تنها نقاط بسته‌شدنِ فعلی: auth/limit رد شدن، مقصد سوکتش رو ببنده،
+// یا کلاینت استریم GET رو کنسل کنه) - و چون سوکت باز مانع hibernate شدنِ DO می‌شه، یعنی duration
+// بی‌دلیل مصرف می‌شه (دقیقاً همون چیزی که توی متریک Durable Objects دیده شد). lastActivity از قبل
+// (فاز ۹/۱۱/۱۲) روی هر fetch() و هر بایت دانلودی آپدیت می‌شه؛ این فاز فقط یک ناظر دوره‌ای
+// (این‌جا via Alarm API، نه setInterval - که خودش هم جلوی hibernate رو می‌گرفت) بهش اضافه می‌کنه.
+const XHTTP_IDLE_TIMEOUT_MS = 120000; // ۲ دقیقه بی‌فعالیتی مطلق (نه آپلود، نه دانلود، نه GET/POST جدید) = ببند
+const XHTTP_IDLE_CHECK_INTERVAL_MS = 60000; // هر ۶۰ ثانیه یک‌بار چک کن - نه زودتر (که خودش duration اضافه بخوره)، نه دیرتر (که idle واقعی رو دیر بگیره)
 // ===== xhttp.md — فاز ۱: اسکلت خالی Durable Object (بدون منطق واقعی) =====
 // این کلاس قراره در فازهای ۹ تا ۱۵ هماهنگ‌کننده‌ی GET/POST سشن XHTTP بشه (یک instance به‌ازای هر
 // sessionId). فاز ۹ فقط اسکلت state رو اضافه کرده (فیلدهای اولیه‌ی سشن + خوندن sessionId از URL)؛
@@ -1368,7 +1411,7 @@ class StateStore {
 					bytesToAdd += this.uncountedBytes;
 					this.uncountedBytes = 0;
 				}
-				addUserTrafficBytes(this.env, null, this.username, bytesToAdd);
+				addUserTrafficBytes(this.env, this.state, this.username, bytesToAdd);
 			}
 		}
 		if (this.status === "connected") {
@@ -1513,6 +1556,11 @@ class StateStore {
 				name: "xhttpUploadQueue",
 			});
 			this.status = "connected";
+			// xhttp.md فاز ۱۵: از همین لحظه که سشن واقعاً «زنده»ست (سوکت مقصد باز شده)، ناظر
+			// idle timeout رو شروع کن. عمداً await نمی‌شه - نباید جواب‌دادن به کلاینت رو معطل کنه؛
+			// اگه setAlarm خودش شکست بخوره (نادره)، فقط یعنی این سشن idle-timeout نمی‌گیره، نه
+			// این‌که کل اتصال خراب بشه.
+			this.state.storage.setAlarm(Date.now() + XHTTP_IDLE_CHECK_INTERVAL_MS).catch(() => { });
 			if (this._readyResolve) {
 				try { this._readyResolve(); } catch (e) { }
 			}
@@ -1536,11 +1584,34 @@ class StateStore {
 		try { this.socket?.close(); } catch (e) { }
 		try { this.uploadQueue?.clear(); } catch (e) { }
 		this.pendingPackets.clear();
+		// xhttp.md فاز ۱۵: اگه هنوز alarm بی‌فعالیتی زمان‌بندی‌شده مونده، لازم نیست یک بار دیگه
+		// DO رو بیدار کنه فقط برای این‌که ببینه از قبل بسته شده - همین‌جا حذفش می‌کنیم.
+		try { this.state.storage.deleteAlarm(); } catch (e) { }
+		// باگ‌فیکس فاز ۱۳: بدون این خط، هر بایت/ریکوئستی که هنوز به آستانه‌ی دبانسِ
+		// addUserTrafficBytes نرسیده بود، همین‌جا با بسته‌شدنِ سشن برای همیشه گم می‌شد (توضیح
+		// کامل بالای تعریف forceFlushUserTraffic). این‌جا تنها نقطه‌ایه که همه‌ی مسیرهای بسته‌شدنِ
+		// سشن (auth رد شد، limit، connect() شکست خورد، سوکت مقصد بست، خطای غیرمنتظره) از توش رد
+		// می‌شن، پس بهترین جا برای فلاش اجباریه.
+		try { forceFlushUserTraffic(this.env, this.state, this.username); } catch (e) { }
 		// اگه هیچ‌وقت به "connected" نرسیده بودیم، هر GET منتظرِ readyPromise باید با خطا تموم
 		// بشه؛ اگه قبلاً resolve شده بود، این reject بی‌اثره (یک Promise فقط یک‌بار settle می‌شه).
 		if (this._readyReject) {
 			try { this._readyReject(new Error("xhttp session closed")); } catch (e) { }
 		}
+	}
+	// xhttp.md فاز ۱۵: فقط خودِ Alarm API کلودفلر این متد رو صدا می‌زنه - جای دیگه‌ای از این
+	// فایل مستقیم صداش نمی‌زنه. اگه از آخرین فعالیت (lastActivity - هر fetch()، هر بایت دانلودی)
+	// به‌اندازه‌ی XHTTP_IDLE_TIMEOUT_MS گذشته باشه، سشن idle حساب می‌شه و بسته می‌شه (که یعنی
+	// سوکت مقصد هم بسته می‌شه، DO دیگه پین نمی‌مونه و می‌تونه evict/hibernate بشه). وگرنه فقط
+	// یک alarm دیگه برای دور بعدی چک برنامه‌ریزی می‌کنه.
+	async alarm() {
+		if (this.status === "closed") return;
+		const idleMs = Date.now() - this.lastActivity;
+		if (idleMs >= XHTTP_IDLE_TIMEOUT_MS) {
+			this._closeSession("idle_timeout:" + idleMs + "ms");
+			return;
+		}
+		try { await this.state.storage.setAlarm(Date.now() + XHTTP_IDLE_CHECK_INTERVAL_MS); } catch (e) { }
 	}
 	// ===== xhttp.md فاز ۱۲: مسیر دانلود (GET) و رله‌ی دوطرفه =====
 	async _handleDownload(request) {
@@ -1587,7 +1658,7 @@ class StateStore {
 					// xhttp.md فاز ۱۳: دقیقاً هم‌الگو با addBytes صدا زده شده از connectStreams (WS، مسیر
 					// دانلود) - اینجا status از قبل "connected"ه (چک شده قبل از ساختن این استریم)، پس
 					// username همیشه معلومه، نیازی به منطق uncountedBytes نیست.
-					if (value && value.byteLength) addUserTrafficBytes(store.env, null, store.username, value.byteLength);
+					if (value && value.byteLength) addUserTrafficBytes(store.env, store.state, store.username, value.byteLength);
 				} catch (e) {
 					try { controller.error(e); } catch (_e) { }
 					store._closeSession("download_relay_error:" + (e && e.message));
