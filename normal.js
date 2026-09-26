@@ -1202,6 +1202,7 @@ class StateStore {
 		this.sessionId = null; // پایین‌تر توی fetch از URL خونده می‌شه (method-aware، طبق اصلاحیه‌ی فاز ۱۱)
 		this.socket = null; // فاز ۱۱: سوکت connect() مقصد، وقتی هدر با موفقیت پارس و auth بشه باز می‌شه
 		this.status = "awaiting-header"; // 'awaiting-header' | 'connected' | 'closed' - فاز ۱۱/۱۵ عوضش می‌کنن
+		this.closeReason = null; // دیباگ موقت: چرا _closeSession صدا زده شده - توی پاسخ ۴۱۰ هم برگردونده می‌شه
 		this.headerBuffer = new Uint8Array(0); // فاز ۱۱: بافر بایت خام تا رسیدن به اندازه‌ی کافی برای parseVlessTrojanHeader (فاز ۲)
 		this.lastActivity = Date.now(); // فاز ۱۵: مبنای Alarm API برای timeout بی‌فعالیتی
 		// فاز ۱۱ (اصلاحیه‌ی packet-up): هر POST جدا با seq خودش می‌رسه و ممکنه نامرتب برسه؛
@@ -1262,7 +1263,7 @@ class StateStore {
 	// ===== xhttp.md فاز ۱۱: مسیر آپلود (POST) و باز کردن connect() =====
 	async _handleUploadPacket(request, seq) {
 		if (this.status === "closed") {
-			return new Response("session closed", { status: 410 });
+			return new Response("session closed: " + (this.closeReason || "unknown"), { status: 410 });
 		}
 		let bytes;
 		try {
@@ -1282,7 +1283,7 @@ class StateStore {
 		this.chainLock = run.catch(() => {});
 		await run;
 		if (this.status === "closed") {
-			return new Response("session closed", { status: 410 });
+			return new Response("session closed: " + (this.closeReason || "unknown"), { status: 410 });
 		}
 		return new Response(null, { status: 200 });
 	}
@@ -1296,7 +1297,7 @@ class StateStore {
 			} catch (e) {
 				// خطای پیش‌بینی‌نشده هم سشن رو یتیم نمی‌ذاره - همون رفتار «رد شد → ببند»ی که
 				// بقیه‌ی شاخه‌های این فاز دارن.
-				this._closeSession();
+				this._closeSession("unexpected_error:" + (e && e.message));
 			}
 			if (this.status === "closed") break;
 		}
@@ -1308,7 +1309,7 @@ class StateStore {
 				try {
 					await this.uploadQueue.writeAndAwait(chunk, false);
 				} catch (e) {
-					this._closeSession();
+					this._closeSession("upload_write_failed:" + (e && e.message));
 				}
 			}
 			return;
@@ -1322,7 +1323,7 @@ class StateStore {
 		}
 		if (parsedHeader.invalid) {
 			console.log("[XHTTP-DEBUG] closing: header parse returned invalid, bytes=", this.headerBuffer.byteLength);
-			this._closeSession();
+			this._closeSession("invalid_header");
 			return;
 		}
 		console.log("[XHTTP-DEBUG] header parsed ok:", JSON.stringify({ isTrojan: parsedHeader.isTrojan, cmd: parsedHeader.cmd, address: parsedHeader.address, port: parsedHeader.port }));
@@ -1359,32 +1360,32 @@ class StateStore {
 			}
 			if (!user) {
 				console.log("[XHTTP-DEBUG] closing: no user found for", isTrojan ? "trojan_hash" : "uuid", "=", uuidOrHash);
-				this._closeSession();
+				this._closeSession("no_user_found:" + uuidOrHash);
 				return;
 			}
 			console.log("[XHTTP-DEBUG] user found:", user.username, "is_active=", user.is_active, "connection_type=", user.connection_type);
 			const userConn = String(user.connection_type || "vless").toLowerCase();
 			if (isTrojan) {
-				if (!userConn.includes("trojan")) { console.log("[XHTTP-DEBUG] closing: connection_type mismatch (expected trojan, got", userConn, ")"); this._closeSession(); return; }
+				if (!userConn.includes("trojan")) { console.log("[XHTTP-DEBUG] closing: connection_type mismatch (expected trojan, got", userConn, ")"); this._closeSession("connection_type_mismatch:expected_trojan_got_" + userConn); return; }
 			} else {
-				if (!userConn.includes("vless") && userConn !== "vl" + "e" + "ss") { console.log("[XHTTP-DEBUG] closing: connection_type mismatch (expected vless, got", userConn, ")"); this._closeSession(); return; }
+				if (!userConn.includes("vless") && userConn !== "vl" + "e" + "ss") { console.log("[XHTTP-DEBUG] closing: connection_type mismatch (expected vless, got", userConn, ")"); this._closeSession("connection_type_mismatch:expected_vless_got_" + userConn); return; }
 			}
 			// UDP/DNS از طریق xhttp فعلاً پشتیبانی نمی‌شه - فقط TCP؛ این محدودیتِ آگاهانه‌ایه،
 			// جزو هیچ‌کدوم از فازهای فعلی xhttp.md نیست.
 			if ((isTrojan && cmd === 3) || (!isTrojan && cmd === 2)) {
 				console.log("[XHTTP-DEBUG] closing: UDP/DNS cmd not supported, cmd=", cmd);
-				this._closeSession();
+				this._closeSession("udp_dns_not_supported");
 				return;
 			}
 			// xhttp.md فاز ۱۱: دقیقاً همون شرط‌هایی که handlevIees قبل از باز کردن سوکت چک می‌کنه.
 			// ⚠️ این بلوک عیناً از handlevIees کپی شده (نه یک تابع مشترک - استخراجش جزو فازهای
 			// فعلی نبود)؛ طبق هشدار بند ۱-۲ خلاصه‌ی پروژه، هر تغییری در این شرط‌ها داخل
 			// handlevIees باید دستی اینجا هم اعمال بشه.
-			if (user.is_active === 0) { console.log("[XHTTP-DEBUG] closing: is_active === 0"); this._closeSession(); return; }
+			if (user.is_active === 0) { console.log("[XHTTP-DEBUG] closing: is_active === 0"); this._closeSession("user_inactive"); return; }
 			const liveGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024));
-			if (user.limit_gb && liveGb >= user.limit_gb) { console.log("[XHTTP-DEBUG] closing: limit_gb reached", liveGb, ">=", user.limit_gb); this._closeSession(); return; }
-			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(user.username) || 0) >= user.limit_req) { console.log("[XHTTP-DEBUG] closing: limit_req reached"); this._closeSession(); return; }
-			if (await isGlobalReqLimitReached(this.env, null)) { console.log("[XHTTP-DEBUG] closing: global req limit reached"); this._closeSession(); return; }
+			if (user.limit_gb && liveGb >= user.limit_gb) { console.log("[XHTTP-DEBUG] closing: limit_gb reached", liveGb, ">=", user.limit_gb); this._closeSession("limit_gb_reached"); return; }
+			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(user.username) || 0) >= user.limit_req) { console.log("[XHTTP-DEBUG] closing: limit_req reached"); this._closeSession("limit_req_reached"); return; }
+			if (await isGlobalReqLimitReached(this.env, null)) { console.log("[XHTTP-DEBUG] closing: global req limit reached"); this._closeSession("global_req_limit_reached"); return; }
 			if (user.expiry_days) {
 				let isTimeExpired = false;
 				if (user.start_on_first_connect === 1) {
@@ -1403,7 +1404,7 @@ class StateStore {
 						await this.env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(user.uuid).run();
 						await invalidateUserAuthCache(null, user.uuid, user.trojan_hash);
 					} catch (e) { }
-					this._closeSession();
+					this._closeSession("user_expired");
 					return;
 				}
 			}
@@ -1417,7 +1418,7 @@ class StateStore {
 				await waitSocketOpened(socket, 12000);
 			} catch (e) {
 				console.log("[XHTTP-DEBUG] closing: connect()/waitSocketOpened failed:", e && e.message);
-				this._closeSession();
+				this._closeSession("connect_failed:" + (e && e.message));
 				return;
 			}
 			console.log("[XHTTP-DEBUG] socket opened successfully");
@@ -1429,7 +1430,7 @@ class StateStore {
 				getWriter: () => this.writer,
 				releaseWriter: () => { try { this.writer?.releaseLock(); } catch (e) { } this.writer = null; },
 				retryConnect: null, // فاز ۱۱: بدون reconnect خودکار - جزو این فاز نیست
-				closeConnection: () => this._closeSession(),
+				closeConnection: () => this._closeSession("upload_queue_closed_connection"),
 				name: "xhttpUploadQueue",
 			});
 			this.status = "connected";
@@ -1440,7 +1441,7 @@ class StateStore {
 				try {
 					await this.uploadQueue.writeAndAwait(remainingPayload, false);
 				} catch (e) {
-					this._closeSession();
+					this._closeSession("initial_payload_write_failed:" + (e && e.message));
 				}
 			}
 		};
@@ -1448,8 +1449,9 @@ class StateStore {
 		await this.connectingPromise;
 		this.connectingPromise = null;
 	}
-	_closeSession() {
+	_closeSession(reason) {
 		if (this.status === "closed") return;
+		if (reason) this.closeReason = reason;
 		this.status = "closed";
 		try { this.writer?.releaseLock(); } catch (e) { }
 		try { this.socket?.close(); } catch (e) { }
@@ -1464,7 +1466,7 @@ class StateStore {
 	// ===== xhttp.md فاز ۱۲: مسیر دانلود (GET) و رله‌ی دوطرفه =====
 	async _handleDownload(request) {
 		if (this.status === "closed") {
-			return new Response("session closed", { status: 410 });
+			return new Response("session closed: " + (this.closeReason || "unknown"), { status: 410 });
 		}
 		if (this.status !== "connected") {
 			// GET زودتر از POST رسیده (یا POST هنوز هدر رو پارس/auth نکرده) - منتظر می‌مونیم تا
@@ -1498,19 +1500,19 @@ class StateStore {
 					const { value, done } = await socketReader.read();
 					if (done) {
 						try { controller.close(); } catch (e) { }
-						store._closeSession();
+						store._closeSession("remote_socket_closed");
 						return;
 					}
 					store.lastActivity = Date.now();
 					controller.enqueue(value);
 				} catch (e) {
 					try { controller.error(e); } catch (_e) { }
-					store._closeSession();
+					store._closeSession("download_relay_error:" + (e && e.message));
 				}
 			},
 			cancel(reason) {
 				try { socketReader.cancel(reason); } catch (e) { }
-				store._closeSession();
+				store._closeSession("get_stream_cancelled");
 			},
 		});
 		// هدرهای پاسخ طبق بند ۳ سند (هنوز فرضه، نه capture واقعی - قبل از rollout واقعی تایید بشه):
