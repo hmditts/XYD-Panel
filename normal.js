@@ -317,6 +317,51 @@ function recordDailyTraffic(env, ctx, deltaGb) {
 	// await کنن؛ وگرنه اون نوشتن یتیم می‌موند و ممکن بود با تموم شدن ریکوئست اصلاً اجرا نشه.
 	return task;
 }
+// xhttp.md فاز ۱۳ - حسابداری ترافیک/درخواست: هسته‌ی مشترکِ همون منطقی که قبلاً فقط داخل
+// addBytes (کلوژر محلیِ handlevIees، پایین‌تر) بود - افزودن بایت به GLOBAL_TRAFFIC_CACHE،
+// آپدیت GLOBAL_LAST_ACTIVE_WRITE، و flush دبانس‌شده به D1 وقتی به آستانه‌ی حجم/زمان برسیم.
+// چیزهای مخصوصِ WS (uncountedBytes قبل از شناخته‌شدنِ username، recordBurstBytes/
+// checkDeviceConfirmation برای هشدار تعداد دستگاه - جزو فاز ۱۴ست) عمداً اینجا نیستن و توی
+// خودِ صدازننده (WS یا DO) قبل از رسیدن به این تابع مدیریت می‌شن. هم addBytes (handlevIees)
+// هم StateStore (DO، مسیرهای آپلود/دانلود xhttp) دقیقاً همین یک تابع رو صدا می‌زنن - نه یک
+// سیستم شمارش جدا و موازی برای xhttp، طبق هشدار بند ۱-۲ خلاصه‌ی پروژه.
+function addUserTrafficBytes(env, ctx, username, bytes) {
+	if (bytes <= 0 || !username) return;
+	let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+	GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
+	GLOBAL_LAST_ACTIVE_WRITE.set(username, Date.now());
+	if (GLOBAL_WRITE_LOCK.get(username)) return;
+	let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
+	let now = Date.now();
+	let thresholdBytes = 500 * 1024 * 1024;
+	if ((current >= thresholdBytes && now - lastDbWrite > 180000) || (current > 0 && now - lastDbWrite > 900000)) {
+		GLOBAL_WRITE_LOCK.set(username, true);
+		let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+		let toCommitReq = USER_REQ_CACHE.get(username) || 0;
+		if (toCommit <= 0 && toCommitReq <= 0) {
+			GLOBAL_WRITE_LOCK.set(username, false);
+			return;
+		}
+		GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) - toCommit);
+		USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) - toCommitReq);
+		GLOBAL_LAST_DB_WRITE.set(username, now);
+		let deltaGb = toCommit / (1024 * 1024 * 1024);
+		let writeTask = async () => {
+			try {
+				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, now, username).run();
+				await recordDailyTraffic(env, ctx, deltaGb);
+			} catch (e) {
+				console.error(e.message);
+				GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) + toCommit);
+				USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) + toCommitReq);
+			} finally {
+				GLOBAL_WRITE_LOCK.set(username, false);
+			}
+		};
+		if (ctx) ctx.waitUntil(writeTask());
+		else writeTask();
+	}
+}
 // ---- Per-connection user-auth cache (D1 read reduction) --------------------------------------
 // Same caches.default (edge Cache API) pattern as checkAutoResets() above, applied to the
 // single hottest D1 read in this file: "which user does this uuid / trojan-hash belong to" -
@@ -1214,6 +1259,10 @@ class StateStore {
 		this.writer = null; // WritableStreamDefaultWriter روی this.socket، بعد از باز شدن سوکت
 		this.uploadQueue = null; // همون createUpstreamQueue مشترکی که صف آپلود WS استفاده می‌کنه
 		this.username = null; // فاز ۱۳/۱۴ برای حسابداری/تایید دستگاه بهش نیاز دارن
+		// فاز ۱۳: دقیقاً هم‌الگو با uncountedBytes توی addBytes (handlevIees) - بایت‌های
+		// آپلودی‌ای که قبل از شناخته‌شدنِ username می‌رسن (هنوز تو مرحله‌ی پارس هدریم) اینجا
+		// جمع می‌شن؛ به‌محض connect شدن، یک‌جا به addUserTrafficBytes پاس داده می‌شن.
+		this.uncountedBytes = 0;
 		this.validUUID = null;
 		this.respHeader = null; // فاز ۱۲ (مسیر GET/دانلود) بهش نیاز داره
 		// فاز ۱۲: هر GET (چه قبل از باز شدن سوکت برسه چه بعدش) روی همین promise منتظر می‌مونه؛
@@ -1304,6 +1353,24 @@ class StateStore {
 	}
 	async _consumeUploadChunk(chunk) {
 		if (this.status === "closed") return;
+		// xhttp.md فاز ۱۳: دقیقاً هم‌الگو با addBytes(bytes) در ابتدای processWsMessage (WS) -
+		// شمارش هر بسته‌ی رسیده، چه هنوز هدر پارس نشده باشه چه بعدش (طبق همون رفتار: بایت‌های
+		// خودِ هدر هم جزو ترافیک کاربر حساب می‌شن). تا وقتی username معلوم نیست (پارس هدر/auth
+		// هنوز تموم نشده)، بایت‌ها توی uncountedBytes جمع می‌شن و به‌محض معلوم‌شدنِ username
+		// (پایین‌تر توی _tryOpenConnection) یک‌جا به addUserTrafficBytes پاس داده می‌شن.
+		const chunkBytes = chunk.byteLength || 0;
+		if (chunkBytes > 0) {
+			if (!this.username) {
+				this.uncountedBytes += chunkBytes;
+			} else {
+				let bytesToAdd = chunkBytes;
+				if (this.uncountedBytes > 0) {
+					bytesToAdd += this.uncountedBytes;
+					this.uncountedBytes = 0;
+				}
+				addUserTrafficBytes(this.env, null, this.username, bytesToAdd);
+			}
+		}
 		if (this.status === "connected") {
 			if (this.uploadQueue) {
 				try {
@@ -1381,10 +1448,22 @@ class StateStore {
 			// ⚠️ این بلوک عیناً از handlevIees کپی شده (نه یک تابع مشترک - استخراجش جزو فازهای
 			// فعلی نبود)؛ طبق هشدار بند ۱-۲ خلاصه‌ی پروژه، هر تغییری در این شرط‌ها داخل
 			// handlevIees باید دستی اینجا هم اعمال بشه.
+			// xhttp.md فاز ۱۳: دقیقاً هم‌جا و هم‌شکل با افزایش USER_REQ_CACHE/مقداردهی اولیه‌ی
+			// GLOBAL_TRAFFIC_CACHE توی handlevIees (بلافاصله بعد از پیدا شدن کاربر و تایید
+			// connection_type، قبل از چک is_active/limit_gb/limit_req) - هر تلاشِ اتصال (چه در
+			// نهایت رد بشه چه نه) یک «ریکوئست» حساب می‌شه، نه فقط اتصال‌های موفق.
+			let currentReqs = USER_REQ_CACHE.get(user.username) || 0;
+			USER_REQ_CACHE.set(user.username, currentReqs + 1);
+			if (!GLOBAL_TRAFFIC_CACHE.has(user.username)) {
+				GLOBAL_TRAFFIC_CACHE.set(user.username, 0);
+			}
 			if (user.is_active === 0) { console.log("[XHTTP-DEBUG] closing: is_active === 0"); this._closeSession("user_inactive"); return; }
 			const liveGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024));
 			if (user.limit_gb && liveGb >= user.limit_gb) { console.log("[XHTTP-DEBUG] closing: limit_gb reached", liveGb, ">=", user.limit_gb); this._closeSession("limit_gb_reached"); return; }
-			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(user.username) || 0) >= user.limit_req) { console.log("[XHTTP-DEBUG] closing: limit_req reached"); this._closeSession("limit_req_reached"); return; }
+			// نکته: چون بالاتر USER_REQ_CACHE از قبلِ این چک +۱ شده (دقیقاً مثل handlevIees،
+			// خط مشابه با ">" نه ">=")، اینجا هم باید ">" باشه - وگرنه با همون +۱ ناخواسته یک
+			// اتصال زودتر از حد واقعی رد می‌شد.
+			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(user.username) || 0) > user.limit_req) { console.log("[XHTTP-DEBUG] closing: limit_req reached"); this._closeSession("limit_req_reached"); return; }
 			if (await isGlobalReqLimitReached(this.env, null)) { console.log("[XHTTP-DEBUG] closing: global req limit reached"); this._closeSession("global_req_limit_reached"); return; }
 			if (user.expiry_days) {
 				let isTimeExpired = false;
@@ -1505,6 +1584,10 @@ class StateStore {
 					}
 					store.lastActivity = Date.now();
 					controller.enqueue(value);
+					// xhttp.md فاز ۱۳: دقیقاً هم‌الگو با addBytes صدا زده شده از connectStreams (WS، مسیر
+					// دانلود) - اینجا status از قبل "connected"ه (چک شده قبل از ساختن این استریم)، پس
+					// username همیشه معلومه، نیازی به منطق uncountedBytes نیست.
+					if (value && value.byteLength) addUserTrafficBytes(store.env, null, store.username, value.byteLength);
 				} catch (e) {
 					try { controller.error(e); } catch (_e) { }
 					store._closeSession("download_relay_error:" + (e && e.message));
@@ -4471,40 +4554,9 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			recordBurstBytes(username + "|" + clientIP, bytes, Date.now());
 			checkDeviceConfirmation();
 		}
-		let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
-		GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
-		GLOBAL_LAST_ACTIVE_WRITE.set(username, Date.now());
-		if (GLOBAL_WRITE_LOCK.get(username)) return;
-		let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
-		let now = Date.now();
-		let thresholdBytes = 500 * 1024 * 1024;
-		if ((current >= thresholdBytes && now - lastDbWrite > 180000) || (current > 0 && now - lastDbWrite > 900000)) {
-			GLOBAL_WRITE_LOCK.set(username, true);
-			let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
-			let toCommitReq = USER_REQ_CACHE.get(username) || 0;
-			if (toCommit <= 0 && toCommitReq <= 0) {
-				GLOBAL_WRITE_LOCK.set(username, false);
-				return;
-			}
-			GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) - toCommit);
-			USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) - toCommitReq);
-			GLOBAL_LAST_DB_WRITE.set(username, now);
-			let deltaGb = toCommit / (1024 * 1024 * 1024);
-			let writeTask = async () => {
-				try {
-					await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, now, username).run();
-					await recordDailyTraffic(env, ctx, deltaGb);
-				} catch (e) {
-					console.error(e.message);
-					GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) + toCommit);
-					USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) + toCommitReq);
-				} finally {
-					GLOBAL_WRITE_LOCK.set(username, false);
-				}
-			};
-			if (ctx) ctx.waitUntil(writeTask());
-			else writeTask();
-		}
+		// xhttp.md فاز ۱۳: هسته‌ی شمارش/flush به addUserTrafficBytes منتقل شد (بالای فایل) تا DO
+		// هم دقیقاً همین تابع رو صدا بزنه - بدون تغییر رفتار اینجا (فقط جابه‌جایی کد).
+		addUserTrafficBytes(env, ctx, username, bytes);
 	}
 	let isOfflineSet = false;
 	let hasCountedAsActive = false;
