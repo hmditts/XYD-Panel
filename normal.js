@@ -1198,107 +1198,318 @@ class StateStore {
 	constructor(state, env) {
 		this.state = state;
 		this.env = env;
-		// xhttp.md فاز ۹ - اسکلت state سشن. این فیلدها هنوز جایی واقعاً relay/auth نمی‌شن؛
-		// فقط جای رزروشده‌ی فازهای بعدی گروه C هستن:
-		this.sessionId = null; // پایین‌تر توی fetch از URL خونده می‌شه
-		this.socket = null; // فاز ۱۱: سوکت connect() مقصد، وقتی POST بازش می‌کنه
-		this.status = "awaiting-header"; // 'awaiting-header' | 'connected' | 'closed' - فازهای ۱۱/۱۲/۱۵ عوضش می‌کنن
-		this.headerBuffer = []; // فاز ۱۱: بافر بایت خام تا رسیدن به اندازه‌ی کافی برای parseVlessTrojanHeader (فاز ۲)
+		// xhttp.md فاز ۹ - اسکلت state سشن (فاز ۱۱ فیلدهای رله/آپلود رو هم اضافه کرده):
+		this.sessionId = null; // پایین‌تر توی fetch از URL خونده می‌شه (method-aware، طبق اصلاحیه‌ی فاز ۱۱)
+		this.socket = null; // فاز ۱۱: سوکت connect() مقصد، وقتی هدر با موفقیت پارس و auth بشه باز می‌شه
+		this.status = "awaiting-header"; // 'awaiting-header' | 'connected' | 'closed' - فاز ۱۱/۱۵ عوضش می‌کنن
+		this.headerBuffer = new Uint8Array(0); // فاز ۱۱: بافر بایت خام تا رسیدن به اندازه‌ی کافی برای parseVlessTrojanHeader (فاز ۲)
 		this.lastActivity = Date.now(); // فاز ۱۵: مبنای Alarm API برای timeout بی‌فعالیتی
+		// فاز ۱۱ (اصلاحیه‌ی packet-up): هر POST جدا با seq خودش می‌رسه و ممکنه نامرتب برسه؛
+		// اینا رو تا نوبتشون برسه نگه می‌داریم، نه اینکه فرض کنیم هر POST بلافاصله بعد قبلیه.
+		this.pendingPackets = new Map(); // seq(number) -> Uint8Array
+		this.nextSeq = 0; // بعدی‌ای که باید پردازش بشه؛ فقط وقتی pendingPackets.has(nextSeq) درین می‌شه
+		this.chainLock = Promise.resolve(); // صف‌بندی «درج + خالی‌کردنِ به‌ترتیب» بین فراخوانی‌های هم‌زمان fetch
+		this.connectingPromise = null; // جلوگیری از connect() موازی وقتی چند بسته هم‌زمان به مرحله‌ی «هدر پارس شد» می‌رسن
+		this.writer = null; // WritableStreamDefaultWriter روی this.socket، بعد از باز شدن سوکت
+		this.uploadQueue = null; // همون createUpstreamQueue مشترکی که صف آپلود WS استفاده می‌کنه
+		this.username = null; // فاز ۱۳/۱۴ برای حسابداری/تایید دستگاه بهش نیاز دارن
+		this.validUUID = null;
+		this.respHeader = null; // فاز ۱۲ (مسیر GET/دانلود) بهش نیاز داره
+		// فاز ۱۲: هر GET (چه قبل از باز شدن سوکت برسه چه بعدش) روی همین promise منتظر می‌مونه؛
+		// resolve وقتی status به "connected" می‌رسه، reject وقتی _closeSession صدا زده بشه
+		// بدون اینکه هیچ‌وقت به connected رسیده باشیم (auth رد شد، connect() شکست خورد، ...).
+		this._readyResolve = null;
+		this._readyReject = null;
+		this.readyPromise = new Promise((resolve, reject) => {
+			this._readyResolve = resolve;
+			this._readyReject = reject;
+		});
 	}
 	async fetch(request) {
-		// xhttp.md فاز ۱۰ (موقتی، جدا از منطق واقعی فاز ۹ پایین‌تر) - این instance فقط وقتی
-		// idFromName === "wire-debug-log" بوده (نگاه کنید به handleApi) به این‌جا می‌رسه؛ کلودفلر
-		// تضمین می‌کنه از هر PoP/isolate بیاد، به همین یک instance برسه - برخلاف یک آرایه‌ی سطح
-		// Worker که هر isolate کپی جدا از حافظه‌ش داره (همون چیزی که باعث خالی دیده‌شدن نسخه‌ی اول
-		// این تست شد). بعد از تایید فاز ۱۰ کل این `if` حذف بشه، ربطی به state سشن واقعی نداره.
-		const instanceName = this.state && this.state.id && this.state.id.name;
-		if (instanceName === "wire-debug-log") {
-			if (!this.debugLog) this.debugLog = [];
-			// xhttp.md فاز ۱۰ - این دو شمارنده هیچ‌وقت trim نمی‌شن (برخلاف this.debugLog که سقف
-			// دارد)؛ اگه کلاینت خیلی سریع retry کنه (که داریم می‌بینیم) و بیشتر از سقف this.debugLog
-			// درخواست بزنه، یه POST قدیمی‌تر ممکنه از آرایه بیفته بیرون - ولی این شمارنده‌ها همچنان
-			// نشون می‌دن که آیا اصلاً تا حالا یه POST واقعی رسیده یا نه.
-			if (this.debugTotalGet === undefined) this.debugTotalGet = 0;
-			if (this.debugTotalPost === undefined) this.debugTotalPost = 0;
-			const debugUrl = new URL(request.url);
-			if (debugUrl.pathname === "/__wire_debug_view__") {
-				return new Response(
-					JSON.stringify({ totalGet: this.debugTotalGet, totalPost: this.debugTotalPost, log: this.debugLog }, null, 2),
-					{ headers: { "Content-Type": "application/json; charset=utf-8" } }
-				);
-			}
-			if (request.method === "GET") this.debugTotalGet++;
-			if (request.method === "POST") this.debugTotalPost++;
-			const headersObj = {};
-			for (const [k, v] of request.headers.entries()) headersObj[k] = v;
-			let bodyLength = 0;
-			let bodyPreviewHex = null;
-			if (request.method === "POST") {
-				try {
-					const buf = await request.arrayBuffer();
-					bodyLength = buf.byteLength;
-					bodyPreviewHex = Array.from(new Uint8Array(buf).slice(0, 64))
-						.map((b) => b.toString(16).padStart(2, "0"))
-						.join(" ");
-				} catch (e) {
-					bodyPreviewHex = "خطا در خوندن بدنه: " + e.message;
+		const url = new URL(request.url);
+		const segments = url.pathname.split("/").filter(Boolean);
+		// xhttp.md فاز ۱۱ (اصلاحیه‌ی بند ۳، بعد از فاز ۱۰): طبق مستندات رسمی Xray-core/sing-xhttp
+		// (نه یک capture واقعی مثل فاز ۱۰ - قبل از فاز ۱۲ بهتره با یک تست دستی هم تایید بشه)،
+		// مسیر GET زیر packet-up همچنان `<path>/<sessionId>` است (بدون تغییر از فاز ۹/۱۰)، ولی
+		// مسیر هر POST به شکل `<path>/<sessionId>/<seq>` است - یعنی sessionId یک سگمنت قبل از
+		// آخرین سگمنته، نه خودِ آخرین سگمنت. این تشخیص باید method-aware باشه؛ فاز ۱۶ (روتینگ
+		// واقعی سمت Worker) هم باید همین منطق رو برای idFromName(sessionId) رعایت کنه.
+		let seq = null;
+		if (request.method === "POST") {
+			if (segments.length >= 2) {
+				const seqRaw = segments[segments.length - 1];
+				const parsedSeq = parseInt(seqRaw, 10);
+				if (Number.isInteger(parsedSeq) && parsedSeq >= 0 && String(parsedSeq) === seqRaw) {
+					seq = parsedSeq;
+					if (!this.sessionId) this.sessionId = url.searchParams.get("sessionId") || segments[segments.length - 2];
 				}
 			}
-			this.debugLog.unshift({
-				time: new Date().toISOString(),
-				method: request.method,
-				path: debugUrl.pathname,
-				search: debugUrl.search,
-				headers: headersObj,
-				bodyLength,
-				bodyPreviewHex,
-			});
-			if (this.debugLog.length > 150) this.debugLog.length = 150;
-			if (request.method === "GET") {
-				// xhttp.md فاز ۱۰ - قبلاً اینجا یه پاسخ کوتاه و فوری برمی‌گشت و می‌بست؛ از دید کلاینت
-				// یعنی استریم دانلود همون لحظه fail می‌شد و کلاینت هیچ‌وقت فرصت نمی‌کرد سمت POST
-				// (آپلود) رو باز کنه - فقط sessionId جدید می‌ساخت و از اول retry می‌کرد (دقیقاً همون
-				// چیزی که توی اولین دور تست دیدیم: ۶ تا GET با sessionId متفاوت، بدون هیچ POST).
-				// اینجا استریم رو واقعاً باز نگه می‌داریم (heartbeat هر ۳ ثانیه، حداکثر ۲۵ ثانیه) تا
-				// کلاینت واقعی فرصت کنه سمت POST رو هم امتحان کنه و اون هم capture بشه.
-				const stream = new ReadableStream({
-					start(controller) {
-						controller.enqueue(new TextEncoder().encode("debug-capture-ok\n"));
-						const iv = setInterval(() => {
-							try {
-								controller.enqueue(new TextEncoder().encode(": ping\n\n"));
-							} catch (e) {
-								clearInterval(iv);
-							}
-						}, 3000);
-						setTimeout(() => {
-							clearInterval(iv);
-							try {
-								controller.close();
-							} catch (e) { }
-						}, 25000);
-					},
-				});
-				return new Response(stream, {
-					headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store", "X-Accel-Buffering": "no" },
-				});
+			if (seq === null) {
+				// فرمت مسیر با packet-up استاندارد جور درنمیاد - بدون هیچ سوکت/رله‌ای رد می‌شه
+				return new Response("invalid xhttp upload path", { status: 400 });
 			}
-			return new Response(JSON.stringify({ captured: true }), {
-				headers: { "Content-Type": "application/json; charset=utf-8" },
-			});
-		}
-		// xhttp.md فاز ۹: فقط خوندن و نگه‌داشتن sessionId - هنوز هیچ auth/سوکت/رله‌ای اینجا نیست
-		// (فازهای ۱۱-۱۲). فرمت دقیق مسیر (`<path>/<sessionId>` طبق بند ۳ سند در برابر query param)
-		// با فاز ۱۰ روی یک کلاینت واقعی تایید می‌شه؛ فعلاً هر دو حالت پوشش داده می‌شه تا فاز ۱۶
-		// (روتینگ واقعی سمت Worker) به هرکدوم که تایید شد راحت وایر بشه، بدون نیاز به تغییر اینجا.
-		if (!this.sessionId) {
-			const url = new URL(request.url);
-			const segments = url.pathname.split("/").filter(Boolean);
-			this.sessionId = url.searchParams.get("sessionId") || (segments.length ? segments[segments.length - 1] : null);
+		} else {
+			if (!this.sessionId) {
+				this.sessionId = url.searchParams.get("sessionId") || (segments.length ? segments[segments.length - 1] : null);
+			}
 		}
 		this.lastActivity = Date.now();
-		return new Response("ok");
+		if (request.method === "POST") {
+			return await this._handleUploadPacket(request, seq);
+		}
+		return await this._handleDownload(request);
+	}
+	// ===== xhttp.md فاز ۱۱: مسیر آپلود (POST) و باز کردن connect() =====
+	async _handleUploadPacket(request, seq) {
+		if (this.status === "closed") {
+			return new Response("session closed", { status: 410 });
+		}
+		let bytes;
+		try {
+			// زیر packet-up هر POST یک بسته‌ی محدود و کامل است (طبق مستندات Xray حداکثر ~۱
+			// مگابایت)، نه یک ReadableStream پیوسته - پس خوندن کامل با arrayBuffer() اینجا
+			// درسته؛ برخلاف متن اولیه‌ی این فاز که برای mode=stream-up نوشته شده بود.
+			const buf = await request.arrayBuffer();
+			bytes = new Uint8Array(buf);
+		} catch (e) {
+			return new Response("bad body", { status: 400 });
+		}
+		this.pendingPackets.set(seq, bytes);
+		// قفل زنجیره‌ای ساده: چند فراخوانی هم‌زمانِ fetch (چند POST جدا) ممکنه با هم interleave
+		// بشن (هر جا await هست) - درج + خالی‌کردنِ به‌ترتیب باید یکی‌یکی اجرا بشه، وگرنه یک بسته
+		// می‌تونه دوبار پردازش بشه یا ترتیب نوشتن به سوکت به‌هم بریزه.
+		const run = this.chainLock.then(() => this._drainReadyPackets(), () => this._drainReadyPackets());
+		this.chainLock = run.catch(() => {});
+		await run;
+		if (this.status === "closed") {
+			return new Response("session closed", { status: 410 });
+		}
+		return new Response(null, { status: 200 });
+	}
+	async _drainReadyPackets() {
+		while (this.pendingPackets.has(this.nextSeq)) {
+			const chunk = this.pendingPackets.get(this.nextSeq);
+			this.pendingPackets.delete(this.nextSeq);
+			this.nextSeq++;
+			try {
+				await this._consumeUploadChunk(chunk);
+			} catch (e) {
+				// خطای پیش‌بینی‌نشده هم سشن رو یتیم نمی‌ذاره - همون رفتار «رد شد → ببند»ی که
+				// بقیه‌ی شاخه‌های این فاز دارن.
+				this._closeSession();
+			}
+			if (this.status === "closed") break;
+		}
+	}
+	async _consumeUploadChunk(chunk) {
+		if (this.status === "closed") return;
+		if (this.status === "connected") {
+			if (this.uploadQueue) {
+				try {
+					await this.uploadQueue.writeAndAwait(chunk, false);
+				} catch (e) {
+					this._closeSession();
+				}
+			}
+			return;
+		}
+		// status === "awaiting-header": فاز ۲ - همون پارسر مشترکی که handlevIees هم استفاده می‌کنه
+		this.headerBuffer = concatBytes(this.headerBuffer, chunk);
+		const parsedHeader = parseVlessTrojanHeader(this.headerBuffer);
+		if (parsedHeader === null) return; // بایت کافی هنوز نرسیده، منتظر بسته‌ی بعدی
+		if (parsedHeader.invalid) {
+			this._closeSession();
+			return;
+		}
+		this.headerBuffer = new Uint8Array(0); // دیگه لازم نیست
+		await this._tryOpenConnection(parsedHeader);
+	}
+	async _tryOpenConnection(parsedHeader) {
+		if (this.connectingPromise) {
+			await this.connectingPromise;
+			return;
+		}
+		const doConnect = async () => {
+			const { isTrojan, uuidOrHash, cmd, address, port, respHeader, remainingPayload } = parsedHeader;
+			let user = null;
+			try {
+				const authCacheKind = isTrojan ? "t" : "u";
+				const cached = await getCachedAuthUser(authCacheKind, uuidOrHash);
+				if (cached !== undefined) {
+					user = cached; // ممکنه null باشه - یک negative cache معتبر
+				} else {
+					if (isTrojan) {
+						user = await this.env.DB.prepare("SELECT * FROM users WHERE trojan_hash = ? OR uuid = ?").bind(uuidOrHash, uuidOrHash).first();
+						if (!user) {
+							const { results } = await this.env.DB.prepare("SELECT * FROM users WHERE is_active = 1").all();
+							if (results) user = results.find((u) => u.uuid && sha224Pure(u.uuid) === uuidOrHash) || null;
+						}
+					} else {
+						user = await this.env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(uuidOrHash).first();
+					}
+					putCachedAuthUser(null, authCacheKind, uuidOrHash, user || null);
+				}
+			} catch (e) { }
+			if (!user) {
+				this._closeSession();
+				return;
+			}
+			const userConn = String(user.connection_type || "vless").toLowerCase();
+			if (isTrojan) {
+				if (!userConn.includes("trojan")) { this._closeSession(); return; }
+			} else {
+				if (!userConn.includes("vless") && userConn !== "vl" + "e" + "ss") { this._closeSession(); return; }
+			}
+			// UDP/DNS از طریق xhttp فعلاً پشتیبانی نمی‌شه - فقط TCP؛ این محدودیتِ آگاهانه‌ایه،
+			// جزو هیچ‌کدوم از فازهای فعلی xhttp.md نیست.
+			if ((isTrojan && cmd === 3) || (!isTrojan && cmd === 2)) {
+				this._closeSession();
+				return;
+			}
+			// xhttp.md فاز ۱۱: دقیقاً همون شرط‌هایی که handlevIees قبل از باز کردن سوکت چک می‌کنه.
+			// ⚠️ این بلوک عیناً از handlevIees کپی شده (نه یک تابع مشترک - استخراجش جزو فازهای
+			// فعلی نبود)؛ طبق هشدار بند ۱-۲ خلاصه‌ی پروژه، هر تغییری در این شرط‌ها داخل
+			// handlevIees باید دستی اینجا هم اعمال بشه.
+			if (user.is_active === 0) { this._closeSession(); return; }
+			const liveGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024));
+			if (user.limit_gb && liveGb >= user.limit_gb) { this._closeSession(); return; }
+			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(user.username) || 0) >= user.limit_req) { this._closeSession(); return; }
+			if (await isGlobalReqLimitReached(this.env, null)) { this._closeSession(); return; }
+			if (user.expiry_days) {
+				let isTimeExpired = false;
+				if (user.start_on_first_connect === 1) {
+					if (user.first_connection_time) {
+						const expiryDate = new Date(user.first_connection_time + user.expiry_days * 24 * 60 * 60 * 1000);
+						if (new Date() > expiryDate) isTimeExpired = true;
+					}
+				} else if (user.created_at) {
+					const created = new Date(user.created_at);
+					const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
+					if (new Date() > expiryDate) isTimeExpired = true;
+				}
+				if (isTimeExpired) {
+					try {
+						await this.env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(user.uuid).run();
+						await invalidateUserAuthCache(null, user.uuid, user.trojan_hash);
+					} catch (e) { }
+					this._closeSession();
+					return;
+				}
+			}
+			this.username = user.username;
+			this.validUUID = user.uuid;
+			this.respHeader = respHeader;
+			let socket;
+			try {
+				socket = connect({ hostname: bracketIPv6(address), port: port });
+				await waitSocketOpened(socket, 12000);
+			} catch (e) {
+				this._closeSession();
+				return;
+			}
+			this.socket = socket;
+			this.writer = socket.writable.getWriter();
+			// فاز ۱۱: همون createUpstreamQueue مشترکی که صف آپلود WS استفاده می‌کنه، نه یک
+			// پیاده‌سازی صفِ جدا و موازی.
+			this.uploadQueue = createUpstreamQueue({
+				getWriter: () => this.writer,
+				releaseWriter: () => { try { this.writer?.releaseLock(); } catch (e) { } this.writer = null; },
+				retryConnect: null, // فاز ۱۱: بدون reconnect خودکار - جزو این فاز نیست
+				closeConnection: () => this._closeSession(),
+				name: "xhttpUploadQueue",
+			});
+			this.status = "connected";
+			if (this._readyResolve) {
+				try { this._readyResolve(); } catch (e) { }
+			}
+			if (remainingPayload && remainingPayload.byteLength > 0) {
+				try {
+					await this.uploadQueue.writeAndAwait(remainingPayload, false);
+				} catch (e) {
+					this._closeSession();
+				}
+			}
+		};
+		this.connectingPromise = doConnect();
+		await this.connectingPromise;
+		this.connectingPromise = null;
+	}
+	_closeSession() {
+		if (this.status === "closed") return;
+		this.status = "closed";
+		try { this.writer?.releaseLock(); } catch (e) { }
+		try { this.socket?.close(); } catch (e) { }
+		try { this.uploadQueue?.clear(); } catch (e) { }
+		this.pendingPackets.clear();
+		// اگه هیچ‌وقت به "connected" نرسیده بودیم، هر GET منتظرِ readyPromise باید با خطا تموم
+		// بشه؛ اگه قبلاً resolve شده بود، این reject بی‌اثره (یک Promise فقط یک‌بار settle می‌شه).
+		if (this._readyReject) {
+			try { this._readyReject(new Error("xhttp session closed")); } catch (e) { }
+		}
+	}
+	// ===== xhttp.md فاز ۱۲: مسیر دانلود (GET) و رله‌ی دوطرفه =====
+	async _handleDownload(request) {
+		if (this.status === "closed") {
+			return new Response("session closed", { status: 410 });
+		}
+		if (this.status !== "connected") {
+			// GET زودتر از POST رسیده (یا POST هنوز هدر رو پارس/auth نکرده) - منتظر می‌مونیم تا
+			// فاز ۱۱ سوکت رو باز کنه؛ اگه اون‌طرف رد بشه (auth/limit/connect fail)، readyPromise
+			// reject می‌شه و اینجا با خطا برمی‌گردیم، بدون اینکه استریمی باز کرده باشیم.
+			try {
+				await this.readyPromise;
+			} catch (e) {
+				return new Response("upstream not available", { status: 502 });
+			}
+		}
+		if (this.status !== "connected" || !this.socket) {
+			return new Response("upstream not available", { status: 502 });
+		}
+		if (this.socket.readable.locked) {
+			// فعلاً فقط یک GET هم‌زمان در هر سشن پشتیبانی می‌شه - reconnect/GET دوم روی همون
+			// سشن جزو این فاز نیست (فاز ۱۵ مسئول بستن/پاکسازی سشن‌های قدیمیه، نه اینجا).
+			return new Response("download already in progress for this session", { status: 409 });
+		}
+		const store = this;
+		const socketReader = this.socket.readable.getReader();
+		const initialRespHeader = this.respHeader; // فقط vless (غیر trojan) پرشه؛ برای trojan همیشه null
+		const stream = new ReadableStream({
+			start(controller) {
+				if (initialRespHeader && initialRespHeader.byteLength > 0) {
+					try { controller.enqueue(initialRespHeader); } catch (e) { }
+				}
+			},
+			async pull(controller) {
+				try {
+					const { value, done } = await socketReader.read();
+					if (done) {
+						try { controller.close(); } catch (e) { }
+						store._closeSession();
+						return;
+					}
+					store.lastActivity = Date.now();
+					controller.enqueue(value);
+				} catch (e) {
+					try { controller.error(e); } catch (_e) { }
+					store._closeSession();
+				}
+			},
+			cancel(reason) {
+				try { socketReader.cancel(reason); } catch (e) { }
+				store._closeSession();
+			},
+		});
+		// هدرهای پاسخ طبق بند ۳ سند (هنوز فرضه، نه capture واقعی - قبل از rollout واقعی تایید بشه):
+		// text/event-stream + no-store + X-Accel-Buffering برای جلوگیری از بافر شدن جواب توسط
+		// هر پروکسی/CDN میون‌راه.
+		return new Response(stream, {
+			status: 200,
+			headers: {
+				"Content-Type": "text/event-stream",
+				"Cache-Control": "no-store",
+				"X-Accel-Buffering": "no",
+			},
+		});
 	}
 }
 const __WORKER_EXPORT__ = {
@@ -1598,24 +1809,6 @@ const Router = {
 		}
 	},
 	async handleApi(request, url, env, ctx) {
-		// xhttp.md فاز ۱۰ - عمداً قبل از چک رمز/auth: کلاینت واقعی (v2rayNG/NekoBox) هیچ کوکی پنلی
-		// نمی‌فرسته. این مسیر رو به‌عنوان "path" ترنسپورت XHTTP توی کلاینت بذارید تا شکل واقعیِ
-		// درخواست‌ها (مسیر دقیق، seq، هدرها، x_padding) بدون حدس دیده بشه.
-		// ⚠️ نسخه‌ی اول این تست (لاگ توی یک آرایه‌ی سطح Worker) همیشه خالی دیده می‌شد، چون هر
-		// edge/isolate کلودفلر یک کپی جدا از حافظه‌ی JS داره - دقیقاً همون مشکلی که خودِ خلاصه‌ی
-		// پروژه (فاز ۹) به‌خاطرش راه‌حل رو Durable Object گذاشته. برای همین اینجا درخواست واقعی رو
-		// مستقیم به‌همون instance ثابت (idFromName "wire-debug-log") پاس می‌دیم که خودِ StateStore
-		// (فاز ۹) capture می‌کنه - چون کلودفلر تضمین می‌کنه از هر PoP بیاد به همین یک instance برسه.
-		// موقتیه - بعد از تایید فاز ۱۰ هم این بلوک هم شاخه‌ی "wire-debug-log" توی StateStore.fetch
-		// هم مسیر /api/xhttp-wire-debug-log پایین‌تر حذف بشن.
-		if (url.pathname.startsWith("/api/xhttp-wire-capture")) {
-			if (!env.XHTTP_SESSION) {
-				return new Response("XHTTP_SESSION binding missing - از /api/update-panel دیپلوی بزنید.", { status: 500 });
-			}
-			const debugId = env.XHTTP_SESSION.idFromName("wire-debug-log");
-			const debugStub = env.XHTTP_SESSION.get(debugId);
-			return await debugStub.fetch(request);
-		}
 		const hasPassword = await DbService.getPanelPassword(env.DB);
 		if (url.pathname === "/api/setup-password" && request.method === "POST") {
 			if (hasPassword) {
@@ -1824,23 +2017,6 @@ const Router = {
 			} catch (err) {
 				return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
 			}
-		}
-		if (url.pathname === "/api/xhttp-wire-debug-log" && request.method === "GET") {
-			// xhttp.md فاز ۱۰ - نمایش لاگ ذخیره‌شده‌ی داخل instance ثابت "wire-debug-log" (نگاه کنید
-			// به کامنت بالای شاخه‌ی مربوطه در handleApi و توی StateStore.fetch). بعد از فاز ۱۰ حذف بشه.
-			if (!env.XHTTP_SESSION) {
-				return new Response(JSON.stringify({ error: "XHTTP_SESSION binding missing" }), {
-					status: 500,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			const debugId = env.XHTTP_SESSION.idFromName("wire-debug-log");
-			const debugStub = env.XHTTP_SESSION.get(debugId);
-			const viewResp = await debugStub.fetch("https://internal.zeus/__wire_debug_view__");
-			const viewText = await viewResp.text();
-			return new Response(viewText, {
-				headers: { "Content-Type": "application/json; charset=utf-8" },
-			});
 		}
 		if (url.pathname === "/api/xhttp-do-test" && request.method === "GET") {
 			// xhttp.md فاز ۱ - تست پذیرش (acceptance test): فقط تایید می‌کنه بایندینگ DO رسیده و
@@ -12091,7 +12267,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '4.0.9';
+const CURRENT_VERSION = '4.0.11';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
