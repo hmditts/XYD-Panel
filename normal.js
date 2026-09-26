@@ -1512,6 +1512,12 @@ class StateStore {
 		});
 	}
 }
+// xhttp.md فاز ۱۶: همون رشته‌ی ثابتِ "/XYZ" که در ۴ محل تولید لینک (rawPath محلی) هم استفاده
+// می‌شه - این‌جا یک‌بار به‌عنوان ثابتِ مشترک تعریف شده تا روتینگ همیشه با همون مسیری match کنه
+// که کانفیگ‌ها واقعاً توش ساخته می‌شن. ⚠️ فازهای ۱۷-۲۱ (تولید لینک xhttp) هنوز به این ثابت
+// وصل نشدن - همچنان literal «/XYZ» محلی خودشون رو دارن؛ وقتی اون فازها انجام شدن، بهتره
+// همه‌جا همین ثابت رو صدا بزنن تا دوباره یک مقدار تکراری از دو جا دستی sync نشه.
+const XHTTP_RAW_PATH = "/XYZ";
 const __WORKER_EXPORT__ = {
 	async fetch(request, env, ctx) {
 		if (!env.DB) {
@@ -1529,6 +1535,13 @@ const __WORKER_EXPORT__ = {
 			const url = new URL(request.url);
 			if (Router.isWebSocketUpgrade(request)) {
 				return await Router.handleWebSocket(request, env, ctx);
+			}
+			// xhttp.md فاز ۱۶: بدون auth پنل، دقیقاً مثل WS - چون این ترافیکِ واقعیِ کلاینت
+			// VPNه، نه یک درخواست API ادمین. باید قبل از چک /api/ بیاد چون XHTTP_RAW_PATH
+			// ("/XYZ") با هیچ مسیر رزروی دیگه (api, ppannell, profile, notes, bundle,
+			// manifest/icon) تداخل نداره (تایید شده با grep - پایین‌تر).
+			if ((request.method === "GET" || request.method === "POST") && url.pathname.startsWith(XHTTP_RAW_PATH + "/")) {
+				return await Router.handleXhttp(request, env, ctx);
 			}
 			if (Router.isSubscriptionPath(url.pathname)) {
 				return await Router.handleSubscription(url, env);
@@ -1690,6 +1703,46 @@ const Router = {
 	},
 	isSubscriptionPath(pathname) {
 		return pathname.startsWith("/notes/") || pathname.startsWith("/bundle/");
+	},
+	// xhttp.md فاز ۱۶ - روتینگ خام سمت Worker: هیچ auth/relay‌ای اینجا نیست (اونا مسئولیت
+	// StateStore خودشه، فازهای ۹-۱۲). فقط sessionId رو از URL درمیاره و request رو بدون
+	// تغییر به همون DO instance پاس می‌ده.
+	// ⚠️ استخراج sessionId اینجا عمداً method-aware و عیناً هم‌الگو با ابتدای StateStore.fetch()
+	// (فاز ۹، اصلاح‌شده در فاز ۱۱) است، نه یک تابع مشترک - چون در زمان نوشتن این فاز استخراج
+	// مشترک‌کردنش جزو دامنه نبود. اگه اون منطق توی StateStore.fetch() عوض بشه، اینجا هم دستی
+	// sync بشه؛ وگرنه GET و POST یک سشن به دو DO مختلف می‌رن و رله می‌شکنه (دقیقاً همون کلاس
+	// ریسکی که بند ۱-۲ خلاصه‌ی پروژه درباره‌ی منطق تکراری هشدار داده).
+	async handleXhttp(request, env, ctx) {
+		if (!env.XHTTP_SESSION) {
+			return new Response("XHTTP_SESSION binding is missing on this Worker", { status: 500 });
+		}
+		const url = new URL(request.url);
+		const segments = url.pathname.split("/").filter(Boolean);
+		let sessionId = null;
+		if (request.method === "POST") {
+			// زیر packet-up مسیر POST به‌شکل <path>/<sessionId>/<seq> است - sessionId یک
+			// سگمنت قبل از آخرین سگمنته (که خودِ seq عددیه)، نه خودِ آخرین سگمنت.
+			if (segments.length >= 2) {
+				const seqRaw = segments[segments.length - 1];
+				if (/^\d+$/.test(seqRaw)) {
+					sessionId = segments[segments.length - 2];
+				}
+			}
+		} else {
+			// GET (دانلود): sessionId همون آخرین سگمنت مسیره.
+			sessionId = segments.length ? segments[segments.length - 1] : null;
+		}
+		if (!sessionId) {
+			return new Response("invalid xhttp session path", { status: 400 });
+		}
+		try {
+			const id = env.XHTTP_SESSION.idFromName(sessionId);
+			const stub = env.XHTTP_SESSION.get(id);
+			// همون Request object بدون تغییر - StateStore.fetch() خودش دوباره URL رو پارس می‌کنه.
+			return await stub.fetch(request);
+		} catch (e) {
+			return new Response("xhttp routing error: " + (e && e.message ? e.message : String(e)), { status: 500 });
+		}
 	},
 	async handleWebSocket(request, env, ctx) {
 		try {
@@ -12267,7 +12320,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '4.0.11';
+const CURRENT_VERSION = '4.0.12';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
