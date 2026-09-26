@@ -317,85 +317,6 @@ function recordDailyTraffic(env, ctx, deltaGb) {
 	// await کنن؛ وگرنه اون نوشتن یتیم می‌موند و ممکن بود با تموم شدن ریکوئست اصلاً اجرا نشه.
 	return task;
 }
-// xhttp.md فاز ۱۳ - حسابداری ترافیک/درخواست: هسته‌ی مشترکِ همون منطقی که قبلاً فقط داخل
-// addBytes (کلوژر محلیِ handlevIees، پایین‌تر) بود - افزودن بایت به GLOBAL_TRAFFIC_CACHE،
-// آپدیت GLOBAL_LAST_ACTIVE_WRITE، و flush دبانس‌شده به D1 وقتی به آستانه‌ی حجم/زمان برسیم.
-// چیزهای مخصوصِ WS (uncountedBytes قبل از شناخته‌شدنِ username، recordBurstBytes/
-// checkDeviceConfirmation برای هشدار تعداد دستگاه - جزو فاز ۱۴ست) عمداً اینجا نیستن و توی
-// خودِ صدازننده (WS یا DO) قبل از رسیدن به این تابع مدیریت می‌شن. هم addBytes (handlevIees)
-// هم StateStore (DO، مسیرهای آپلود/دانلود xhttp) دقیقاً همین یک تابع رو صدا می‌زنن - نه یک
-// سیستم شمارش جدا و موازی برای xhttp، طبق هشدار بند ۱-۲ خلاصه‌ی پروژه.
-function addUserTrafficBytes(env, ctx, username, bytes) {
-	if (bytes <= 0 || !username) return;
-	let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
-	GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
-	GLOBAL_LAST_ACTIVE_WRITE.set(username, Date.now());
-	if (GLOBAL_WRITE_LOCK.get(username)) return;
-	let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
-	let now = Date.now();
-	let thresholdBytes = 500 * 1024 * 1024;
-	if ((current >= thresholdBytes && now - lastDbWrite > 180000) || (current > 0 && now - lastDbWrite > 900000)) {
-		GLOBAL_WRITE_LOCK.set(username, true);
-		let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
-		let toCommitReq = USER_REQ_CACHE.get(username) || 0;
-		if (toCommit <= 0 && toCommitReq <= 0) {
-			GLOBAL_WRITE_LOCK.set(username, false);
-			return;
-		}
-		GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) - toCommit);
-		USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) - toCommitReq);
-		GLOBAL_LAST_DB_WRITE.set(username, now);
-		let deltaGb = toCommit / (1024 * 1024 * 1024);
-		let writeTask = async () => {
-			try {
-				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, now, username).run();
-				await recordDailyTraffic(env, ctx, deltaGb);
-			} catch (e) {
-				console.error(e.message);
-				GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) + toCommit);
-				USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) + toCommitReq);
-			} finally {
-				GLOBAL_WRITE_LOCK.set(username, false);
-			}
-		};
-		if (ctx) ctx.waitUntil(writeTask());
-		else writeTask();
-	}
-}
-// باگ‌فیکس فاز ۱۳ (گزارش کاربر: MB/آنلاین صفر، Request خیلی کمتر از واقعی): addUserTrafficBytes
-// فقط وقتی به آستانه‌ی دبانس می‌رسیم (۵۰۰ مگابایت طی ۳ دقیقه، یا هر مقدار>۰ بعد از ۱۵ دقیقه از
-// آخرین نوشتن) واقعاً به D1 می‌نویسه - در غیر این صورت فقط توی GLOBAL_TRAFFIC_CACHE/USER_REQ_CACHE
-// می‌مونه. برای WS این بی‌خطره چون همون Map توی کل عمر Worker (بین همه‌ی کاربرها/اتصال‌ها) زنده
-// می‌مونه و هم به‌مرور با اتصال‌های بعدی، هم با سوئیپ دوره‌ای flushExpiredTraffic (که پنل ادمین
-// صداش می‌زنه) جمع می‌شه. برای XHTTP این فرض غلطه: هر سشن یک Durable Object جداست، یعنی یک
-// JS isolate کاملاً مجزا از Worker اصلی و از بقیه‌ی سشن‌ها - GLOBAL_TRAFFIC_CACHE/USER_REQ_CACHE
-// این‌جا یک Map خصوصیِ همون instance‌ان، نه همون Mapی که Worker اصلی/flushExpiredTraffic می‌بینه.
-// اگه سشن قبل از رسیدن به آستانه‌ی بالا بسته بشه (خیلی از اتصال‌های کوتاه xhttp همین‌طورن)، هر
-// بایت/ریکوئستی که هنوز commit نشده با از بین رفتن instance این DO برای همیشه گم می‌شه - هیچ
-// سوئیپ بیرونی‌ای نمی‌تونه بهش برسه. این تابع همون منطق commit بالا رو بدون شرط آستانه اجرا
-// می‌کنه؛ _closeSession باید همیشه صداش بزنه تا این نشتی جمع بشه.
-function forceFlushUserTraffic(env, ctx, username) {
-	if (!username) return;
-	let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
-	let toCommitReq = USER_REQ_CACHE.get(username) || 0;
-	if (toCommit <= 0 && toCommitReq <= 0) return;
-	GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) - toCommit);
-	USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) - toCommitReq);
-	let deltaGb = toCommit / (1024 * 1024 * 1024);
-	let now = Date.now();
-	let writeTask = async () => {
-		try {
-			await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, now, username).run();
-			await recordDailyTraffic(env, ctx, deltaGb);
-		} catch (e) {
-			console.error(e.message);
-			GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) + toCommit);
-			USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) + toCommitReq);
-		}
-	};
-	if (ctx) ctx.waitUntil(writeTask());
-	else writeTask();
-}
 // ---- Per-connection user-auth cache (D1 read reduction) --------------------------------------
 // Same caches.default (edge Cache API) pattern as checkAutoResets() above, applied to the
 // single hottest D1 read in this file: "which user does this uuid / trojan-hash belong to" -
@@ -615,8 +536,6 @@ const NEW_USER_DEFAULTS_FALLBACK = {
 	// پیشنهادی 2560، حداکثر 8192 طبق مستندات xray/sing-box WS early data).
 	new_user_early_data_enabled: "0",
 	new_user_early_data_size: "2560",
-	// xhttp.md فاز ۵: پیش‌فرض ترنسپورت کاربر تازه‌ساز - دقیقاً هم‌الگو با کلیدهای Early Data بالا.
-	new_user_transport_type: "ws",
 };
 // فقط این دو کلید مجازند خالی ذخیره شوند (خالی = فرگمنت خاموش)؛ برای بقیه، مقدار
 // خالی/نامعتبر یعنی «از NEW_USER_DEFAULTS_FALLBACK استفاده کن».
@@ -646,23 +565,6 @@ function applySingboxEarlyData(transport, user) {
 		transport.max_early_data = size;
 		transport.early_data_header_name = "Sec-WebSocket-Protocol";
 	}
-}
-// xhttp.md فاز ۴: ثابت و توابع کمکی مشترک برای ترنسپورت هر کاربر - دقیقاً هم‌الگو با
-// EARLY_DATA_MAX_SIZE/getUserEarlyDataSize بالا (یک منبع مشترک، نه تکرار در ۴ محل تولید لینک).
-// ⚠️ تفاوت مهم با connection_type: connection_type چندانتخابی‌ست (هر پروتکل = یک لینک جدا)؛
-// transport_type این‌جوری نیست - "ws+xhttp" یعنی حالت سوم با رفتار *متناوب* روی کل خروجی یک
-// کاربر (نه تولید دوتایی برای هر مقصد)، پس UI‌ش (فاز ۶) باید یک select تک‌مقداری باشه.
-const VALID_TRANSPORT_TYPES = ["ws", "xhttp", "ws+xhttp"];
-function getUserTransportMode(user) {
-	const t = String((user && user.transport_type) || "ws").toLowerCase();
-	return VALID_TRANSPORT_TYPES.includes(t) ? t : "ws";
-}
-// index = شمارنده‌ی پیوسته‌ی همون کاربر در کل حلقه‌ی تولید لینک (بند فاز ۱۶/۱۷ - یک شمارنده‌ی
-// مشترک بین حلقه‌ی اصلی و شاخه‌ی otherCleanIps، نه دوتا شمارنده‌ی جدا).
-function resolveConfigTransport(user, index) {
-	const mode = getUserTransportMode(user);
-	if (mode === "ws+xhttp") return index % 2 === 0 ? "ws" : "xhttp";
-	return mode; // "ws" یا "xhttp"
 }
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
@@ -1255,439 +1157,6 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 		GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
 	}
 }
-// xhttp.md فاز ۱۵: تایم‌اوت بی‌فعالیتِ سشن‌های xhttp، از طریق Alarm API.
-// بدون این، سشنی که سوکت مقصدش باز مونده ولی نه مقصد چیزی می‌فرسته نه کلاینت GET/POST جدیدی
-// می‌زنه هیچ‌وقت بسته نمی‌شه (تنها نقاط بسته‌شدنِ فعلی: auth/limit رد شدن، مقصد سوکتش رو ببنده،
-// یا کلاینت استریم GET رو کنسل کنه) - و چون سوکت باز مانع hibernate شدنِ DO می‌شه، یعنی duration
-// بی‌دلیل مصرف می‌شه (دقیقاً همون چیزی که توی متریک Durable Objects دیده شد). lastActivity از قبل
-// (فاز ۹/۱۱/۱۲) روی هر fetch() و هر بایت دانلودی آپدیت می‌شه؛ این فاز فقط یک ناظر دوره‌ای
-// (این‌جا via Alarm API، نه setInterval - که خودش هم جلوی hibernate رو می‌گرفت) بهش اضافه می‌کنه.
-const XHTTP_IDLE_TIMEOUT_MS = 120000; // ۲ دقیقه بی‌فعالیتی مطلق (نه آپلود، نه دانلود، نه GET/POST جدید) = ببند
-const XHTTP_IDLE_CHECK_INTERVAL_MS = 60000; // هر ۶۰ ثانیه یک‌بار چک کن - نه زودتر (که خودش duration اضافه بخوره)، نه دیرتر (که idle واقعی رو دیر بگیره)
-// ===== xhttp.md — فاز ۱: اسکلت خالی Durable Object (بدون منطق واقعی) =====
-// این کلاس قراره در فازهای ۹ تا ۱۵ هماهنگ‌کننده‌ی GET/POST سشن XHTTP بشه (یک instance به‌ازای هر
-// sessionId). فاز ۹ فقط اسکلت state رو اضافه کرده (فیلدهای اولیه‌ی سشن + خوندن sessionId از URL)؛
-// رله‌ی واقعی سوکت، auth، حسابداری ترافیک و بستن سشن هنوز نیستن - اونا فازهای ۱۱ تا ۱۵ هستن.
-//
-// ⚠️ نکته‌ی معماری مهم (این فایل خودش ماژول دیپلوی‌شونده نیست): طبق بند ۲ خلاصه‌ی پروژه، کل محتوای
-// همین فایل بدنه‌ی همون `new Function("connect", view)` است که در stub بیرونی (obfuscated) اجرا
-// می‌شود؛ یعنی اینجا هیچ `export` معتبر نیست (چه `export class`، چه هر export دیگه) - داخل بدنه‌ی
-// Function Constructor غیرمجازه و SyntaxError می‌ده. به همین دلیل این کلاس به‌جای export، به‌عنوان
-// یک property روی خودِ __WORKER_EXPORT__ برگردانده می‌شود (پایین‌تر: `StateStore,`).
-// **برای این‌که بایندینگ Durable Object واقعاً روی کلودفلر کار کنه، stub بیرونی (بیرون از این فایل،
-// همونی که مطابق بند ۲ خلاصه با ENCODE ساخته می‌شه) باید کنار `export default name;` این خط هم
-// اضافه بشه:**
-//     export const StateStore = name.StateStore;
-// بدون این خط، بایندینگ `class_name: "StateStore"` که دو هندلر آپدیت خودکار پایین‌تر اضافه
-// می‌کنند موقع دیپلوی روی کلودفلر شکست می‌خورد ("class not exported"). این رو حتماً قبل از فاز ۲
-// روی یک اکانت واقعی تست کنید (کنار همون ریسک شناخته‌شده‌ی «فعال‌سازی اولین DO ممکنه دستی باشه»
-// که در خودِ xhttp.md فاز ۱ هشدار داده شده) - تست با درخواست GET به /api/xhttp-do-test.
-class StateStore {
-	constructor(state, env) {
-		this.state = state;
-		this.env = env;
-		// xhttp.md فاز ۹ - اسکلت state سشن (فاز ۱۱ فیلدهای رله/آپلود رو هم اضافه کرده):
-		this.sessionId = null; // پایین‌تر توی fetch از URL خونده می‌شه (method-aware، طبق اصلاحیه‌ی فاز ۱۱)
-		this.socket = null; // فاز ۱۱: سوکت connect() مقصد، وقتی هدر با موفقیت پارس و auth بشه باز می‌شه
-		this.status = "awaiting-header"; // 'awaiting-header' | 'connected' | 'closed' - فاز ۱۱/۱۵ عوضش می‌کنن
-		this.closeReason = null; // دیباگ موقت: چرا _closeSession صدا زده شده - توی پاسخ ۴۱۰ هم برگردونده می‌شه
-		this.headerBuffer = new Uint8Array(0); // فاز ۱۱: بافر بایت خام تا رسیدن به اندازه‌ی کافی برای parseVlessTrojanHeader (فاز ۲)
-		this.lastActivity = Date.now(); // فاز ۱۵: مبنای Alarm API برای timeout بی‌فعالیتی
-		// فاز ۱۱ (اصلاحیه‌ی packet-up): هر POST جدا با seq خودش می‌رسه و ممکنه نامرتب برسه؛
-		// اینا رو تا نوبتشون برسه نگه می‌داریم، نه اینکه فرض کنیم هر POST بلافاصله بعد قبلیه.
-		this.pendingPackets = new Map(); // seq(number) -> Uint8Array
-		this.nextSeq = 0; // بعدی‌ای که باید پردازش بشه؛ فقط وقتی pendingPackets.has(nextSeq) درین می‌شه
-		this.chainLock = Promise.resolve(); // صف‌بندی «درج + خالی‌کردنِ به‌ترتیب» بین فراخوانی‌های هم‌زمان fetch
-		this.connectingPromise = null; // جلوگیری از connect() موازی وقتی چند بسته هم‌زمان به مرحله‌ی «هدر پارس شد» می‌رسن
-		this.writer = null; // WritableStreamDefaultWriter روی this.socket، بعد از باز شدن سوکت
-		this.uploadQueue = null; // همون createUpstreamQueue مشترکی که صف آپلود WS استفاده می‌کنه
-		this.username = null; // فاز ۱۳/۱۴ برای حسابداری/تایید دستگاه بهش نیاز دارن
-		// فاز ۱۳: دقیقاً هم‌الگو با uncountedBytes توی addBytes (handlevIees) - بایت‌های
-		// آپلودی‌ای که قبل از شناخته‌شدنِ username می‌رسن (هنوز تو مرحله‌ی پارس هدریم) اینجا
-		// جمع می‌شن؛ به‌محض connect شدن، یک‌جا به addUserTrafficBytes پاس داده می‌شن.
-		this.uncountedBytes = 0;
-		this.validUUID = null;
-		this.respHeader = null; // فاز ۱۲ (مسیر GET/دانلود) بهش نیاز داره
-		// فاز ۱۲: هر GET (چه قبل از باز شدن سوکت برسه چه بعدش) روی همین promise منتظر می‌مونه؛
-		// resolve وقتی status به "connected" می‌رسه، reject وقتی _closeSession صدا زده بشه
-		// بدون اینکه هیچ‌وقت به connected رسیده باشیم (auth رد شد، connect() شکست خورد، ...).
-		this._readyResolve = null;
-		this._readyReject = null;
-		this.readyPromise = new Promise((resolve, reject) => {
-			this._readyResolve = resolve;
-			this._readyReject = reject;
-		});
-	}
-	async fetch(request) {
-		const url = new URL(request.url);
-		const segments = url.pathname.split("/").filter(Boolean);
-		// xhttp.md فاز ۱۱ (اصلاحیه‌ی بند ۳، بعد از فاز ۱۰): طبق مستندات رسمی Xray-core/sing-xhttp
-		// (نه یک capture واقعی مثل فاز ۱۰ - قبل از فاز ۱۲ بهتره با یک تست دستی هم تایید بشه)،
-		// مسیر GET زیر packet-up همچنان `<path>/<sessionId>` است (بدون تغییر از فاز ۹/۱۰)، ولی
-		// مسیر هر POST به شکل `<path>/<sessionId>/<seq>` است - یعنی sessionId یک سگمنت قبل از
-		// آخرین سگمنته، نه خودِ آخرین سگمنت. این تشخیص باید method-aware باشه؛ فاز ۱۶ (روتینگ
-		// واقعی سمت Worker) هم باید همین منطق رو برای idFromName(sessionId) رعایت کنه.
-		let seq = null;
-		if (request.method === "POST") {
-			if (segments.length >= 2) {
-				const seqRaw = segments[segments.length - 1];
-				const parsedSeq = parseInt(seqRaw, 10);
-				if (Number.isInteger(parsedSeq) && parsedSeq >= 0 && String(parsedSeq) === seqRaw) {
-					seq = parsedSeq;
-					if (!this.sessionId) this.sessionId = url.searchParams.get("sessionId") || segments[segments.length - 2];
-				}
-			}
-			if (seq === null) {
-				// فرمت مسیر با packet-up استاندارد جور درنمیاد - بدون هیچ سوکت/رله‌ای رد می‌شه
-				return new Response("invalid xhttp upload path", { status: 400 });
-			}
-		} else {
-			if (!this.sessionId) {
-				this.sessionId = url.searchParams.get("sessionId") || (segments.length ? segments[segments.length - 1] : null);
-			}
-		}
-		this.lastActivity = Date.now();
-		if (request.method === "POST") {
-			return await this._handleUploadPacket(request, seq);
-		}
-		return await this._handleDownload(request);
-	}
-	// ===== xhttp.md فاز ۱۱: مسیر آپلود (POST) و باز کردن connect() =====
-	async _handleUploadPacket(request, seq) {
-		if (this.status === "closed") {
-			return new Response("session closed: " + (this.closeReason || "unknown"), { status: 410 });
-		}
-		let bytes;
-		try {
-			// زیر packet-up هر POST یک بسته‌ی محدود و کامل است (طبق مستندات Xray حداکثر ~۱
-			// مگابایت)، نه یک ReadableStream پیوسته - پس خوندن کامل با arrayBuffer() اینجا
-			// درسته؛ برخلاف متن اولیه‌ی این فاز که برای mode=stream-up نوشته شده بود.
-			const buf = await request.arrayBuffer();
-			bytes = new Uint8Array(buf);
-		} catch (e) {
-			return new Response("bad body", { status: 400 });
-		}
-		this.pendingPackets.set(seq, bytes);
-		// قفل زنجیره‌ای ساده: چند فراخوانی هم‌زمانِ fetch (چند POST جدا) ممکنه با هم interleave
-		// بشن (هر جا await هست) - درج + خالی‌کردنِ به‌ترتیب باید یکی‌یکی اجرا بشه، وگرنه یک بسته
-		// می‌تونه دوبار پردازش بشه یا ترتیب نوشتن به سوکت به‌هم بریزه.
-		const run = this.chainLock.then(() => this._drainReadyPackets(), () => this._drainReadyPackets());
-		this.chainLock = run.catch(() => {});
-		await run;
-		if (this.status === "closed") {
-			return new Response("session closed: " + (this.closeReason || "unknown"), { status: 410 });
-		}
-		return new Response(null, { status: 200 });
-	}
-	async _drainReadyPackets() {
-		while (this.pendingPackets.has(this.nextSeq)) {
-			const chunk = this.pendingPackets.get(this.nextSeq);
-			this.pendingPackets.delete(this.nextSeq);
-			this.nextSeq++;
-			try {
-				await this._consumeUploadChunk(chunk);
-			} catch (e) {
-				// خطای پیش‌بینی‌نشده هم سشن رو یتیم نمی‌ذاره - همون رفتار «رد شد → ببند»ی که
-				// بقیه‌ی شاخه‌های این فاز دارن.
-				this._closeSession("unexpected_error:" + (e && e.message));
-			}
-			if (this.status === "closed") break;
-		}
-	}
-	async _consumeUploadChunk(chunk) {
-		if (this.status === "closed") return;
-		// xhttp.md فاز ۱۳: دقیقاً هم‌الگو با addBytes(bytes) در ابتدای processWsMessage (WS) -
-		// شمارش هر بسته‌ی رسیده، چه هنوز هدر پارس نشده باشه چه بعدش (طبق همون رفتار: بایت‌های
-		// خودِ هدر هم جزو ترافیک کاربر حساب می‌شن). تا وقتی username معلوم نیست (پارس هدر/auth
-		// هنوز تموم نشده)، بایت‌ها توی uncountedBytes جمع می‌شن و به‌محض معلوم‌شدنِ username
-		// (پایین‌تر توی _tryOpenConnection) یک‌جا به addUserTrafficBytes پاس داده می‌شن.
-		const chunkBytes = chunk.byteLength || 0;
-		if (chunkBytes > 0) {
-			if (!this.username) {
-				this.uncountedBytes += chunkBytes;
-			} else {
-				let bytesToAdd = chunkBytes;
-				if (this.uncountedBytes > 0) {
-					bytesToAdd += this.uncountedBytes;
-					this.uncountedBytes = 0;
-				}
-				addUserTrafficBytes(this.env, this.state, this.username, bytesToAdd);
-			}
-		}
-		if (this.status === "connected") {
-			if (this.uploadQueue) {
-				try {
-					await this.uploadQueue.writeAndAwait(chunk, false);
-				} catch (e) {
-					this._closeSession("upload_write_failed:" + (e && e.message));
-				}
-			}
-			return;
-		}
-		// status === "awaiting-header": فاز ۲ - همون پارسر مشترکی که handlevIees هم استفاده می‌کنه
-		this.headerBuffer = concatBytes(this.headerBuffer, chunk);
-		const parsedHeader = parseVlessTrojanHeader(this.headerBuffer);
-		if (parsedHeader === null) {
-			console.log("[XHTTP-DEBUG] header parse: not enough bytes yet, have", this.headerBuffer.byteLength);
-			return; // بایت کافی هنوز نرسیده، منتظر بسته‌ی بعدی
-		}
-		if (parsedHeader.invalid) {
-			console.log("[XHTTP-DEBUG] closing: header parse returned invalid, bytes=", this.headerBuffer.byteLength);
-			this._closeSession("invalid_header");
-			return;
-		}
-		console.log("[XHTTP-DEBUG] header parsed ok:", JSON.stringify({ isTrojan: parsedHeader.isTrojan, cmd: parsedHeader.cmd, address: parsedHeader.address, port: parsedHeader.port }));
-		this.headerBuffer = new Uint8Array(0); // دیگه لازم نیست
-		await this._tryOpenConnection(parsedHeader);
-	}
-	async _tryOpenConnection(parsedHeader) {
-		if (this.connectingPromise) {
-			await this.connectingPromise;
-			return;
-		}
-		const doConnect = async () => {
-			const { isTrojan, uuidOrHash, cmd, address, port, respHeader, remainingPayload } = parsedHeader;
-			let user = null;
-			try {
-				const authCacheKind = isTrojan ? "t" : "u";
-				const cached = await getCachedAuthUser(authCacheKind, uuidOrHash);
-				if (cached !== undefined) {
-					user = cached; // ممکنه null باشه - یک negative cache معتبر
-				} else {
-					if (isTrojan) {
-						user = await this.env.DB.prepare("SELECT * FROM users WHERE trojan_hash = ? OR uuid = ?").bind(uuidOrHash, uuidOrHash).first();
-						if (!user) {
-							const { results } = await this.env.DB.prepare("SELECT * FROM users WHERE is_active = 1").all();
-							if (results) user = results.find((u) => u.uuid && sha224Pure(u.uuid) === uuidOrHash) || null;
-						}
-					} else {
-						user = await this.env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(uuidOrHash).first();
-					}
-					putCachedAuthUser(null, authCacheKind, uuidOrHash, user || null);
-				}
-			} catch (e) {
-				console.log("[XHTTP-DEBUG] auth lookup threw:", e && e.message);
-			}
-			if (!user) {
-				console.log("[XHTTP-DEBUG] closing: no user found for", isTrojan ? "trojan_hash" : "uuid", "=", uuidOrHash);
-				this._closeSession("no_user_found:" + uuidOrHash);
-				return;
-			}
-			console.log("[XHTTP-DEBUG] user found:", user.username, "is_active=", user.is_active, "connection_type=", user.connection_type);
-			const userConn = String(user.connection_type || "vless").toLowerCase();
-			if (isTrojan) {
-				if (!userConn.includes("trojan")) { console.log("[XHTTP-DEBUG] closing: connection_type mismatch (expected trojan, got", userConn, ")"); this._closeSession("connection_type_mismatch:expected_trojan_got_" + userConn); return; }
-			} else {
-				if (!userConn.includes("vless") && userConn !== "vl" + "e" + "ss") { console.log("[XHTTP-DEBUG] closing: connection_type mismatch (expected vless, got", userConn, ")"); this._closeSession("connection_type_mismatch:expected_vless_got_" + userConn); return; }
-			}
-			// UDP/DNS از طریق xhttp فعلاً پشتیبانی نمی‌شه - فقط TCP؛ این محدودیتِ آگاهانه‌ایه،
-			// جزو هیچ‌کدوم از فازهای فعلی xhttp.md نیست.
-			if ((isTrojan && cmd === 3) || (!isTrojan && cmd === 2)) {
-				console.log("[XHTTP-DEBUG] closing: UDP/DNS cmd not supported, cmd=", cmd);
-				this._closeSession("udp_dns_not_supported");
-				return;
-			}
-			// xhttp.md فاز ۱۱: دقیقاً همون شرط‌هایی که handlevIees قبل از باز کردن سوکت چک می‌کنه.
-			// ⚠️ این بلوک عیناً از handlevIees کپی شده (نه یک تابع مشترک - استخراجش جزو فازهای
-			// فعلی نبود)؛ طبق هشدار بند ۱-۲ خلاصه‌ی پروژه، هر تغییری در این شرط‌ها داخل
-			// handlevIees باید دستی اینجا هم اعمال بشه.
-			// xhttp.md فاز ۱۳: دقیقاً هم‌جا و هم‌شکل با افزایش USER_REQ_CACHE/مقداردهی اولیه‌ی
-			// GLOBAL_TRAFFIC_CACHE توی handlevIees (بلافاصله بعد از پیدا شدن کاربر و تایید
-			// connection_type، قبل از چک is_active/limit_gb/limit_req) - هر تلاشِ اتصال (چه در
-			// نهایت رد بشه چه نه) یک «ریکوئست» حساب می‌شه، نه فقط اتصال‌های موفق.
-			let currentReqs = USER_REQ_CACHE.get(user.username) || 0;
-			USER_REQ_CACHE.set(user.username, currentReqs + 1);
-			if (!GLOBAL_TRAFFIC_CACHE.has(user.username)) {
-				GLOBAL_TRAFFIC_CACHE.set(user.username, 0);
-			}
-			if (user.is_active === 0) { console.log("[XHTTP-DEBUG] closing: is_active === 0"); this._closeSession("user_inactive"); return; }
-			const liveGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024));
-			if (user.limit_gb && liveGb >= user.limit_gb) { console.log("[XHTTP-DEBUG] closing: limit_gb reached", liveGb, ">=", user.limit_gb); this._closeSession("limit_gb_reached"); return; }
-			// نکته: چون بالاتر USER_REQ_CACHE از قبلِ این چک +۱ شده (دقیقاً مثل handlevIees،
-			// خط مشابه با ">" نه ">=")، اینجا هم باید ">" باشه - وگرنه با همون +۱ ناخواسته یک
-			// اتصال زودتر از حد واقعی رد می‌شد.
-			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(user.username) || 0) > user.limit_req) { console.log("[XHTTP-DEBUG] closing: limit_req reached"); this._closeSession("limit_req_reached"); return; }
-			if (await isGlobalReqLimitReached(this.env, null)) { console.log("[XHTTP-DEBUG] closing: global req limit reached"); this._closeSession("global_req_limit_reached"); return; }
-			if (user.expiry_days) {
-				let isTimeExpired = false;
-				if (user.start_on_first_connect === 1) {
-					if (user.first_connection_time) {
-						const expiryDate = new Date(user.first_connection_time + user.expiry_days * 24 * 60 * 60 * 1000);
-						if (new Date() > expiryDate) isTimeExpired = true;
-					}
-				} else if (user.created_at) {
-					const created = new Date(user.created_at);
-					const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
-					if (new Date() > expiryDate) isTimeExpired = true;
-				}
-				if (isTimeExpired) {
-					console.log("[XHTTP-DEBUG] closing: user expired");
-					try {
-						await this.env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(user.uuid).run();
-						await invalidateUserAuthCache(null, user.uuid, user.trojan_hash);
-					} catch (e) { }
-					this._closeSession("user_expired");
-					return;
-				}
-			}
-			this.username = user.username;
-			this.validUUID = user.uuid;
-			this.respHeader = respHeader;
-			let socket;
-			console.log("[XHTTP-DEBUG] all checks passed, connecting to", address, ":", port);
-			try {
-				socket = connect({ hostname: bracketIPv6(address), port: port });
-				await waitSocketOpened(socket, 12000);
-			} catch (e) {
-				console.log("[XHTTP-DEBUG] closing: connect()/waitSocketOpened failed:", e && e.message);
-				this._closeSession("connect_failed:" + (e && e.message));
-				return;
-			}
-			console.log("[XHTTP-DEBUG] socket opened successfully");
-			this.socket = socket;
-			this.writer = socket.writable.getWriter();
-			// فاز ۱۱: همون createUpstreamQueue مشترکی که صف آپلود WS استفاده می‌کنه، نه یک
-			// پیاده‌سازی صفِ جدا و موازی.
-			this.uploadQueue = createUpstreamQueue({
-				getWriter: () => this.writer,
-				releaseWriter: () => { try { this.writer?.releaseLock(); } catch (e) { } this.writer = null; },
-				retryConnect: null, // فاز ۱۱: بدون reconnect خودکار - جزو این فاز نیست
-				closeConnection: () => this._closeSession("upload_queue_closed_connection"),
-				name: "xhttpUploadQueue",
-			});
-			this.status = "connected";
-			// xhttp.md فاز ۱۵: از همین لحظه که سشن واقعاً «زنده»ست (سوکت مقصد باز شده)، ناظر
-			// idle timeout رو شروع کن. عمداً await نمی‌شه - نباید جواب‌دادن به کلاینت رو معطل کنه؛
-			// اگه setAlarm خودش شکست بخوره (نادره)، فقط یعنی این سشن idle-timeout نمی‌گیره، نه
-			// این‌که کل اتصال خراب بشه.
-			this.state.storage.setAlarm(Date.now() + XHTTP_IDLE_CHECK_INTERVAL_MS).catch(() => { });
-			if (this._readyResolve) {
-				try { this._readyResolve(); } catch (e) { }
-			}
-			if (remainingPayload && remainingPayload.byteLength > 0) {
-				try {
-					await this.uploadQueue.writeAndAwait(remainingPayload, false);
-				} catch (e) {
-					this._closeSession("initial_payload_write_failed:" + (e && e.message));
-				}
-			}
-		};
-		this.connectingPromise = doConnect();
-		await this.connectingPromise;
-		this.connectingPromise = null;
-	}
-	_closeSession(reason) {
-		if (this.status === "closed") return;
-		if (reason) this.closeReason = reason;
-		this.status = "closed";
-		try { this.writer?.releaseLock(); } catch (e) { }
-		try { this.socket?.close(); } catch (e) { }
-		try { this.uploadQueue?.clear(); } catch (e) { }
-		this.pendingPackets.clear();
-		// xhttp.md فاز ۱۵: اگه هنوز alarm بی‌فعالیتی زمان‌بندی‌شده مونده، لازم نیست یک بار دیگه
-		// DO رو بیدار کنه فقط برای این‌که ببینه از قبل بسته شده - همین‌جا حذفش می‌کنیم.
-		try { this.state.storage.deleteAlarm(); } catch (e) { }
-		// باگ‌فیکس فاز ۱۳: بدون این خط، هر بایت/ریکوئستی که هنوز به آستانه‌ی دبانسِ
-		// addUserTrafficBytes نرسیده بود، همین‌جا با بسته‌شدنِ سشن برای همیشه گم می‌شد (توضیح
-		// کامل بالای تعریف forceFlushUserTraffic). این‌جا تنها نقطه‌ایه که همه‌ی مسیرهای بسته‌شدنِ
-		// سشن (auth رد شد، limit، connect() شکست خورد، سوکت مقصد بست، خطای غیرمنتظره) از توش رد
-		// می‌شن، پس بهترین جا برای فلاش اجباریه.
-		try { forceFlushUserTraffic(this.env, this.state, this.username); } catch (e) { }
-		// اگه هیچ‌وقت به "connected" نرسیده بودیم، هر GET منتظرِ readyPromise باید با خطا تموم
-		// بشه؛ اگه قبلاً resolve شده بود، این reject بی‌اثره (یک Promise فقط یک‌بار settle می‌شه).
-		if (this._readyReject) {
-			try { this._readyReject(new Error("xhttp session closed")); } catch (e) { }
-		}
-	}
-	// xhttp.md فاز ۱۵: فقط خودِ Alarm API کلودفلر این متد رو صدا می‌زنه - جای دیگه‌ای از این
-	// فایل مستقیم صداش نمی‌زنه. اگه از آخرین فعالیت (lastActivity - هر fetch()، هر بایت دانلودی)
-	// به‌اندازه‌ی XHTTP_IDLE_TIMEOUT_MS گذشته باشه، سشن idle حساب می‌شه و بسته می‌شه (که یعنی
-	// سوکت مقصد هم بسته می‌شه، DO دیگه پین نمی‌مونه و می‌تونه evict/hibernate بشه). وگرنه فقط
-	// یک alarm دیگه برای دور بعدی چک برنامه‌ریزی می‌کنه.
-	async alarm() {
-		if (this.status === "closed") return;
-		const idleMs = Date.now() - this.lastActivity;
-		if (idleMs >= XHTTP_IDLE_TIMEOUT_MS) {
-			this._closeSession("idle_timeout:" + idleMs + "ms");
-			return;
-		}
-		try { await this.state.storage.setAlarm(Date.now() + XHTTP_IDLE_CHECK_INTERVAL_MS); } catch (e) { }
-	}
-	// ===== xhttp.md فاز ۱۲: مسیر دانلود (GET) و رله‌ی دوطرفه =====
-	async _handleDownload(request) {
-		if (this.status === "closed") {
-			return new Response("session closed: " + (this.closeReason || "unknown"), { status: 410 });
-		}
-		if (this.status !== "connected") {
-			// GET زودتر از POST رسیده (یا POST هنوز هدر رو پارس/auth نکرده) - منتظر می‌مونیم تا
-			// فاز ۱۱ سوکت رو باز کنه؛ اگه اون‌طرف رد بشه (auth/limit/connect fail)، readyPromise
-			// reject می‌شه و اینجا با خطا برمی‌گردیم، بدون اینکه استریمی باز کرده باشیم.
-			try {
-				await this.readyPromise;
-			} catch (e) {
-				return new Response("upstream not available", { status: 502 });
-			}
-		}
-		if (this.status !== "connected" || !this.socket) {
-			return new Response("upstream not available", { status: 502 });
-		}
-		if (this.socket.readable.locked) {
-			// فعلاً فقط یک GET هم‌زمان در هر سشن پشتیبانی می‌شه - reconnect/GET دوم روی همون
-			// سشن جزو این فاز نیست (فاز ۱۵ مسئول بستن/پاکسازی سشن‌های قدیمیه، نه اینجا).
-			return new Response("download already in progress for this session", { status: 409 });
-		}
-		const store = this;
-		const socketReader = this.socket.readable.getReader();
-		const initialRespHeader = this.respHeader; // فقط vless (غیر trojan) پرشه؛ برای trojan همیشه null
-		const stream = new ReadableStream({
-			start(controller) {
-				if (initialRespHeader && initialRespHeader.byteLength > 0) {
-					try { controller.enqueue(initialRespHeader); } catch (e) { }
-				}
-			},
-			async pull(controller) {
-				try {
-					const { value, done } = await socketReader.read();
-					if (done) {
-						try { controller.close(); } catch (e) { }
-						store._closeSession("remote_socket_closed");
-						return;
-					}
-					store.lastActivity = Date.now();
-					controller.enqueue(value);
-					// xhttp.md فاز ۱۳: دقیقاً هم‌الگو با addBytes صدا زده شده از connectStreams (WS، مسیر
-					// دانلود) - اینجا status از قبل "connected"ه (چک شده قبل از ساختن این استریم)، پس
-					// username همیشه معلومه، نیازی به منطق uncountedBytes نیست.
-					if (value && value.byteLength) addUserTrafficBytes(store.env, store.state, store.username, value.byteLength);
-				} catch (e) {
-					try { controller.error(e); } catch (_e) { }
-					store._closeSession("download_relay_error:" + (e && e.message));
-				}
-			},
-			cancel(reason) {
-				try { socketReader.cancel(reason); } catch (e) { }
-				store._closeSession("get_stream_cancelled");
-			},
-		});
-		// هدرهای پاسخ طبق بند ۳ سند (هنوز فرضه، نه capture واقعی - قبل از rollout واقعی تایید بشه):
-		// text/event-stream + no-store + X-Accel-Buffering برای جلوگیری از بافر شدن جواب توسط
-		// هر پروکسی/CDN میون‌راه.
-		return new Response(stream, {
-			status: 200,
-			headers: {
-				"Content-Type": "text/event-stream",
-				"Cache-Control": "no-store",
-				"X-Accel-Buffering": "no",
-			},
-		});
-	}
-}
-// xhttp.md فاز ۱۶: همون رشته‌ی ثابتِ "/XYZ" که در ۴ محل تولید لینک (rawPath محلی) هم استفاده
-// می‌شه - این‌جا یک‌بار به‌عنوان ثابتِ مشترک تعریف شده تا روتینگ همیشه با همون مسیری match کنه
-// که کانفیگ‌ها واقعاً توش ساخته می‌شن. ⚠️ فازهای ۱۷-۲۱ (تولید لینک xhttp) هنوز به این ثابت
-// وصل نشدن - همچنان literal «/XYZ» محلی خودشون رو دارن؛ وقتی اون فازها انجام شدن، بهتره
-// همه‌جا همین ثابت رو صدا بزنن تا دوباره یک مقدار تکراری از دو جا دستی sync نشه.
-const XHTTP_RAW_PATH = "/XYZ";
 const __WORKER_EXPORT__ = {
 	async fetch(request, env, ctx) {
 		if (!env.DB) {
@@ -1705,13 +1174,6 @@ const __WORKER_EXPORT__ = {
 			const url = new URL(request.url);
 			if (Router.isWebSocketUpgrade(request)) {
 				return await Router.handleWebSocket(request, env, ctx);
-			}
-			// xhttp.md فاز ۱۶: بدون auth پنل، دقیقاً مثل WS - چون این ترافیکِ واقعیِ کلاینت
-			// VPNه، نه یک درخواست API ادمین. باید قبل از چک /api/ بیاد چون XHTTP_RAW_PATH
-			// ("/XYZ") با هیچ مسیر رزروی دیگه (api, ppannell, profile, notes, bundle,
-			// manifest/icon) تداخل نداره (تایید شده با grep - پایین‌تر).
-			if ((request.method === "GET" || request.method === "POST") && url.pathname.startsWith(XHTTP_RAW_PATH + "/")) {
-				return await Router.handleXhttp(request, env, ctx);
 			}
 			if (Router.isSubscriptionPath(url.pathname)) {
 				return await Router.handleSubscription(url, env);
@@ -1773,9 +1235,6 @@ const __WORKER_EXPORT__ = {
 			return new Response("Internal Server Error", { status: 500 });
 		}
 	},
-	// xhttp.md فاز ۱ - نگاه کنید به کامنت بالای کلاس StateStore برای این‌که چرا export مستقیم
-	// اینجا ممکن نیست و stub بیرونی چه کاری باید بکنه.
-	StateStore,
 };
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
@@ -1873,46 +1332,6 @@ const Router = {
 	},
 	isSubscriptionPath(pathname) {
 		return pathname.startsWith("/notes/") || pathname.startsWith("/bundle/");
-	},
-	// xhttp.md فاز ۱۶ - روتینگ خام سمت Worker: هیچ auth/relay‌ای اینجا نیست (اونا مسئولیت
-	// StateStore خودشه، فازهای ۹-۱۲). فقط sessionId رو از URL درمیاره و request رو بدون
-	// تغییر به همون DO instance پاس می‌ده.
-	// ⚠️ استخراج sessionId اینجا عمداً method-aware و عیناً هم‌الگو با ابتدای StateStore.fetch()
-	// (فاز ۹، اصلاح‌شده در فاز ۱۱) است، نه یک تابع مشترک - چون در زمان نوشتن این فاز استخراج
-	// مشترک‌کردنش جزو دامنه نبود. اگه اون منطق توی StateStore.fetch() عوض بشه، اینجا هم دستی
-	// sync بشه؛ وگرنه GET و POST یک سشن به دو DO مختلف می‌رن و رله می‌شکنه (دقیقاً همون کلاس
-	// ریسکی که بند ۱-۲ خلاصه‌ی پروژه درباره‌ی منطق تکراری هشدار داده).
-	async handleXhttp(request, env, ctx) {
-		if (!env.XHTTP_SESSION) {
-			return new Response("XHTTP_SESSION binding is missing on this Worker", { status: 500 });
-		}
-		const url = new URL(request.url);
-		const segments = url.pathname.split("/").filter(Boolean);
-		let sessionId = null;
-		if (request.method === "POST") {
-			// زیر packet-up مسیر POST به‌شکل <path>/<sessionId>/<seq> است - sessionId یک
-			// سگمنت قبل از آخرین سگمنته (که خودِ seq عددیه)، نه خودِ آخرین سگمنت.
-			if (segments.length >= 2) {
-				const seqRaw = segments[segments.length - 1];
-				if (/^\d+$/.test(seqRaw)) {
-					sessionId = segments[segments.length - 2];
-				}
-			}
-		} else {
-			// GET (دانلود): sessionId همون آخرین سگمنت مسیره.
-			sessionId = segments.length ? segments[segments.length - 1] : null;
-		}
-		if (!sessionId) {
-			return new Response("invalid xhttp session path", { status: 400 });
-		}
-		try {
-			const id = env.XHTTP_SESSION.idFromName(sessionId);
-			const stub = env.XHTTP_SESSION.get(id);
-			// همون Request object بدون تغییر - StateStore.fetch() خودش دوباره URL رو پارس می‌کنه.
-			return await stub.fetch(request);
-		} catch (e) {
-			return new Response("xhttp routing error: " + (e && e.message ? e.message : String(e)), { status: 500 });
-		}
 	},
 	async handleWebSocket(request, env, ctx) {
 		try {
@@ -2241,34 +1660,6 @@ const Router = {
 				return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
 			}
 		}
-		if (url.pathname === "/api/xhttp-do-test" && request.method === "GET") {
-			// xhttp.md فاز ۱ - تست پذیرش (acceptance test): فقط تایید می‌کنه بایندینگ DO رسیده و
-			// fetch تستی جواب می‌ده؛ هیچ ربطی به منطق واقعی سشن xhttp (فازهای ۹+) نداره. بعد از
-			// این‌که فاز ۱۶ روتینگ واقعی رو اضافه کرد، این مسیر رو می‌تونید نگه دارید (health-check
-			// بی‌ضرره) یا حذف کنید.
-			if (!env.XHTTP_SESSION) {
-				return new Response(
-					JSON.stringify({
-						error: "بایندینگ XHTTP_SESSION هنوز روی این Worker تنظیم نشده. یک‌بار از /api/update-panel (یا update-panel-github) دیپلوی بزنید تا بایندینگ + migration کلاس StateStore اضافه بشه، بعد دوباره امتحان کنید.",
-					}),
-					{ status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } }
-				);
-			}
-			try {
-				const id = env.XHTTP_SESSION.idFromName("phase1-test");
-				const stub = env.XHTTP_SESSION.get(id);
-				const doResp = await stub.fetch("https://internal.zeus/xhttp-do-test");
-				const doText = await doResp.text();
-				return new Response(JSON.stringify({ success: true, do_response: doText }), {
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			} catch (err) {
-				return new Response(JSON.stringify({ error: err.message }), {
-					status: 500,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-		}
 		if (url.pathname === "/api/update-panel" && request.method === "POST") {
 			const body = await request.json().catch(() => ({}));
 			const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
@@ -2298,8 +1689,6 @@ const Router = {
 				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
 				const newCode = await githubRes.text();
 				assertDeployableWorkerModule(newCode, "zeus.obfuscated.js");
-				// xhttp.md فاز ۱: اگه stub بیرونی هنوز آپدیت نشده (نگاه کنید به کامنت بالای کلاس
-				// StateStore)، همین‌جا هم رد می‌شه چون کلاس export نشده - قبل از دیپلوی واقعی چک شود.
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
@@ -2326,25 +1715,12 @@ const Router = {
 				}
 				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
 				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
-				// xhttp.md فاز ۱: بایندینگ Durable Object فقط وقتی که هنوز روی کلودفلر ثبت نشده اضافه
-				// می‌شه (دفعات بعدی از همون حلقه‌ی بالا - شاخه‌ی `else if (b.type !== "secret_text")`
-				// - دست‌نخورده حفظ می‌شه). migration هم فقط همون بار اول فرستاده می‌شه تا کلودفلر
-				// دوباره برای یک کلاس از قبل موجود خطا نده.
-				// ⚠️ تست‌نشده روی یک اکانت واقعی - طبق هشدار خودِ فاز ۱، قبل از فاز ۲ حتماً تایید کنید
-				// (این‌که آیا کلودفلر بدون old_tag/new_tag صریح این migration رو قبول می‌کنه یا نه).
-				const hasXhttpDoBinding = newBindings.some((b) => b.type === "durable_object_namespace" && b.name === "XHTTP_SESSION");
-				if (!hasXhttpDoBinding) {
-					newBindings.push({ type: "durable_object_namespace", name: "XHTTP_SESSION", class_name: "StateStore" });
-				}
 				const metadata = {
 					main_module: "zeus.js",
 					compatibility_date: "2026-07-10",
 					compatibility_flags: ["nodejs_compat"],
 					bindings: newBindings,
 				};
-				if (!hasXhttpDoBinding) {
-					metadata.migrations = { new_sqlite_classes: ["StateStore"] };
-				}
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
 				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
@@ -2400,8 +1776,6 @@ const Router = {
 				const newCode = await githubRes.text();
 				if (!newCode || newCode.trim().length < 100) throw new Error("فایل دریافتی از گیت‌هاب خالی یا نامعتبر است.");
 				assertDeployableWorkerModule(newCode, "worker.js");
-				// xhttp.md فاز ۱: اگه stub بیرونی هنوز آپدیت نشده (نگاه کنید به کامنت بالای کلاس
-				// StateStore)، همین‌جا هم رد می‌شه چون کلاس export نشده - قبل از دیپلوی واقعی چک شود.
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
 				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
 					headers: cfHeaders,
@@ -2428,25 +1802,12 @@ const Router = {
 				}
 				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
 				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
-				// xhttp.md فاز ۱: بایندینگ Durable Object فقط وقتی که هنوز روی کلودفلر ثبت نشده اضافه
-				// می‌شه (دفعات بعدی از همون حلقه‌ی بالا - شاخه‌ی `else if (b.type !== "secret_text")`
-				// - دست‌نخورده حفظ می‌شه). migration هم فقط همون بار اول فرستاده می‌شه تا کلودفلر
-				// دوباره برای یک کلاس از قبل موجود خطا نده.
-				// ⚠️ تست‌نشده روی یک اکانت واقعی - طبق هشدار خودِ فاز ۱، قبل از فاز ۲ حتماً تایید کنید
-				// (این‌که آیا کلودفلر بدون old_tag/new_tag صریح این migration رو قبول می‌کنه یا نه).
-				const hasXhttpDoBinding = newBindings.some((b) => b.type === "durable_object_namespace" && b.name === "XHTTP_SESSION");
-				if (!hasXhttpDoBinding) {
-					newBindings.push({ type: "durable_object_namespace", name: "XHTTP_SESSION", class_name: "StateStore" });
-				}
 				const metadata = {
 					main_module: "zeus.js",
 					compatibility_date: "2026-07-10",
 					compatibility_flags: ["nodejs_compat"],
 					bindings: newBindings,
 				};
-				if (!hasXhttpDoBinding) {
-					metadata.migrations = { new_sqlite_classes: ["StateStore"] };
-				}
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
 				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
@@ -2530,7 +1891,6 @@ const Router = {
 				let unpinRemoval = { countries: [], usersUpdated: 0 };
 				let fragApplied = false;
 				let earlyDataApplied = false;
-				let transportTypeApplied = false;
 				let userLimitApplied = false;
 				let fingerprintApplied = false;
 				let connTypeApplied = false;
@@ -2637,22 +1997,6 @@ const Router = {
 							overrideEarlyData = { enabled: edEnabledRaw === "1" ? 1 : 0, size: edSize };
 						}
 					}
-					// xhttp.md فاز ۵ (transport_type): دقیقاً هم‌الگو با بلوک Early Data بالا - فقط پیش‌فرضِ کاربر
-					// *تازه‌ساز*ه؛ لینک‌ها از ستون transport_type خودِ هر کاربر ساخته می‌شوند (resolveConfigTransport،
-					// فاز ۴)، نه از settings. فقط وقتی apply_transport_to_existing_users: true بفرستند (فلگ بیرون از
-					// body.settings) روی ستون همه‌ی کاربرهای *موجود* هم نوشته می‌شود. مقدار باید دقیقاً یکی از
-					// VALID_TRANSPORT_TYPES باشد؛ نامعتبر = نادیده گرفته می‌شود (و چون transport_type_applied
-					// برنمی‌گردد، فراخواننده آن را به‌عنوان خطا می‌بیند).
-					let overrideTransportType = undefined;
-					if (
-						body.apply_transport_to_existing_users === true &&
-						Object.prototype.hasOwnProperty.call(body.settings, "new_user_transport_type")
-					) {
-						const ttRaw = String(body.settings.new_user_transport_type == null ? "" : body.settings.new_user_transport_type).trim().toLowerCase();
-						if (VALID_TRANSPORT_TYPES.includes(ttRaw)) {
-							overrideTransportType = ttRaw;
-						}
-					}
 					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
 					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
 					// «لیست لوکیشن‌های پین‌شده»: اگه این کلید توی همین درخواست هست، لیست قبلی رو
@@ -2703,10 +2047,6 @@ const Router = {
 						await env.DB.prepare("UPDATE users SET early_data_enabled = ?, early_data_size = ?").bind(overrideEarlyData.enabled, overrideEarlyData.size).run();
 						earlyDataApplied = true;
 					}
-					if (overrideTransportType !== undefined) {
-						await env.DB.prepare("UPDATE users SET transport_type = ?").bind(overrideTransportType).run();
-						transportTypeApplied = true;
-					}
 					if (overrideFingerprint !== undefined) {
 						await env.DB.prepare("UPDATE users SET fingerprint = ?").bind(overrideFingerprint).run();
 						fingerprintApplied = true;
@@ -2723,7 +2063,7 @@ const Router = {
 						} catch (e) { /* best-effort: the cache expires by itself within seconds */ }
 					}
 				}
-				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, early_data_applied: earlyDataApplied, transport_type_applied: transportTypeApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, early_data_applied: earlyDataApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/settings/sync-vip-proxies") {
@@ -2999,7 +2339,7 @@ const Router = {
 						if (resetUser) await invalidateUserAuthCache(ctx, resetUser.uuid, resetUser.trojan_hash);
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} else {
-						const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size, transport_type } = body;
+						const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = body;
 						if (new_username && new_username !== username) {
 							if (!/^[a-zA-Z0-9_-]+$/.test(new_username)) {
 								return new Response(JSON.stringify({ error: "نام کاربری جدید غیرمجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
@@ -3088,15 +2428,6 @@ const Router = {
 							const edSizePut = edSizePutRaw >= 1 && edSizePutRaw <= EARLY_DATA_MAX_SIZE ? edSizePutRaw : null;
 							if (edEnabledPut !== null || edSizePut !== null) {
 								await env.DB.prepare("UPDATE users SET early_data_enabled = COALESCE(?, early_data_enabled), early_data_size = COALESCE(?, early_data_size) WHERE username = ?").bind(edEnabledPut, edSizePut, new_username || username).run();
-							}
-						} catch (e) { }
-						// xhttp.md فاز ۵ (transport_type): دقیقاً هم‌الگو با بلوک Early Data بالا - فقط اگر بدنه
-						// فرستاده باشد نوشته می‌شود (نیامده = بدون تغییر)؛ مقدار نامعتبر هم نادیده گرفته می‌شود.
-						try {
-							const ttPut = transport_type !== undefined && transport_type !== null ? String(transport_type).trim().toLowerCase() : null;
-							const finalTtPut = ttPut !== null && VALID_TRANSPORT_TYPES.includes(ttPut) ? ttPut : null;
-							if (finalTtPut !== null) {
-								await env.DB.prepare("UPDATE users SET transport_type = COALESCE(?, transport_type) WHERE username = ?").bind(finalTtPut, new_username || username).run();
 							}
 						} catch (e) { }
 						if (resetProxyToDefault) {
@@ -3269,7 +2600,7 @@ const Router = {
 					}
 				}
 				if (request.method === "POST") {
-					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size, transport_type } = await readJsonBody(request);
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = await readJsonBody(request);
 					if (!username) {
 						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
 					}
@@ -3338,17 +2669,6 @@ const Router = {
 						const finalEarlyDataEnabled = flagOf(early_data_enabled, nud.new_user_early_data_enabled);
 						const edSizeParsed = parseInt(given(early_data_size) ? early_data_size : nud.new_user_early_data_size, 10);
 						const finalEarlyDataSize = edSizeParsed >= 1 && edSizeParsed <= EARLY_DATA_MAX_SIZE ? edSizeParsed : 2560;
-						// xhttp.md فاز ۵ (transport_type): مقدار صریح برنده است؛ نیامده = پیش‌فرض Settings
-						// (new_user_transport_type)؛ نامعتبر (نه در VALID_TRANSPORT_TYPES) = 'ws'.
-						const requestedTransportType = given(transport_type) ? String(transport_type).trim().toLowerCase() : null;
-						const finalTransportType =
-							requestedTransportType !== null
-								? VALID_TRANSPORT_TYPES.includes(requestedTransportType)
-									? requestedTransportType
-									: "ws"
-								: VALID_TRANSPORT_TYPES.includes(nud.new_user_transport_type)
-									? nud.new_user_transport_type
-									: "ws";
 						const finalTls = given(tls) && String(tls).trim() !== "" ? tls : String(finalPort).split(",").some((p) => NEW_USER_TLS_PORTS.includes(p.trim())) ? "on" : "off";
 						if (!(protocols && Array.isArray(protocols) && protocols.length > 0) && !connection_type) finalConnType = nud.new_user_connection_type;
 						// Every new user is always pinned to whatever the current
@@ -3359,8 +2679,8 @@ const Router = {
 						// the background right after insert (see ctx.waitUntil below) so
 						// this request doesn't have to wait on a full round of live
 						// proxy testing.
-						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, early_data_enabled, early_data_size, transport_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct), finalEarlyDataEnabled, finalEarlyDataSize, finalTransportType)
+						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, early_data_enabled, early_data_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct), finalEarlyDataEnabled, finalEarlyDataSize)
 							.run();
 						// Clears any stale negative-cache ("no such user") entry that might exist for
 						// this uuid/hash from an earlier probe or connection attempt with this UUID.
@@ -3487,10 +2807,6 @@ const DbService = {
 					// early_data_enabled=0 داشته باشن (نه NULL) و user.early_data_enabled بدون fallback جدا کار کنه.
 					{ name: "early_data_enabled", def: "INTEGER DEFAULT 0" },
 					{ name: "early_data_size", def: "INTEGER DEFAULT 2560" },
-					// xhttp.md فاز ۳: نوع ترنسپورت هر کاربر - 'ws' (پیش‌فرض، رفتار فعلی)، 'xhttp'، یا
-					// 'ws+xhttp' (تناوبی). دقیقاً هم‌الگو با early_data_enabled: DEFAULT ساخته می‌شه تا
-					// کاربرهای موجود هم 'ws' داشته باشن (نه NULL).
-					{ name: "transport_type", def: "TEXT DEFAULT 'ws'" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
@@ -4473,112 +3789,6 @@ function getSelectedUserProxy(userSocks5, request) {
 	const selected = proxyList[idx] || proxyList[0];
 	return typeof selected === "object" ? selected.proxy || "" : String(selected || "");
 }
-// xhttp.md فاز ۲ (گروه A) — پارسر مستقل هدر VLESS/Trojan.
-// قبلاً این منطق inline داخل handlevIees بود؛ به این تابع خالص منتقل شده تا فاز ۹+ (Durable
-// Object سشن XHTTP) بتونه دقیقاً همین پارسر رو دوباره صدا بزنه، بدون یک پیاده‌سازی موازی/تکراری.
-// این تابع فقط از روی یک بافر بایت خام تصمیم می‌گیره - هیچ سوکتی نمی‌بنده، هیچ DB/کشی صدا
-// نمی‌زنه؛ فقط سه‌جور خروجی ممکنه:
-//   - null                → بافر هنوز ناقصه (بایت کافی نرسیده)، فراخوان باید صبر کنه (chunk بعدی)
-//   - { invalid: true }    → پروتکل بدفرم/نامعتبره، فراخوان باید سوکت رو ببنده
-//   - آبجکت کامل زیر       → پارس موفق:
-//     { isTrojan, uuidOrHash, cmd, addrType, address, port, respHeader, remainingPayload }
-function parseVlessTrojanHeader(chunkBuffer) {
-	let isTrojan = false;
-	if (chunkBuffer.byteLength >= 58 && chunkBuffer[56] === 0x0D && chunkBuffer[57] === 0x0A) {
-		const checkHex = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
-		if (/^[0-9a-f]{56}$/.test(checkHex)) {
-			isTrojan = true;
-		}
-	}
-	let cmd = 0;
-	let port = 0;
-	let addrType = 0;
-	let addr = "";
-	let rawData = null;
-	let respHeader = null;
-	let uuidOrHash = null;
-	if (isTrojan) {
-		if (chunkBuffer.byteLength < 60) return null;
-		const hexHash = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
-		uuidOrHash = hexHash;
-		let offset = 58;
-		cmd = chunkBuffer[offset++];
-		addrType = chunkBuffer[offset++];
-		if (addrType === 1) {
-			if (chunkBuffer.byteLength < offset + 4 + 2 + 2) return null;
-			addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
-		} else if (addrType === 3) {
-			if (chunkBuffer.byteLength < offset + 1) return null;
-			const domainLen = chunkBuffer[offset++];
-			if (chunkBuffer.byteLength < offset + domainLen + 2 + 2) return null;
-			addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
-			offset += domainLen;
-		} else if (addrType === 4) {
-			if (chunkBuffer.byteLength < offset + 16 + 2 + 2) return null;
-			const v6 = [];
-			for (let i = 0; i < 8; i++) {
-				v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
-			}
-			addr = v6.join(":");
-		} else {
-			return { invalid: true };
-		}
-		port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
-		if (chunkBuffer.byteLength < offset + 2) return null;
-		if (chunkBuffer[offset] !== 0x0D || chunkBuffer[offset + 1] !== 0x0A) {
-			return { invalid: true };
-		}
-		offset += 2;
-		rawData = chunkBuffer.slice(offset);
-		respHeader = null;
-	} else {
-		if (chunkBuffer.byteLength < 24) return null;
-		let optLen = chunkBuffer[17];
-		let requiredLen = 18 + optLen + 4;
-		if (chunkBuffer.byteLength < requiredLen) return null;
-		addrType = chunkBuffer[18 + optLen + 3];
-		if (addrType === 1) {
-			requiredLen += 4;
-		} else if (addrType === 2) {
-			requiredLen += 1;
-			if (chunkBuffer.byteLength < requiredLen) return null;
-			requiredLen += chunkBuffer[18 + optLen + 4];
-		} else if (addrType === 3) {
-			requiredLen += 16;
-		} else {
-			return { invalid: true };
-		}
-		if (chunkBuffer.byteLength < requiredLen) return null;
-		const reqUUID = extractUUIDFromvIees(chunkBuffer);
-		if (!reqUUID) {
-			return { invalid: true };
-		}
-		uuidOrHash = reqUUID;
-		let offset = 17;
-		optLen = chunkBuffer[offset++];
-		offset += optLen;
-		cmd = chunkBuffer[offset++];
-		port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
-		addrType = chunkBuffer[offset++];
-		if (addrType === 1) {
-			addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
-		} else if (addrType === 2) {
-			const domainLen = chunkBuffer[offset++];
-			addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
-			offset += domainLen;
-		} else if (addrType === 3) {
-			const v6 = [];
-			for (let i = 0; i < 8; i++) {
-				v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
-			}
-			addr = v6.join(":");
-		}
-		rawData = chunkBuffer.slice(offset);
-		respHeader = new Uint8Array([chunkBuffer[0], 0]);
-	}
-	return { isTrojan, uuidOrHash, cmd, addrType, address: addr, port, respHeader, remainingPayload: rawData };
-}
-
 async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	let rawClientIP = request ? request.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
 	let clientIP = rawClientIP;
@@ -4625,9 +3835,40 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			recordBurstBytes(username + "|" + clientIP, bytes, Date.now());
 			checkDeviceConfirmation();
 		}
-		// xhttp.md فاز ۱۳: هسته‌ی شمارش/flush به addUserTrafficBytes منتقل شد (بالای فایل) تا DO
-		// هم دقیقاً همین تابع رو صدا بزنه - بدون تغییر رفتار اینجا (فقط جابه‌جایی کد).
-		addUserTrafficBytes(env, ctx, username, bytes);
+		let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+		GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
+		GLOBAL_LAST_ACTIVE_WRITE.set(username, Date.now());
+		if (GLOBAL_WRITE_LOCK.get(username)) return;
+		let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
+		let now = Date.now();
+		let thresholdBytes = 500 * 1024 * 1024;
+		if ((current >= thresholdBytes && now - lastDbWrite > 180000) || (current > 0 && now - lastDbWrite > 900000)) {
+			GLOBAL_WRITE_LOCK.set(username, true);
+			let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+			let toCommitReq = USER_REQ_CACHE.get(username) || 0;
+			if (toCommit <= 0 && toCommitReq <= 0) {
+				GLOBAL_WRITE_LOCK.set(username, false);
+				return;
+			}
+			GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) - toCommit);
+			USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) - toCommitReq);
+			GLOBAL_LAST_DB_WRITE.set(username, now);
+			let deltaGb = toCommit / (1024 * 1024 * 1024);
+			let writeTask = async () => {
+				try {
+					await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, now, username).run();
+					await recordDailyTraffic(env, ctx, deltaGb);
+				} catch (e) {
+					console.error(e.message);
+					GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) + toCommit);
+					USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) + toCommitReq);
+				} finally {
+					GLOBAL_WRITE_LOCK.set(username, false);
+				}
+			};
+			if (ctx) ctx.waitUntil(writeTask());
+			else writeTask();
+		}
 	}
 	let isOfflineSet = false;
 	let hasCountedAsActive = false;
@@ -4909,23 +4150,104 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 		}
 		if (!isHeaderParsed) {
 			chunkBuffer = concatBytes(chunkBuffer, chunk);
-			// xhttp.md فاز ۲: پارس هدر VLESS/Trojan از این‌جا به تابع مستقل parseVlessTrojanHeader
-			// منتقل شده (تعریف بالای handlevIees) - چون فاز ۹+ (Durable Object سشن XHTTP) دقیقاً
-			// همین پارسر رو دوباره لازم داره؛ این‌جا فقط نتیجه‌ش dispatch می‌شه، منطق عوض نشده.
-			const parsedHeader = parseVlessTrojanHeader(chunkBuffer);
-			if (parsedHeader === null) return; // بایت کافی هنوز نرسیده، منتظر chunk بعدی
-			if (parsedHeader.invalid) {
-				serverSock.close();
-				return;
+			
+			let isTrojan = false;
+			if (chunkBuffer.byteLength >= 58 && chunkBuffer[56] === 0x0D && chunkBuffer[57] === 0x0A) {
+				const checkHex = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
+				if (/^[0-9a-f]{56}$/.test(checkHex)) {
+					isTrojan = true;
+				}
 			}
-			let isTrojan = parsedHeader.isTrojan;
-			let cmd = parsedHeader.cmd;
-			let port = parsedHeader.port;
-			let addrType = parsedHeader.addrType;
-			let addr = parsedHeader.address;
-			let rawData = parsedHeader.remainingPayload;
-			let respHeader = parsedHeader.respHeader;
-			let userLookupKey = parsedHeader.uuidOrHash;
+			let cmd = 0;
+			let port = 0;
+			let addrType = 0;
+			let addr = "";
+			let rawData = null;
+			let respHeader = null;
+			let userLookupKey = null;
+			if (isTrojan) {
+				if (chunkBuffer.byteLength < 60) return;
+				const hexHash = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
+				userLookupKey = hexHash;
+				let offset = 58;
+				cmd = chunkBuffer[offset++];
+				addrType = chunkBuffer[offset++];
+				if (addrType === 1) {
+					if (chunkBuffer.byteLength < offset + 4 + 2 + 2) return;
+					addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
+				} else if (addrType === 3) {
+					if (chunkBuffer.byteLength < offset + 1) return;
+					const domainLen = chunkBuffer[offset++];
+					if (chunkBuffer.byteLength < offset + domainLen + 2 + 2) return;
+					addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
+					offset += domainLen;
+				} else if (addrType === 4) {
+					if (chunkBuffer.byteLength < offset + 16 + 2 + 2) return;
+					const v6 = [];
+					for (let i = 0; i < 8; i++) {
+						v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
+					}
+					addr = v6.join(":");
+				} else {
+					serverSock.close();
+					return;
+				}
+				port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
+				if (chunkBuffer.byteLength < offset + 2) return;
+				if (chunkBuffer[offset] !== 0x0D || chunkBuffer[offset + 1] !== 0x0A) {
+					serverSock.close();
+					return;
+				}
+				offset += 2;
+				rawData = chunkBuffer.slice(offset);
+				respHeader = null;
+			} else {
+				if (chunkBuffer.byteLength < 24) return;
+				let optLen = chunkBuffer[17];
+				let requiredLen = 18 + optLen + 4;
+				if (chunkBuffer.byteLength < requiredLen) return;
+				addrType = chunkBuffer[18 + optLen + 3];
+				if (addrType === 1) {
+					requiredLen += 4;
+				} else if (addrType === 2) {
+					requiredLen += 1;
+					if (chunkBuffer.byteLength < requiredLen) return;
+					requiredLen += chunkBuffer[18 + optLen + 4];
+				} else if (addrType === 3) {
+					requiredLen += 16;
+				} else {
+					serverSock.close();
+					return;
+				}
+				if (chunkBuffer.byteLength < requiredLen) return;
+				reqUUID = extractUUIDFromvIees(chunkBuffer);
+				if (!reqUUID) {
+					serverSock.close();
+					return;
+				}
+				userLookupKey = reqUUID;
+				let offset = 17;
+				optLen = chunkBuffer[offset++];
+				offset += optLen;
+				cmd = chunkBuffer[offset++];
+				port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
+				addrType = chunkBuffer[offset++];
+				if (addrType === 1) {
+					addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
+				} else if (addrType === 2) {
+					const domainLen = chunkBuffer[offset++];
+					addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
+					offset += domainLen;
+				} else if (addrType === 3) {
+					const v6 = [];
+					for (let i = 0; i < 8; i++) {
+						v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
+					}
+					addr = v6.join(":");
+				}
+				rawData = chunkBuffer.slice(offset);
+				respHeader = new Uint8Array([chunkBuffer[0], 0]);
+			}
 			if (isHeaderParsing) return;
 			isHeaderParsing = true;
 			isTrojanProto = isTrojan;
@@ -7570,14 +6892,6 @@ Commercial support is available at
 										<input type="checkbox" id="input-proto-trojan" onchange="handleProtocolChange(this)" class="w-4 h-4 rounded focus:ring-green-500/50 bg-white dark:bg-amoled-input border-gray-300 dark:border-amoled-border cursor-pointer text-green-600" style="filter: none !important; accent-color: #16a34a !important;">
 									</label>
 								</div>
-								<div class="pt-3 border-t border-gray-200/70 dark:border-amoled-border">
-									<label class="block text-[10px] font-bold text-gray-600 dark:text-zinc-300 mb-1">نوع ترنسپورت</label>
-									<select id="input-transport-type" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-bold text-gray-800 dark:text-zinc-100 transition shadow-sm cursor-pointer">
-										<option value="ws" selected>WebSocket (ws)</option>
-										<option value="xhttp">XHTTP</option>
-										<option value="ws+xhttp">WS + XHTTP (متناوب)</option>
-									</select>
-								</div>
 							</div>
 							
 							<div class="p-4 bg-gray-50/70 dark:bg-amoled-input/30 border border-gray-200/70 dark:border-amoled-border rounded-xl space-y-3">
@@ -8539,14 +7853,6 @@ Commercial support is available at
 							</select>
 						</div>
 						<div>
-							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">نوع ترنسپورت</label>
-							<select id="nud-transport-type" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
-								<option value="ws">WebSocket (ws)</option>
-								<option value="xhttp">XHTTP</option>
-								<option value="ws+xhttp">WS + XHTTP (متناوب)</option>
-							</select>
-						</div>
-						<div>
 							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">تمدید خودکار حجم (روز)</label>
 							<input type="number" id="nud-auto-reset-vol" dir="ltr" min="0" step="1" placeholder="۰ = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 						</div>
@@ -8627,10 +7933,6 @@ Commercial support is available at
 					<label class="mt-3 flex items-start gap-2 cursor-pointer">
 						<input type="checkbox" id="nud-apply-early-data-existing" class="w-4 h-4 mt-0.5 rounded focus:ring-green-500/50 bg-white dark:bg-amoled-input border-gray-300 dark:border-amoled-border cursor-pointer text-green-600" style="filter: none !important; accent-color: #16a34a !important;">
 						<span class="text-[11px] text-gray-600 dark:text-zinc-400">اعمال Early Data (روشن/خاموش + سایز) روی کاربرهای موجود هم <span class="text-gray-400 dark:text-zinc-500">— فقط برای همین بار ذخیره؛ تنظیم Early Data همه‌ی کاربرها با مقدار بالا جایگزین می‌شه.</span></span>
-					</label>
-					<label class="mt-2 flex items-start gap-2 cursor-pointer">
-						<input type="checkbox" id="nud-apply-transport-existing" class="w-4 h-4 mt-0.5 rounded focus:ring-green-500/50 bg-white dark:bg-amoled-input border-gray-300 dark:border-amoled-border cursor-pointer text-green-600" style="filter: none !important; accent-color: #16a34a !important;">
-						<span class="text-[11px] text-gray-600 dark:text-zinc-400">اعمال نوع ترنسپورت روی کاربرهای موجود هم <span class="text-gray-400 dark:text-zinc-500">— فقط برای همین بار ذخیره؛ نوع ترنسپورت همه‌ی کاربرها با مقدار بالا جایگزین می‌شه.</span></span>
 					</label>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
@@ -9374,8 +8676,6 @@ let activeRocketBtn = null;
 			const edSizeInput = document.getElementById('input-early-data-size');
 			if (edSizeInput) edSizeInput.value = String(nud.early_data_size);
 			if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(nud.early_data_enabled);
-			const transportTypeSelect = document.getElementById('input-transport-type');
-			if (transportTypeSelect) transportTypeSelect.value = nud.transport_type;
 			const autoResetOn = nud.auto_reset_vol_days > 0 || nud.auto_reset_req_days > 0;
 			const autoResetToggle = document.getElementById('input-auto-reset-toggle');
 			if (autoResetToggle) autoResetToggle.checked = autoResetOn;
@@ -10261,7 +9561,6 @@ let activeRocketBtn = null;
 			const tls_mask = (isAdvancedSettingsOn && document.getElementById('input-tls-mask')) ? document.getElementById('input-tls-mask').value.trim() : "";
 			const early_data_enabled = (document.getElementById('input-early-data-toggle') && document.getElementById('input-early-data-toggle').checked) ? 1 : 0;
 			const early_data_size = Math.min(8192, Math.max(1, parseInt(document.getElementById('input-early-data-size') ? document.getElementById('input-early-data-size').value : '', 10) || 2560));
-			const transport_type = document.getElementById('input-transport-type') ? document.getElementById('input-transport-type').value : 'ws';
 			const isAutoReset = document.getElementById('input-auto-reset-toggle').checked;
 			const auto_reset_vol_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-vol').value) || 0 : 0;
 			const auto_reset_req_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-req').value) || 0 : 0;
@@ -10301,7 +9600,6 @@ let activeRocketBtn = null;
 						username, uuid, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int,
 						advanced_frag: advanced_frag || null, cipher_suites: cipher_suites || null, tls_mask: tls_mask || null,
 						early_data_enabled: early_data_enabled, early_data_size: early_data_size,
-						transport_type: transport_type,
 						user_proxy_iata: null,
 						user_socks5: userSocks5 || null,
 						reset_user_to_default: isEditMode && window.resetUserToDefaultPending === true,
@@ -11224,10 +10522,6 @@ function populateUserFormFields(user) {
 	const edSizeEdit = document.getElementById('input-early-data-size');
 	if (edSizeEdit) edSizeEdit.value = String((edUserSize >= 1 && edUserSize <= 8192) ? edUserSize : 2560);
 	if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(edUserOn);
-	// xhttp.md فاز ۶: مقدار نامعتبر/خالی توی ستون transport_type یعنی 'ws' - همون الگوی connection_type بالا.
-	const userTransportType = ['ws', 'xhttp', 'ws+xhttp'].indexOf(user.transport_type) !== -1 ? user.transport_type : 'ws';
-	const transportTypeEdit = document.getElementById('input-transport-type');
-	if (transportTypeEdit) transportTypeEdit.value = userTransportType;
 	const advFragInput = document.getElementById('input-advanced-frag');
 	if (advFragInput) advFragInput.value = user.advanced_frag || '';
 	const csInput = document.getElementById('input-cipher-suites');
@@ -11721,8 +11015,7 @@ window.NEW_USER_DEFAULTS_FALLBACK = {
 	new_user_start_on_first_connect: '0',
 	new_user_connection_type: 'vless',
 	new_user_early_data_enabled: '0',
-	new_user_early_data_size: '2560',
-	new_user_transport_type: 'ws'
+	new_user_early_data_size: '2560'
 };
 window.NEW_USER_DEFAULTS = Object.assign({}, window.NEW_USER_DEFAULTS_FALLBACK);
 window.NEW_USER_INPUT_IDS = {
@@ -11741,8 +11034,7 @@ window.NEW_USER_INPUT_IDS = {
 	new_user_start_on_first_connect: 'nud-start-on-first-connect',
 	new_user_connection_type: 'nud-connection-type',
 	new_user_early_data_enabled: 'nud-early-data-enabled',
-	new_user_early_data_size: 'nud-early-data-size',
-	new_user_transport_type: 'nud-transport-type'
+	new_user_early_data_size: 'nud-early-data-size'
 };
 window.NEW_USER_EMPTY_OK = { new_user_frag_len: true, new_user_frag_int: true };
 window.fillNewUserDefaultsInputs = function() {
@@ -11755,8 +11047,6 @@ window.fillNewUserDefaultsInputs = function() {
 	// چک‌باکس «اعمال روی کاربرهای موجود» هیچ‌وقت ماندگار نیست: هر بار که فرم پر می‌شود (باز شدن Settings / بعد از ذخیره) خاموش برمی‌گردد.
 	const applyEdEl = document.getElementById('nud-apply-early-data-existing');
 	if (applyEdEl) applyEdEl.checked = false;
-	const applyTtEl = document.getElementById('nud-apply-transport-existing');
-	if (applyTtEl) applyTtEl.checked = false;
 };
 window.loadNewUserDefaultsSetting = async function() {
 	let data = null;
@@ -11821,10 +11111,7 @@ window.getNewUserDefaultsTyped = function() {
 		early_data_enabled: d.new_user_early_data_enabled === '1',
 		early_data_size: (function() { const n = parseInt(d.new_user_early_data_size, 10); return (n >= 1 && n <= 8192) ? n : 2560; })(),
 		connection_type: protocols.join(','),
-		protocols: protocols,
-		// xhttp.md فاز ۶: همون الگوی اعتبارسنجی ed - مقدار نامعتبر/خالی یعنی 'ws'. لیست معتبرها
-		// اینجا دوباره inline نوشته شده چون VALID_TRANSPORT_TYPES سمت Worker است، نه مرورگر.
-		transport_type: (['ws', 'xhttp', 'ws+xhttp'].indexOf(d.new_user_transport_type) !== -1) ? d.new_user_transport_type : 'ws'
+		protocols: protocols
 	};
 };
 window.generateMasterKey = async function() {
@@ -11883,8 +11170,6 @@ window.saveSettings = async function() {
 	const nudSettings = window.collectNewUserDefaultsFromInputs();
 	const applyEarlyDataEl = document.getElementById('nud-apply-early-data-existing');
 	const applyEarlyData = !!(applyEarlyDataEl && applyEarlyDataEl.checked);
-	const applyTransportEl = document.getElementById('nud-apply-transport-existing');
-	const applyTransport = !!(applyTransportEl && applyTransportEl.checked);
 
 	const buttons = [document.getElementById('save-settings-btn'), document.getElementById('save-settings-fab-btn')].filter(Boolean);
 	buttons.forEach(function(b) { b.disabled = true; });
@@ -11903,8 +11188,7 @@ window.saveSettings = async function() {
 					inline_proxy_ip: proxyIpVal,
 					default_port: defaultPortVal
 				}, nudSettings),
-				apply_early_data_to_existing_users: applyEarlyData,
-				apply_transport_to_existing_users: applyTransport
+				apply_early_data_to_existing_users: applyEarlyData
 			})
 		});
 		let saveData = null;
@@ -12459,7 +11743,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '4.0.12';
+const CURRENT_VERSION = '3.32.9';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
