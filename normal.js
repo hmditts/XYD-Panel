@@ -775,24 +775,36 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 // نداره، تنها راه دیدن proxy_vip/*.txt که فقط اونجاست (مثل FR که ادمین دستی اضافه کرد) یک فچ به
 // GitHub Contents API است. طبق تصمیم صریح ادمین (۲۰۲۶-۰۹-۳۰) این محدود به همین دکمه‌ست، نه
 // syncAllVipProxies/دراپ‌داون همیشگی.
-let HEALTHY_VIP_COUNTRIES_CACHE = null; // { codes: string[], checkedCount: number, checkedAt: number }
 const HEALTHY_VIP_CACHE_TTL = 600000; // ۱۰ دقیقه - طبق خواسته‌ی صریح ادمین: کلیک‌های پشت‌سرهم دوباره کل تست connect را تکرار نکنند
+// وقتی کشف کشورهای ریپوی شخصی از GitHub API شکست بخورد (معمولاً ریت‌لیمیت ۶۰ ریکوئست/ساعت روی IP
+// مشترک Cloudflare)، نتیجه فقط ۶۰ ثانیه کش می‌شود - نه ۱۰ دقیقه - تا نتیجه‌ی ناقص مدت طولانی نچسبد.
+const HEALTHY_VIP_DEGRADED_TTL = 60000;
+// لیست پشتیبان برای وقتی GitHub API جواب نمی‌دهد: کشورهایی که فایلشون در proxy_vip ریپوی شخصی هست.
+// فقط «کاندید» است؛ اگه فایلی واقعاً وجود نداشته باشه یا پروکسی زنده نداشته باشه، توی دراپ‌داون نمی‌آید.
+// کشور جدیدی که فقط در ریپوی شخصی گذاشتید و GitHub API هم ریت‌لیمیت است را اینجا اضافه کنید
+// (یا برای رفع ریشه‌ای، Secret با نام GITHUB_TOKEN روی Worker بگذارید).
+const PERSONAL_REPO_FALLBACK_COUNTRIES = ["DE", "FR", "GB", "TH"];
 
-async function fetchPersonalRepoVipCountries() {
+// خروجی: { codes, status } — status: "ok" (لیست واقعاً از GitHub API آمد) یا "fallback" (API ریت‌لیمیت/خطا
+// داد و از PERSONAL_REPO_FALLBACK_COUNTRIES استفاده شد). اگه env.GITHUB_TOKEN تنظیم شده باشه، سقف
+// ریکوئست از ۶۰/ساعت (IP مشترک) به ۵۰۰۰/ساعت می‌رسه.
+async function fetchPersonalRepoVipCountries(githubToken) {
+	const fallback = { codes: [...PERSONAL_REPO_FALLBACK_COUNTRIES], status: "fallback" };
 	try {
-		const res = await fetch("https://api.github.com/repos/hmditts/XYD-Panel/contents/proxy_vip", {
-			headers: { "User-Agent": "ChildPanel-VIP-HealthCheck" },
-		});
-		if (!res.ok) return [];
+		const headers = { "User-Agent": "ChildPanel-VIP-HealthCheck", "Accept": "application/vnd.github+json" };
+		if (githubToken) headers["Authorization"] = `Bearer ${githubToken}`;
+		const res = await fetch("https://api.github.com/repos/hmditts/XYD-Panel/contents/proxy_vip", { headers });
+		if (!res.ok) return fallback;
 		const files = await res.json();
-		if (!Array.isArray(files)) return [];
-		return files
+		if (!Array.isArray(files)) return fallback;
+		const codes = files
 			.map((f) => f && f.name)
 			.filter((name) => typeof name === "string" && name.toLowerCase().endsWith(".txt"))
 			.map((name) => name.slice(0, -4).trim().toUpperCase())
 			.filter((cc) => /^[A-Z]{2}$/.test(cc));
+		return { codes, status: "ok" };
 	} catch (e) {
-		return [];
+		return fallback;
 	}
 }
 
@@ -844,27 +856,37 @@ async function quickCountryHasLiveIp(country) {
 	}
 }
 
-// دسته‌های ۵تایی و متوالی (نه Promise.all روی کل لیست) تا از سقف ۶ اتصال هم‌زمان Cloudflare رد نشویم.
-async function checkCountriesInBatches(countries, batchSize = 5) {
-	const healthy = [];
-	for (let i = 0; i < countries.length; i += batchSize) {
-		const batch = countries.slice(i, i + batchSize);
-		const results = await Promise.all(batch.map((cc) => quickCountryHasLiveIp(cc)));
-		batch.forEach((cc, idx) => { if (results[idx]) healthy.push(cc); });
-	}
-	return healthy;
+// ⚠️ سقف Workers Free = ۵۰ subrequest در هر invocation (و ۶ اتصال هم‌زمان). اگه کل کشورها در یک
+// invocation تست بشن، فقط فچ‌های فایل هر کشور (تا ۵ تا: ۴ میرور + ریپوی شخصی) به‌علاوه‌ی ۲ سوکت تست،
+// خیلی راحت از ۵۰ رد می‌شه. برای همین بررسی به دو مرحله‌ی جدا (دو نوع invocation) تقسیم شده و کلاینت
+// اون‌ها رو پشت‌سرهم صدا می‌زنه:
+//   step=candidates → فقط کشف کاندیدها (vip-list حداکثر ۴ فچ + GitHub API ۱ فچ = حداکثر ۵)
+//   step=check&codes=DE,FR,... → حداکثر HEALTHY_VIP_CHUNK_SIZE کشور؛ بدترین حالت هر کشور ۵ فچ + ۲ سوکت
+//                                = ۷ → برای ۵ کشور حداکثر ۳۵ (حتی اگه سوکت‌ها هم subrequest حساب بشن)
+// یعنی هر invocation مستقل با بودجه‌ی خودش زیر ۵۰ می‌مونه، مستقل از تعداد کل کشورها.
+const HEALTHY_VIP_CHUNK_SIZE = 5;
+const HEALTHY_VIP_COUNTRY_CACHE = new Map(); // cc -> { ok: boolean, at: number } - بهترین‌تلاش (حافظه‌ی isolate)
+
+async function checkVipCountriesChunk(codes, force) {
+	const list = [...new Set((Array.isArray(codes) ? codes : []).map((c) => String(c).trim().toUpperCase()))]
+		.filter((cc) => /^[A-Z]{2}$/.test(cc))
+		.slice(0, HEALTHY_VIP_CHUNK_SIZE); // سقف سخت سمت سرور - حتی اگه کلاینت بیشتر بفرسته
+	const results = await Promise.all(list.map(async (cc) => {
+		const c = HEALTHY_VIP_COUNTRY_CACHE.get(cc);
+		if (!force && c && Date.now() - c.at < HEALTHY_VIP_CACHE_TTL) return c.ok;
+		const ok = await quickCountryHasLiveIp(cc);
+		HEALTHY_VIP_COUNTRY_CACHE.set(cc, { ok, at: Date.now() });
+		return ok;
+	}));
+	return { checked: list, healthy: list.filter((cc, i) => results[i]) };
 }
 
 // کاندیدها: vip-list رسمی (میرور ۱-۳) + فایل‌های proxy_vip ریپوی شخصی (میرور ۴، از GitHub API) +
-// کلیدهای MANUAL_VIP_PROXIES - یکتا. نتیجه‌ی نهایی ۱۰ دقیقه کش می‌شود.
-async function getHealthyVipCountries(force) {
-	const now = Date.now();
-	if (!force && HEALTHY_VIP_COUNTRIES_CACHE && now - HEALTHY_VIP_COUNTRIES_CACHE.checkedAt < HEALTHY_VIP_CACHE_TTL) {
-		return { ...HEALTHY_VIP_COUNTRIES_CACHE, fromCache: true };
-	}
-	const [officialRes, personalCodes] = await Promise.all([
+// کلیدهای MANUAL_VIP_PROXIES - یکتا. هیچ تست اتصالی اینجا انجام نمی‌شه.
+async function getVipHealthCandidates(githubToken) {
+	const [officialRes, personal] = await Promise.all([
 		fetchWithFallback("vip-list").catch(() => null),
-		fetchPersonalRepoVipCountries(),
+		fetchPersonalRepoVipCountries(githubToken),
 	]);
 	let officialCodes = [];
 	if (officialRes && officialRes.ok) {
@@ -878,12 +900,8 @@ async function getHealthyVipCountries(force) {
 		} catch (e) { }
 	}
 	const manualCodes = Object.keys(MANUAL_VIP_PROXIES).map((c) => c.toUpperCase());
-	const candidates = [...new Set([...officialCodes, ...personalCodes, ...manualCodes])];
-	const healthy = await checkCountriesInBatches(candidates, 5);
-	healthy.sort();
-	const result = { codes: healthy, checkedCount: candidates.length, checkedAt: now };
-	HEALTHY_VIP_COUNTRIES_CACHE = result;
-	return { ...result, fromCache: false };
+	const candidates = [...new Set([...officialCodes, ...personal.codes, ...manualCodes])];
+	return { candidates, personalDiscovery: personal.status };
 }
 // ==================== پایان «بررسی کشورهای سالم» ====================
 
@@ -2274,11 +2292,14 @@ const Router = {
 		// (vip-list) + میرور ۴ (ریپوی شخصی، GitHub API) + MANUAL_VIP_PROXIES، تست سبک زنده‌بودن، کش ۱۰ دقیقه‌ای.
 		if (url.pathname === "/api/settings/vip-healthy-countries" && request.method === "GET") {
 			try {
-				const force = url.searchParams.get("force") === "1";
-				const result = await getHealthyVipCountries(force);
-				return new Response(JSON.stringify({ success: true, codes: result.codes, checkedCount: result.checkedCount, checkedAt: result.checkedAt, fromCache: result.fromCache }), {
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
+				const jsonHeaders = { "Content-Type": "application/json; charset=utf-8" };
+				if (url.searchParams.get("step") === "check") {
+					const codes = (url.searchParams.get("codes") || "").split(",");
+					const r = await checkVipCountriesChunk(codes, url.searchParams.get("force") === "1");
+					return new Response(JSON.stringify({ success: true, checked: r.checked, healthy: r.healthy }), { headers: jsonHeaders });
+				}
+				const r = await getVipHealthCandidates(env.GITHUB_TOKEN);
+				return new Response(JSON.stringify({ success: true, candidates: r.candidates, personalDiscovery: r.personalDiscovery, chunkSize: HEALTHY_VIP_CHUNK_SIZE }), { headers: jsonHeaders });
 			} catch (e) {
 				return new Response(JSON.stringify({ error: e.message || "خطا در بررسی کشورهای سالم" }), {
 					status: 502,
@@ -11181,19 +11202,58 @@ window.populatePinnedLocationSelects = async function(force) {
 // تست زنده بودن می‌ریزد تو دراپ‌داون)، این فقط کشورهایی را می‌گذارد که سرور واقعاً حداقل ۱ آی‌پی
 // زنده برایشان پیدا کرده - چه در میرور ۱ (رسمی) چه فقط در میرور ۴ (ریپوی شخصی). چند ثانیه طول
 // می‌کشد چون سرور دارد واقعاً کانکشن باز می‌کند؛ نتیجه ۱۰ دقیقه سمت سرور کش می‌شود.
+window.HEALTHY_VIP_CLIENT_CACHE = null; // { codes, checkedCount, checkedAt, personalDiscovery }
 window.checkHealthyVipCountries = async function() {
 	const btn = document.getElementById('check-healthy-countries-btn');
 	const select = document.getElementById('pinned-location-add-select');
-	if (btn) { btn.disabled = true; btn.innerText = '⏳ در حال بررسی... (چند ثانیه)'; }
+	const TTL_OK = 600000;      // ۱۰ دقیقه
+	const TTL_DEGRADED = 60000; // وقتی کشف ریپوی شخصی با GitHub API شکست خورده و لیست پشتیبان استفاده شده
+	const pause = function(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); };
+	if (btn) { btn.disabled = true; btn.innerText = '⏳ در حال بررسی...'; }
 	if (select) {
 		select.setAttribute('data-vip-state', 'loading');
 		select.innerHTML = '<option value="">در حال بررسی کشورهای سالم...</option>';
 	}
 	try {
-		const res = await fetch('/api/settings/vip-healthy-countries');
-		const data = await res.json();
-		if (!res.ok || !data.success) throw new Error((data && data.error) || 'خطا در بررسی کشورهای سالم');
-		const codes = Array.isArray(data.codes) ? data.codes : [];
+		let result = window.HEALTHY_VIP_CLIENT_CACHE;
+		let fromCache = false;
+		if (result && (Date.now() - result.checkedAt) < (result.personalDiscovery === 'fallback' ? TTL_DEGRADED : TTL_OK)) {
+			fromCache = true;
+		} else {
+			// مرحله ۱: فقط کشف کاندیدها (بدون تست اتصال)
+			const candRes = await fetch('/api/settings/vip-healthy-countries?step=candidates');
+			const cand = await candRes.json();
+			if (!candRes.ok || !cand.success) throw new Error((cand && cand.error) || 'خطا در کشف کشورها');
+			const candidates = Array.isArray(cand.candidates) ? cand.candidates : [];
+			const chunkSize = Math.max(1, Math.min(5, cand.chunkSize || 5));
+			const healthy = [];
+			let unchecked = 0;
+			let done = 0;
+			// مرحله ۲: هر بار حداکثر ۵ کشور در یک ریکوئست جدا (هر ریکوئست بودجه‌ی ۵۰ subrequest خودش را دارد)
+			for (let i = 0; i < candidates.length; i += chunkSize) {
+				const chunk = candidates.slice(i, i + chunkSize);
+				if (btn) btn.innerText = '⏳ ' + done + ' از ' + candidates.length + '...';
+				let ok = false;
+				for (let attempt = 0; attempt < 2 && !ok; attempt++) {
+					try {
+						const chunkRes = await fetch('/api/settings/vip-healthy-countries?step=check&codes=' + encodeURIComponent(chunk.join(',')));
+						const chunkData = await chunkRes.json();
+						if (chunkRes.ok && chunkData.success) {
+							(chunkData.healthy || []).forEach(function(cc) { healthy.push(cc); });
+							ok = true;
+						}
+					} catch (err) { }
+					if (!ok && attempt === 0) await pause(1000);
+				}
+				if (!ok) unchecked += chunk.length;
+				done += chunk.length;
+				if (i + chunkSize < candidates.length) await pause(300);
+			}
+			healthy.sort();
+			result = { codes: healthy, checkedCount: candidates.length, checkedAt: Date.now(), personalDiscovery: cand.personalDiscovery, unchecked: unchecked };
+			if (unchecked === 0) window.HEALTHY_VIP_CLIENT_CACHE = result; // نتیجه‌ی ناقص کش نمی‌شود
+		}
+		const codes = result.codes;
 		window.VIP_COUNTRY_CODES = codes; // از این به بعد دراپ‌داون فقط همین کشورهای سالم را نشان می‌دهد
 		if (select) {
 			select.innerHTML = '';
@@ -11212,7 +11272,9 @@ window.checkHealthyVipCountries = async function() {
 				});
 			}
 		}
-		showToast('✅ از ' + data.checkedCount + ' کشور بررسی‌شده، ' + codes.length + ' تا حداقل ۱ آی‌پی زنده داشتن' + (data.fromCache ? ' (نتیجه‌ی کش‌شده‌ی ۱۰ دقیقه‌ی اخیر)' : '') + '.');
+		showToast('✅ از ' + result.checkedCount + ' کشور بررسی‌شده، ' + codes.length + ' تا حداقل ۱ آی‌پی زنده داشتن' + (fromCache ? ' (نتیجه‌ی کش‌شده‌ی اخیر)' : '') + '.');
+		if (result.unchecked > 0) showToast('⚠️ ' + result.unchecked + ' کشور به‌خاطر خطای شبکه بررسی نشد؛ دوباره دکمه را بزنید.');
+		if (result.personalDiscovery === 'fallback') showToast('⚠️ GitHub API جواب نداد (احتمالاً ریت‌لیمیت)؛ برای ریپوی شخصی از لیست پشتیبان استفاده شد - ممکنه کشور جدیدی که فقط اونجاست دیده نشه.');
 		if (typeof window.renderPinnedLocationsList === 'function') window.renderPinnedLocationsList();
 	} catch (e) {
 		showToast('❌ بررسی کشورهای سالم ناموفق بود.');
@@ -12022,7 +12084,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '3.20.0';
+const CURRENT_VERSION = '3.10.2';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
