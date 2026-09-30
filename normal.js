@@ -168,7 +168,7 @@ async function syncAllVipProxies() {
 	return { countries, perCountry, totalCountries: countries.length, totalProxies, fetchedAt: now };
 }
 // Both update endpoints (/api/update-panel, /api/update-panel-github) upload the fetched file to
-// Cloudflare unchanged, as an ES module (main_module: "ZYX.js"). The plain decoded source (vX_Y.js)
+// Cloudflare unchanged, as an ES module (main_module: "zeus.js"). The plain decoded source (vX_Y.js)
 // is only a function BODY that ends with a top-level "return" of the worker object - it is not a
 // module (no default export, and a top-level return is illegal in a module), so Cloudflare refuses it.
 // Only the obfuscated stub (import ... + default export) or a real module can be deployed this way.
@@ -185,7 +185,7 @@ async function checkAutoResets(env, ctx) {
 	if (now - localLastAutoResetCheck < 3600000) return;
 	try {
 		const cache = caches.default;
-		const cacheReq = new Request("https://internal.ZYX/auto_reset");
+		const cacheReq = new Request("https://internal.zeus/auto_reset");
 		if (await cache.match(cacheReq)) return;
 		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_auto_reset_check'").first();
 		const dbLastCheck = row ? parseInt(row.value) || 0 : 0;
@@ -237,7 +237,7 @@ const GLOBAL_REQ_LIMIT_CACHE_TTL_SECONDS = 60;
 // لازمه: نزدیکی به سقف، جایی که دقت بیشتر اهمیت داره.
 const GLOBAL_REQ_LIMIT_CF_CHECK_THRESHOLD_RATIO = 0.9;
 function globalReqLimitCacheRequest() {
-	return new Request("https://internal.ZYX/global_req_limit_status");
+	return new Request("https://internal.zeus/global_req_limit_status");
 }
 async function isGlobalReqLimitReached(env, ctx) {
 	try {
@@ -339,7 +339,7 @@ function recordDailyTraffic(env, ctx, deltaGb) {
 // writes would erase most of the D1-read savings for close to no real benefit.
 const USER_AUTH_CACHE_TTL_SECONDS = 10;
 function userAuthCacheRequest(kind, key) {
-	return new Request(`https://internal.ZYX/user_auth/${kind}/${encodeURIComponent(String(key))}`);
+	return new Request(`https://internal.zeus/user_auth/${kind}/${encodeURIComponent(String(key))}`);
 }
 async function getCachedAuthUser(kind, key) {
 	if (!key) return undefined;
@@ -532,6 +532,10 @@ const NEW_USER_DEFAULTS_FALLBACK = {
 	new_user_auto_rotate_ip: "0",
 	new_user_start_on_first_connect: "0",
 	new_user_connection_type: "vless",
+	// Early Data (ed=): پیش‌فرض خاموش. new_user_early_data_size بایت early data است (مقدار
+	// پیشنهادی 2560، حداکثر 8192 طبق مستندات xray/sing-box WS early data).
+	new_user_early_data_enabled: "0",
+	new_user_early_data_size: "2560",
 };
 // فقط این دو کلید مجازند خالی ذخیره شوند (خالی = فرگمنت خاموش)؛ برای بقیه، مقدار
 // خالی/نامعتبر یعنی «از NEW_USER_DEFAULTS_FALLBACK استفاده کن».
@@ -540,6 +544,28 @@ const NEW_USER_TLS_PORTS = ["443", "2053", "2083", "2087", "2096", "8443"];
 // Same list as the Fingerprint <select> of the panel (fingerprint-select / nud-fingerprint) — the only
 // values POST /api/settings/bulk accepts when it is asked to write a fingerprint onto existing users.
 const NEW_USER_FINGERPRINTS = ["chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized", "unsafe"];
+// Early Data (ed=): سقف مجاز سایز (بایت) برای new_user_early_data_size وقتی POST /api/settings/bulk قراره اون رو روی
+// کاربرهای *موجود* بنویسه؛ همون ۸۱۹۲ که توی مستندات xray/sing-box برای WS early data حداکثره.
+const EARLY_DATA_MAX_SIZE = 8192;
+// Early Data (ed=): سازنده‌های مشترک برای SubscriptionService.generateText (?ed= روی path) و generateSingbox
+// (فیلدهای transport). دو کپی کلاینت‌ساید (getvIeesLink پنل و صفحه‌ی Status) همین قاعده را دارند (بند ۱-۲ خلاصه).
+// خاموش/نبودن فیلد = خروجی دقیقاً مثل قبل؛ سایز نامعتبر (خارج از 1..EARLY_DATA_MAX_SIZE) = 2560.
+function getUserEarlyDataSize(user) {
+	if (!user || Number(user.early_data_enabled) !== 1) return 0;
+	const n = parseInt(user.early_data_size, 10);
+	return n >= 1 && n <= EARLY_DATA_MAX_SIZE ? n : 2560;
+}
+function buildEarlyDataPathSuffix(user) {
+	const size = getUserEarlyDataSize(user);
+	return size ? "?ed=" + size : "";
+}
+function applySingboxEarlyData(transport, user) {
+	const size = getUserEarlyDataSize(user);
+	if (size && transport) {
+		transport.max_early_data = size;
+		transport.early_data_header_name = "Sec-WebSocket-Protocol";
+	}
+}
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
 // runs automatically for every user right after the admin saves the pinned
@@ -785,7 +811,7 @@ async function mergePinnedLocationsForUser(existingProxyList, pinnedLocations) {
 // modal is saved. The modal only keeps the bare proxy string of each slot (populateUserFormFields
 // drops the `country` tag) and posts user_socks5 back as a plain string / array of strings, so
 // without this every "save" - whatever field was changed - wiped every country tag, and
-// getSelectedUserProxy() (which matches /ZYX/<country-code> against slot.country) then found
+// getSelectedUserProxy() (which matches /XYZ/<country-code> against slot.country) then found
 // nothing and the config silently fell back to a direct/Cloudflare connection.
 // Every incoming string that is identical to a tagged slot already stored for this user gets that
 // slot's country back (each stored slot is consumed once, so duplicated proxy strings can't steal
@@ -1212,18 +1238,18 @@ const __WORKER_EXPORT__ = {
 };
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
-    <radialGradient id="ZYXBg" cx="50%" cy="50%" r="50%">
+    <radialGradient id="zeusBg" cx="50%" cy="50%" r="50%">
       <stop offset="0%" stop-color="#0e2348"/>
       <stop offset="100%" stop-color="#020617"/>
     </radialGradient>
-    <filter id="ZYXGlow" x="-20%" y="-20%" width="140%" height="140%">
+    <filter id="zeusGlow" x="-20%" y="-20%" width="140%" height="140%">
       <feDropShadow dx="0" dy="0" stdDeviation="16" flood-color="#3b82f6" flood-opacity="0.6"/>
     </filter>
   </defs>
   <rect width="512" height="512" rx="128" fill="#000000"/>
-  <rect x="48" y="48" width="416" height="416" rx="96" fill="url(#ZYXBg)" stroke="#3b82f6" stroke-width="16" filter="url(#ZYXGlow)"/>
+  <rect x="48" y="48" width="416" height="416" rx="96" fill="url(#zeusBg)" stroke="#3b82f6" stroke-width="16" filter="url(#zeusGlow)"/>
   <rect x="56" y="56" width="400" height="400" rx="88" fill="none" stroke="#60a5fa" stroke-width="4" stroke-opacity="0.4"/>
-  <g transform="translate(128, 128) scale(10.666)" filter="url(#ZYXGlow)">
+  <g transform="translate(128, 128) scale(10.666)" filter="url(#zeusGlow)">
     <path d="M13 10V3L4 14h7v7l9-11h-7z" fill="#38bdf8" fill-opacity="0.3" stroke="#60a5fa" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
   </g>
 </svg>`;
@@ -1247,7 +1273,7 @@ const PWA_MANIFEST = JSON.stringify({
 			purpose: "any maskable"
 		},
 		{
-			src: "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20512%20512%22%20width%3D%22512%22%20height%3D%22512%22%3E%0A%20%20%3Cdefs%3E%0A%20%20%20%20%3CradialGradient%20id%3D%22ZYXBg%22%20cx%3D%2250%25%22%20cy%3D%2250%25%22%20r%3D%2250%25%22%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%230e2348%22%2F%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%23020617%22%2F%3E%0A%20%20%20%20%3C%2FradialGradient%3E%0A%20%20%20%20%3Cfilter%20id%3D%22ZYXGlow%22%20x%3D%22-20%25%22%20y%3D%22-20%25%22%20width%3D%22140%25%22%20height%3D%22140%25%22%3E%0A%20%20%20%20%20%20%3CfeDropShadow%20dx%3D%220%22%20dy%3D%220%22%20stdDeviation%3D%2216%22%20flood-color%3D%22%233b82f6%22%20flood-opacity%3D%220.6%22%2F%3E%0A%20%20%20%20%3C%2Ffilter%3E%0A%20%20%3C%2Fdefs%3E%0A%20%20%3Crect%20width%3D%22512%22%20height%3D%22512%22%20rx%3D%22128%22%20fill%3D%22%23000000%22%2F%3E%0A%20%20%3Crect%20x%3D%2248%22%20y%3D%2248%22%20width%3D%22416%22%20height%3D%22416%22%20rx%3D%2296%22%20fill%3D%22url(%23ZYXBg)%22%20stroke%3D%22%233b82f6%22%20stroke-width%3D%2216%22%20filter%3D%22url(%23ZYXGlow)%22%2F%3E%0A%20%20%3Crect%20x%3D%2256%22%20y%3D%2256%22%20width%3D%22400%22%20height%3D%22400%22%20rx%3D%2288%22%20fill%3D%22none%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%224%22%20stroke-opacity%3D%220.4%22%2F%3E%0A%20%20%3Cg%20transform%3D%22translate(128%2C%20128)%20scale(10.666)%22%20filter%3D%22url(%23ZYXGlow)%22%3E%0A%20%20%20%20%3Cpath%20d%3D%22M13%2010V3L4%2014h7v7l9-11h-7z%22%20fill%3D%22%2338bdf8%22%20fill-opacity%3D%220.3%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%221.6%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%20%20%3C%2Fg%3E%0A%3C%2Fsvg%3E",
+			src: "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20512%20512%22%20width%3D%22512%22%20height%3D%22512%22%3E%0A%20%20%3Cdefs%3E%0A%20%20%20%20%3CradialGradient%20id%3D%22zeusBg%22%20cx%3D%2250%25%22%20cy%3D%2250%25%22%20r%3D%2250%25%22%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%230e2348%22%2F%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%23020617%22%2F%3E%0A%20%20%20%20%3C%2FradialGradient%3E%0A%20%20%20%20%3Cfilter%20id%3D%22zeusGlow%22%20x%3D%22-20%25%22%20y%3D%22-20%25%22%20width%3D%22140%25%22%20height%3D%22140%25%22%3E%0A%20%20%20%20%20%20%3CfeDropShadow%20dx%3D%220%22%20dy%3D%220%22%20stdDeviation%3D%2216%22%20flood-color%3D%22%233b82f6%22%20flood-opacity%3D%220.6%22%2F%3E%0A%20%20%20%20%3C%2Ffilter%3E%0A%20%20%3C%2Fdefs%3E%0A%20%20%3Crect%20width%3D%22512%22%20height%3D%22512%22%20rx%3D%22128%22%20fill%3D%22%23000000%22%2F%3E%0A%20%20%3Crect%20x%3D%2248%22%20y%3D%2248%22%20width%3D%22416%22%20height%3D%22416%22%20rx%3D%2296%22%20fill%3D%22url(%23zeusBg)%22%20stroke%3D%22%233b82f6%22%20stroke-width%3D%2216%22%20filter%3D%22url(%23zeusGlow)%22%2F%3E%0A%20%20%3Crect%20x%3D%2256%22%20y%3D%2256%22%20width%3D%22400%22%20height%3D%22400%22%20rx%3D%2288%22%20fill%3D%22none%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%224%22%20stroke-opacity%3D%220.4%22%2F%3E%0A%20%20%3Cg%20transform%3D%22translate(128%2C%20128)%20scale(10.666)%22%20filter%3D%22url(%23zeusGlow)%22%3E%0A%20%20%20%20%3Cpath%20d%3D%22M13%2010V3L4%2014h7v7l9-11h-7z%22%20fill%3D%22%2338bdf8%22%20fill-opacity%3D%220.3%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%221.6%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%20%20%3C%2Fg%3E%0A%3C%2Fsvg%3E",
 			sizes: "192x192 512x512",
 			type: "image/svg+xml",
 			purpose: "any maskable"
@@ -1256,7 +1282,7 @@ const PWA_MANIFEST = JSON.stringify({
 	categories: ["utilities", "productivity"]
 });
 const PWA_SERVICE_WORKER = `
-const CACHE_NAME = "ZYX-pwa-cache-v1";
+const CACHE_NAME = "zeus-pwa-cache-v1";
 const STATIC_ASSETS = [
 	"https://cdn.tailwindcss.com",
 	"https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js",
@@ -1406,6 +1432,8 @@ const Router = {
 				start_on_first_connect: user.start_on_first_connect,
 				first_connection_time: user.first_connection_time,
 				enable_direct: user.enable_direct !== 0 ? 1 : 0,
+				early_data_enabled: Number(user.early_data_enabled) === 1 ? 1 : 0,
+				early_data_size: user.early_data_size,
 			});
 			const html = HTML_TEMPLATES.status.replace("/* {{USER_DATA_PLACEHOLDER}} */", `window.statusUser = ${userJson}; window.INLINE_PROXY_IP = ${JSON.stringify(inlineProxyIpForStatusPage)}; window.OTHER_CLEAN_IPS = ${JSON.stringify(otherCleanIpsForStatusPage)};`);
 			const finalHtml = html + "\n<!-- HIDDEN_CONFIGS -->\n<div style='display:none; white-space:pre-wrap;'>\n" + plainLinks + "\n</div>";
@@ -1643,7 +1671,7 @@ const Router = {
 			try {
 				const cfHeaders = {
 					Authorization: "Bearer " + currentToken,
-					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZYXPanel/1.0",
+					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZeusPanel/1.0",
 				};
 				if (!currentAccountId) {
 					const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: cfHeaders });
@@ -1688,14 +1716,14 @@ const Router = {
 				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
 				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
 				const metadata = {
-					main_module: "ZYX.js",
+					main_module: "zeus.js",
 					compatibility_date: "2026-07-10",
 					compatibility_flags: ["nodejs_compat"],
 					bindings: newBindings,
 				};
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
-				formData.append("ZYX.js", new Blob([newCode], { type: "application/javascript+module" }), "ZYX.js");
+				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
 				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
 					method: "PUT",
 					headers: cfHeaders,
@@ -1728,7 +1756,7 @@ const Router = {
 			try {
 				const cfHeaders = {
 					Authorization: "Bearer " + currentToken,
-					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZYXPanel/1.0",
+					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZeusPanel/1.0",
 				};
 				if (!currentAccountId) {
 					const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: cfHeaders });
@@ -1775,14 +1803,14 @@ const Router = {
 				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
 				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
 				const metadata = {
-					main_module: "ZYX.js",
+					main_module: "zeus.js",
 					compatibility_date: "2026-07-10",
 					compatibility_flags: ["nodejs_compat"],
 					bindings: newBindings,
 				};
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
-				formData.append("ZYX.js", new Blob([newCode], { type: "application/javascript+module" }), "ZYX.js");
+				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
 				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
 					method: "PUT",
 					headers: cfHeaders,
@@ -1862,6 +1890,7 @@ const Router = {
 				const body = await readJsonBody(request);
 				let unpinRemoval = { countries: [], usersUpdated: 0 };
 				let fragApplied = false;
+				let earlyDataApplied = false;
 				let userLimitApplied = false;
 				let fingerprintApplied = false;
 				let connTypeApplied = false;
@@ -1946,6 +1975,28 @@ const Router = {
 						const ctFinal = ["vless", "trojan"].filter((x) => ctParts.includes(x));
 						if (ctFinal.length > 0) overrideConnType = ctFinal.join(",");
 					}
+					// «Early Data» (new_user_early_data_enabled / new_user_early_data_size): مثل فرگمنت،
+					// این دو کلید هم فقط پیش‌فرضِ کاربر *تازه‌ساز*ند؛ لینک‌ها از ستون‌های
+					// early_data_enabled/early_data_size خودِ هر کاربر ساخته می‌شوند، نه از settings. فقط وقتی
+					// فراخواننده صریحاً apply_early_data_to_existing_users: true بفرستد (فلگ بیرون از
+					// body.settings، مثل apply_frag_to_existing_users) هر دو مقدار روی ستون‌های همه‌ی کاربرهای
+					// *موجود* هم نوشته می‌شود. «ذخیره‌ی تنظیمات» همین پنل این فلگ را فقط وقتی می‌فرستد که
+					// چک‌باکس «اعمال روی کاربرهای موجود» تیک خورده باشد. هر دو کلید باید در درخواست باشند؛
+					// enabled فقط "0"/"1" و size فقط عدد صحیح 1..EARLY_DATA_MAX_SIZE؛ مقدار نامعتبر = نادیده
+					// گرفته می‌شود (و چون early_data_applied برنمی‌گردد، فراخواننده آن را به‌عنوان خطا می‌بیند).
+					let overrideEarlyData = undefined;
+					if (
+						body.apply_early_data_to_existing_users === true &&
+						Object.prototype.hasOwnProperty.call(body.settings, "new_user_early_data_enabled") &&
+						Object.prototype.hasOwnProperty.call(body.settings, "new_user_early_data_size")
+					) {
+						const edEnabledRaw = String(body.settings.new_user_early_data_enabled == null ? "" : body.settings.new_user_early_data_enabled).trim();
+						const edSizeRaw = String(body.settings.new_user_early_data_size == null ? "" : body.settings.new_user_early_data_size).trim();
+						const edSize = /^[0-9]+$/.test(edSizeRaw) ? parseInt(edSizeRaw, 10) : NaN;
+						if ((edEnabledRaw === "0" || edEnabledRaw === "1") && edSize >= 1 && edSize <= EARLY_DATA_MAX_SIZE) {
+							overrideEarlyData = { enabled: edEnabledRaw === "1" ? 1 : 0, size: edSize };
+						}
+					}
 					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
 					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
 					// «لیست لوکیشن‌های پین‌شده»: اگه این کلید توی همین درخواست هست، لیست قبلی رو
@@ -1992,6 +2043,10 @@ const Router = {
 						await env.DB.prepare("UPDATE users SET frag_len = ?, frag_int = ?").bind(overrideFrag.len, overrideFrag.int).run();
 						fragApplied = true;
 					}
+					if (overrideEarlyData !== undefined) {
+						await env.DB.prepare("UPDATE users SET early_data_enabled = ?, early_data_size = ?").bind(overrideEarlyData.enabled, overrideEarlyData.size).run();
+						earlyDataApplied = true;
+					}
 					if (overrideFingerprint !== undefined) {
 						await env.DB.prepare("UPDATE users SET fingerprint = ?").bind(overrideFingerprint).run();
 						fingerprintApplied = true;
@@ -2008,7 +2063,7 @@ const Router = {
 						} catch (e) { /* best-effort: the cache expires by itself within seconds */ }
 					}
 				}
-				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, early_data_applied: earlyDataApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/settings/sync-vip-proxies") {
@@ -2284,7 +2339,7 @@ const Router = {
 						if (resetUser) await invalidateUserAuthCache(ctx, resetUser.uuid, resetUser.trojan_hash);
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} else {
-						const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols } = body;
+						const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = body;
 						if (new_username && new_username !== username) {
 							if (!/^[a-zA-Z0-9_-]+$/.test(new_username)) {
 								return new Response(JSON.stringify({ error: "نام کاربری جدید غیرمجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
@@ -2365,6 +2420,16 @@ const Router = {
 							}
 							return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
 						}
+						// Early Data: فقط اگر بدنه هرکدام را فرستاده باشد نوشته می‌شود (فرستنده‌ی قدیمی مثل بک‌آپ/پنل مادر
+						// قدیمی مقدار فعلی کاربر را دست‌نخورده می‌گذارد)؛ سایز نامعتبر نادیده گرفته می‌شود.
+						try {
+							const edEnabledPut = early_data_enabled !== undefined && early_data_enabled !== null ? (early_data_enabled && early_data_enabled !== "0" && early_data_enabled !== "false" ? 1 : 0) : null;
+							const edSizePutRaw = early_data_size !== undefined && early_data_size !== null ? parseInt(early_data_size, 10) : NaN;
+							const edSizePut = edSizePutRaw >= 1 && edSizePutRaw <= EARLY_DATA_MAX_SIZE ? edSizePutRaw : null;
+							if (edEnabledPut !== null || edSizePut !== null) {
+								await env.DB.prepare("UPDATE users SET early_data_enabled = COALESCE(?, early_data_enabled), early_data_size = COALESCE(?, early_data_size) WHERE username = ?").bind(edEnabledPut, edSizePut, new_username || username).run();
+							}
+						} catch (e) { }
 						if (resetProxyToDefault) {
 							// fresh list => old per-country auto-heal cooldowns no longer apply. The auto-reset timers
 							// are restarted from today exactly like POST /api/users does for a new user: last_reset_*_time
@@ -2535,7 +2600,7 @@ const Router = {
 					}
 				}
 				if (request.method === "POST") {
-					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols } = await readJsonBody(request);
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = await readJsonBody(request);
 					if (!username) {
 						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
 					}
@@ -2600,6 +2665,10 @@ const Router = {
 						const intOf = (v, dfltStr) => (given(v) ? parseInt(v) || 0 : parseInt(dfltStr) || 0);
 						const finalFingerprint = fingerprint || nud.new_user_fingerprint;
 						const finalIps = ips !== undefined ? ips : nud.global_clean_ip;
+						// Early Data: مقدار صریح برنده است؛ نیامده = پیش‌فرض Settings (new_user_early_data_*)؛ سایز نامعتبر = 2560.
+						const finalEarlyDataEnabled = flagOf(early_data_enabled, nud.new_user_early_data_enabled);
+						const edSizeParsed = parseInt(given(early_data_size) ? early_data_size : nud.new_user_early_data_size, 10);
+						const finalEarlyDataSize = edSizeParsed >= 1 && edSizeParsed <= EARLY_DATA_MAX_SIZE ? edSizeParsed : 2560;
 						const finalTls = given(tls) && String(tls).trim() !== "" ? tls : String(finalPort).split(",").some((p) => NEW_USER_TLS_PORTS.includes(p.trim())) ? "on" : "off";
 						if (!(protocols && Array.isArray(protocols) && protocols.length > 0) && !connection_type) finalConnType = nud.new_user_connection_type;
 						// Every new user is always pinned to whatever the current
@@ -2610,8 +2679,8 @@ const Router = {
 						// the background right after insert (see ctx.waitUntil below) so
 						// this request doesn't have to wait on a full round of live
 						// proxy testing.
-						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct))
+						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, early_data_enabled, early_data_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct), finalEarlyDataEnabled, finalEarlyDataSize)
 							.run();
 						// Clears any stale negative-cache ("no such user") entry that might exist for
 						// this uuid/hash from an earlier probe or connection attempt with this UUID.
@@ -2734,6 +2803,10 @@ const DbService = {
 					{ name: "device_warning_at", def: "INTEGER DEFAULT NULL" },
 					{ name: "device_warning_peak_count", def: "INTEGER DEFAULT NULL" },
 					{ name: "device_warning_streak", def: "INTEGER DEFAULT 0" },
+					// Early Data: ستون‌های خام کاربر؛ با DEFAULT ساخته می‌شن تا کاربرهای موجود هم
+					// early_data_enabled=0 داشته باشن (نه NULL) و user.early_data_enabled بدون fallback جدا کار کنه.
+					{ name: "early_data_enabled", def: "INTEGER DEFAULT 0" },
+					{ name: "early_data_size", def: "INTEGER DEFAULT 2560" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
@@ -3189,7 +3262,7 @@ const SubscriptionService = {
 			let rem = user.limit_req - liveUsedReq;
 			remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
 		}
-		const rawPath = "/ZYX";
+		const rawPath = "/XYZ";
 		const subIpSettings = await getSubscriptionIpSettings(env);
 		const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
 		let proxyList = [];
@@ -3277,19 +3350,15 @@ const SubscriptionService = {
 					flagEmoji = String.fromCodePoint(...codePoints);
 				} catch (e) { }
 			}
-			const currentDynPath = encodeURIComponent(rawPath + (proxyItem !== null && proxyItem !== "" ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment));
+			const currentDynPath = encodeURIComponent(rawPath + (proxyItem !== null && proxyItem !== "" ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment) + buildEarlyDataPathSuffix(user));
 			resolvedProxies.push({ flagEmoji, currentDynPath });
 		}
 		const connType = String(user.connection_type || "vless").toLowerCase();
 		const enableVless = connType.includes("vless") || connType === "vl" + "e" + "ss" || (!connType.includes("trojan"));
 		const enableTrojan = connType.includes("trojan");
-		let protoCycleIdx = 0;
 		ips.forEach((ip) => {
 			ports.forEach((portStr) => {
 				resolvedProxies.forEach((proxy) => {
-					protoCycleIdx++;
-					const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-					const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 					const isTlsPort = TLS_PORTS.has(portStr);
 					const tlsVal = isTlsPort ? "tls" : "none";
 					let userFrag = "";
@@ -3300,11 +3369,11 @@ const SubscriptionService = {
 						
 					const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 
-					if (useVless) {
+					if (enableVless) {
 						const remark = proxy.flagEmoji;
 						links.push("vl" + "e" + "ss://" + user.uuid + "@" + ip + ":" + portStr + "?path=" + proxy.currentDynPath + "&security=" + tlsVal + "&encryption=none&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
 					}
-					if (useTrojan) {
+					if (enableTrojan) {
 						const trojanRemark = proxy.flagEmoji;
 						links.push("trojan://" + user.uuid + "@" + ip + ":" + portStr + "?path=" + proxy.currentDynPath + "&security=" + tlsVal + "&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(trojanRemark));
 					}
@@ -3322,16 +3391,13 @@ const SubscriptionService = {
 			if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
 			if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
 			const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
-			const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment);
+			const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + buildEarlyDataPathSuffix(user));
 			otherCleanIps.forEach((otherIp, otherIdx) => {
-				protoCycleIdx++;
-				const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-				const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 				const remark = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
-				if (useVless) {
+				if (enableVless) {
 					links.push("vl" + "e" + "ss://" + user.uuid + "@" + otherIp + ":" + otherPortStr + "?path=" + otherDynPath + "&security=" + tlsVal + "&encryption=none&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
 				}
-				if (useTrojan) {
+				if (enableTrojan) {
 					links.push("trojan://" + user.uuid + "@" + otherIp + ":" + otherPortStr + "?path=" + otherDynPath + "&security=" + tlsVal + "&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
 				}
 			});
@@ -3376,7 +3442,7 @@ const SubscriptionService = {
 		}
 		const ports = String(user.port || "443").split(",").map((p) => p.trim()).filter((p) => p.length > 0);
 		const fp = user.fingerprint || "chrome";
-		const rawPath = "/ZYX";
+		const rawPath = "/XYZ";
 		const subIpSettings = await getSubscriptionIpSettings(env);
 		const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
 
@@ -3408,23 +3474,19 @@ const SubscriptionService = {
 		const enableTrojan = connType.includes("trojan");
 
 		let locIdx = 0;
-		let protoCycleIdx = 0;
 		for (let proxyItem of proxyList) {
 			const countryCode = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.country : "";
 			const currentDynPath = rawPath + (proxyItem !== null && proxyItem !== "" ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment);
 			ips.forEach((ip) => {
 				ports.forEach((portStr) => {
-					protoCycleIdx++;
-					const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-					const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 					const isTlsPort = TLS_PORTS.has(portStr);
 					const sni = user.tls_mask || host;
 					const safeFp = (fp === "unsafe") ? "chrome" : fp;
 					
-					if (useVless) {
+					if (enableVless) {
 						let outbound = {
 							type: "vless",
-							tag: `ZYX-VLESS-${ip}-${portStr}-loc${locIdx}`,
+							tag: `ZEUS-VLESS-${ip}-${portStr}-loc${locIdx}`,
 							server: ip,
 							server_port: parseInt(portStr),
 							uuid: user.uuid,
@@ -3444,12 +3506,13 @@ const SubscriptionService = {
 								utls: { enabled: true, fingerprint: safeFp }
 							};
 						}
+						applySingboxEarlyData(outbound.transport, user);
 						outbounds.push(outbound);
 					}
-					if (useTrojan) {
+					if (enableTrojan) {
 						let outbound = {
 							type: "trojan",
-							tag: `ZYX-Trojan-${ip}-${portStr}-loc${locIdx}`,
+							tag: `ZEUS-Trojan-${ip}-${portStr}-loc${locIdx}`,
 							server: ip,
 							server_port: parseInt(portStr),
 							password: user.uuid,
@@ -3468,6 +3531,7 @@ const SubscriptionService = {
 								utls: { enabled: true, fingerprint: safeFp }
 							};
 						}
+						applySingboxEarlyData(outbound.transport, user);
 						outbounds.push(outbound);
 					}
 				});
@@ -3483,11 +3547,8 @@ const SubscriptionService = {
 			const safeFp = (fp === "unsafe") ? "chrome" : fp;
 			const otherDynPath = rawPath + inlineProxySegment;
 			otherCleanIps.forEach((otherIp, otherIdx) => {
-				protoCycleIdx++;
-				const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-				const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 				const flagTag = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
-				if (useVless) {
+				if (enableVless) {
 					let outbound = {
 						type: "vless",
 						tag: flagTag + (enableTrojan ? " (VLESS)" : ""),
@@ -3500,9 +3561,10 @@ const SubscriptionService = {
 					if (isTlsPort) {
 						outbound.tls = { enabled: true, server_name: sni, insecure: false, utls: { enabled: true, fingerprint: safeFp } };
 					}
+					applySingboxEarlyData(outbound.transport, user);
 					outbounds.push(outbound);
 				}
-				if (useTrojan) {
+				if (enableTrojan) {
 					let outbound = {
 						type: "trojan",
 						tag: flagTag + (enableVless ? " (Trojan)" : ""),
@@ -3514,6 +3576,7 @@ const SubscriptionService = {
 					if (isTlsPort) {
 						outbound.tls = { enabled: true, server_name: sni, insecure: false, utls: { enabled: true, fingerprint: safeFp } };
 					}
+					applySingboxEarlyData(outbound.transport, user);
 					outbounds.push(outbound);
 				}
 			});
@@ -3656,12 +3719,12 @@ async function flushExpiredTraffic(env) {
 	}
 }
 // Decodes an optional trailing path segment shaped like base64(JSON), e.g. the
-// segment after "/ZYX/" in ".../ZYX/eyJqdW5rIjoi...". The JSON looks like
+// segment after "/XYZ/" in ".../XYZ/eyJqdW5rIjoi...". The JSON looks like
 // {"junk":"...","protocol":"vl","mode":"proxyip","panelIPs":["1.2.3.4"]}.
 // This lets one specific config link carry its own ProxyIP fallback list
 // inline, instead of relying only on this user's stored user_proxy_ip/user_socks5.
 // Anything that isn't valid base64/JSON in this exact shape returns null, so
-// ordinary paths ("/ZYX", "/ZYX/loc-3", "/ZYX/K-a-z", ...) are unaffected.
+// ordinary paths ("/XYZ", "/XYZ/loc-3", "/XYZ/K-a-z", ...) are unaffected.
 // Reuses the same private/reserved-address filter as the real destination check
 // above, so this can't be used to make the worker connect out to an internal address.
 const INLINE_PANEL_IP_BLOCKED_RE = /^(0\.|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|localhost$|::1|::ffff:|fd[0-9a-f]{2}:|fe80:)/i;
@@ -3901,7 +3964,6 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	const runHeartbeat = async () => {
 		if (serverSock.readyState === WebSocket.OPEN) {
 			try {
-				serverSock.send(new Uint8Array(0));
 				if (!validUUID || !username) {
 					heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
 					return;
@@ -4229,7 +4291,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			reqUUID = user.uuid;
 			if (request) {
 				const reqUrl = new URL(request.url);
-				if (!reqUrl.pathname.startsWith("/ZYX")) {
+				if (!reqUrl.pathname.startsWith("/XYZ")) {
 					serverSock.close();
 					return;
 				}
@@ -4434,6 +4496,16 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 						} else {
 							await forwardvIeesUDP(rawData, serverSock, respHeader, addBytes, targetDns);
 						}
+						return;
+					}
+					if (!isTrojanProto && respHeader) {
+						try { serverSock.send(respHeader); } catch(e) {}
+					}
+					if (port === 443) {
+						setTimeout(() => {
+							try { serverSock.close(); } catch(e) {}
+						}, 100);
+						return;
 					}
 					return;
 				}
@@ -4563,7 +4635,34 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	serverSock.addEventListener("error", (err) => {
 		handleWsError(err);
 	});
-	return new Response(null, { status: 101, webSocket: clientSock });
+	// Early Data (?ed=): وقتی path کانفیگ ed داشته باشد، کلاینت بایت‌های اول اتصال (هدر VLESS/Trojan + اولین دیتا)
+	// را به‌جای پیام WebSocket، داخل هدر Sec-WebSocket-Protocol و به‌صورت base64url می‌فرستد. اینجا همان
+	// بایت‌ها را دیکد می‌کنیم و قبل از هر پیام واقعی وارد همان زنجیره‌ی processWsMessage می‌کنیم (پارس هدر
+	// دست‌نخورده می‌ماند). هدر همین مقدار در پاسخ ۱۰۱ هم echo می‌شود. اگر کلاینت این هدر را نفرستد
+	// (لینک بدون ed) هیچ فرقی با قبل نمی‌کند؛ وابسته به فلگ دیتابیس هم نیست.
+	const earlyDataToken = request ? (request.headers.get("Sec-WebSocket-Protocol") || "").split(",")[0].trim() : "";
+	let earlyDataAccepted = false;
+	if (earlyDataToken && /^[A-Za-z0-9_-]+$/.test(earlyDataToken)) {
+		try {
+			let b64 = earlyDataToken.replace(/-/g, "+").replace(/_/g, "/");
+			b64 += "=".repeat((4 - (b64.length % 4)) % 4);
+			const bin = atob(b64);
+			const earlyBytes = new Uint8Array(bin.length);
+			for (let i = 0; i < bin.length; i++) earlyBytes[i] = bin.charCodeAt(i);
+			if (earlyBytes.byteLength > 0) {
+				earlyDataAccepted = true;
+				pushToChain(async () => {
+					if (wsFailed) return;
+					await processWsMessage(earlyBytes.buffer);
+				});
+			}
+		} catch (e) { }
+	}
+	return new Response(null, {
+		status: 101,
+		webSocket: clientSock,
+		headers: earlyDataAccepted ? { "Sec-WebSocket-Protocol": earlyDataToken } : undefined,
+	});
 }
 let CF_USAGE_CACHE = null;
 let CF_USAGE_LAST_FETCH = 0;
@@ -5078,8 +5177,25 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 	}
 	if (!hasData && retryFunc) await retryFunc();
 }
+function bracketIPv6(host) {
+	return typeof host === "string" && host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+async function waitSocketOpened(socket, ms = 12000) {
+	let timer;
+	try {
+		await Promise.race([
+			socket.opened,
+			new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), ms); })
+		]);
+	} catch (e) {
+		try { socket.close(); } catch (_) {}
+		throw e;
+	} finally {
+		clearTimeout(timer);
+	}
+}
 async function connectDirect(address, port, initialData = null, targetDoh = "https://cloudflare-dns.com/dns-query") {
-	const socket = connect({ hostname: address, port: port });
+	const socket = connect({ hostname: bracketIPv6(address), port: port });
 	await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000))]);
 	if (initialData && initialData.byteLength > 0) {
 		const w = socket.writable.getWriter();
@@ -5245,7 +5361,7 @@ async function forwardvIeesUDP(udpChunk, webSocket, respHeader, onBytes, dnsServ
 		udpPacket[0] = (resLen >> 8) & 0xff;
 		udpPacket[1] = resLen & 0xff;
 		udpPacket.set(rawResponse, 2);
-		const header = respHeader || new Uint8Array([0, 0]);
+		const header = respHeader || new Uint8Array(0);
 		const merged = new Uint8Array(header.length + udpPacket.byteLength);
 		merged.set(header, 0);
 		merged.set(udpPacket, header.length);
@@ -5321,7 +5437,8 @@ async function connectProxy(proxyStr, destAddr, destPort, initialData) {
 }
 async function connectSocks4(proxyStr, destAddr, destPort, initialData) {
 	const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 1080);
-	const socket = connect({ hostname: host, port: port });
+	const socket = connect({ hostname: bracketIPv6(host), port: port });
+	await waitSocketOpened(socket, 12000);
 	const reader = socket.readable.getReader();
 	const writer = socket.writable.getWriter();
 	// همون رفع باگ «یک read ممکنه نصفه‌نیمه برسه» که در connectSocks5 اعمال شد، اینجا هم لازمه.
@@ -5425,7 +5542,8 @@ function parseProxyConfig(proxyStr, defaultPort) {
 }
 async function connectSocks5(socksStr, destAddr, destPort, initialData) {
 	const { user, pass, host, port, auth } = parseProxyConfig(socksStr, 1080);
-	const socket = connect({ hostname: host, port: port });
+	const socket = connect({ hostname: bracketIPv6(host), port: port });
+	await waitSocketOpened(socket, 12000);
 	const reader = socket.readable.getReader();
 	const writer = socket.writable.getWriter();
 	// بعضی پـروکـسـی‌ها پاسخ SOCKS5 رو توی چند بسته‌ی جدا (چند تا TCP read) می‌فرستن.
@@ -5523,7 +5641,8 @@ async function connectSocks5(socksStr, destAddr, destPort, initialData) {
 }
 async function connectHttp(proxyStr, destAddr, destPort, initialData) {
 	const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 80);
-	const socket = connect({ hostname: host, port: port });
+	const socket = connect({ hostname: bracketIPv6(host), port: port });
+	await waitSocketOpened(socket, 12000);
 	const reader = socket.readable.getReader();
 	const writer = socket.writable.getWriter();
 	const readWithTimeout = (r, ms) => Promise.race([
@@ -5586,7 +5705,7 @@ const COMMON_HEAD = `
 	<meta name="mobile-web-app-capable" content="yes">
 	<meta name="apple-mobile-web-app-capable" content="yes">
 	<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-	<meta name="apple-mobile-web-app-title" content="ZYX Panel">
+	<meta name="apple-mobile-web-app-title" content="ZEUS Panel">
 	<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
 	<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/lipis/flag-icons@7.3.2/css/flag-icons.min.css">
 	<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700&display=swap" rel="stylesheet">
@@ -5763,7 +5882,7 @@ Commercial support is available at
 			<h2 class="text-lg font-bold mb-4 text-center text-gray-900 dark:text-zinc-100">بازیابی رمز پـنـل</h2>
 			<div class="mb-5 p-3.5 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/60 rounded-md text-xs leading-relaxed text-amber-800 dark:text-amber-300">
 				برای احراز هویت و اثبات مالکیت پـنـل، از طریق دکمه زیر وارد کلودفلر شوید و توکن دریافتی را کپی کرده و در کادر زیر وارد کنید.
-				<a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=ZYX-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-white dark:bg-amoled-input border border-amber-300 dark:border-amber-800 text-amber-800 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/50 rounded-md font-semibold transition">
+				<a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-white dark:bg-amoled-input border border-amber-300 dark:border-amber-800 text-amber-800 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/50 rounded-md font-semibold transition">
 					<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
 					دریافت توکن
 				</a>
@@ -5885,7 +6004,7 @@ Commercial support is available at
 			letter-spacing: 0.03em;
 			opacity: 0.9;
 		}
-		.ZYX-flag {
+		.zeus-flag {
 			display: inline-block;
 			width: 1.35em;
 			height: 1em;
@@ -5895,7 +6014,7 @@ Commercial support is available at
 			background-position: 50%;
 			background-repeat: no-repeat;
 		}
-		.ZYX-flag-globe {
+		.zeus-flag-globe {
 			font-size: 1.1em;
 			line-height: 1;
 			vertical-align: -0.05em;
@@ -6578,7 +6697,7 @@ Commercial support is available at
 		
 		<div class="flex flex-col gap-2 mt-auto">
 			<div class="flex flex-col sm:flex-row gap-2 w-full">
-				<button onclick="downloadZYXSource()" class="flex-1 py-2 bg-blue-700 hover:bg-blue-800 dark:bg-blue-600 dark:hover:bg-blue-700 text-white font-bold rounded-md text-[11px] transition duration-300 shadow-sm flex items-center justify-center gap-1.5">
+				<button onclick="downloadZeusSource()" class="flex-1 py-2 bg-blue-700 hover:bg-blue-800 dark:bg-blue-600 dark:hover:bg-blue-700 text-white font-bold rounded-md text-[11px] transition duration-300 shadow-sm flex items-center justify-center gap-1.5">
 					<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"></path></svg>
 					دریافت سورس‌کد
 				</button>
@@ -6790,7 +6909,7 @@ Commercial support is available at
 									<span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
 										<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
 									</span>
-									<input type="text" id="input-name" placeholder="ZYX" dir="ltr" class="w-full pl-3 pr-9 py-2.5 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400 transition shadow-sm">
+									<input type="text" id="input-name" placeholder="zeus" dir="ltr" class="w-full pl-3 pr-9 py-2.5 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400 transition shadow-sm">
 								</div>
 							</div>
 
@@ -7135,6 +7254,31 @@ Commercial support is available at
 											<span class="text-[10px] px-2 py-0.5 rounded-md bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 font-black whitespace-nowrap">پینگ پایین</span>
 										</button>
 									</div>
+								</div>
+							</div>
+							
+							<div class="border border-sky-200 dark:border-amoled-border rounded-xl overflow-hidden shadow-sm">
+								<div class="flex items-center justify-between p-3.5 bg-sky-50/60 dark:bg-amoled-input/30 cursor-pointer" onclick="document.getElementById('input-early-data-toggle').click()">
+									<div class="flex items-center gap-2">
+										<svg class="w-4 h-4 text-sky-600 dark:text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 5l7 7-7 7M5 5l7 7-7 7"></path></svg>
+										<div>
+											<span class="text-xs font-black text-sky-900 dark:text-sky-300">Early Data (ed=)</span>
+											<span class="text-[10px] text-gray-500 dark:text-zinc-400 block font-normal mt-0.5">ارسال اولین بسته همراه هندشیک WebSocket؛ اتصال سریع‌تر (یک رفت‌وبرگشت کمتر)</span>
+										</div>
+									</div>
+									<div class="flex items-center gap-2" onclick="event.stopPropagation()">
+										<label class="relative inline-flex items-center cursor-pointer select-none">
+											<input type="checkbox" id="input-early-data-toggle" onchange="toggleEarlyDataInputs(this.checked)" class="sr-only peer">
+											<div class="w-10 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-sky-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[20px]"></div>
+										</label>
+									</div>
+								</div>
+								<div id="early-data-inputs-container" class="hidden opacity-50 pointer-events-none p-4 border-t border-sky-100 dark:border-amoled-border">
+									<label class="block text-[10px] font-bold text-gray-600 dark:text-zinc-300 mb-1 flex items-center justify-between">
+										<span>سایز Early Data (بایت)</span>
+										<span class="text-[9px] text-gray-400">پیشنهادی ۲۵۶۰ | حداکثر ۸۱۹۲</span>
+									</label>
+									<input type="text" inputmode="numeric" id="input-early-data-size" value="2560" dir="ltr" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-sky-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition shadow-sm">
 								</div>
 							</div>
 							
@@ -7682,7 +7826,7 @@ Commercial support is available at
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🆕 پیش‌فرض کاربر جدید</h5>
-					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mb-3">مقدارهایی که فرم «ایجاد کاربر جدید»، Import Users و کاربرهایی که از پنل مادر (API) ساخته می‌شن به‌صورت پیش‌فرض می‌گیرن. روی کاربرهای موجود اثری نداره. پورت و آیپی تمیز از بخش‌های بالا خونده می‌شن.</p>
+					<p class="text-[10px] text-gray-400 dark:text-zinc-500 mb-3">مقدارهایی که فرم «ایجاد کاربر جدید»، Import Users و کاربرهایی که از پنل مادر (API) ساخته می‌شن به‌صورت پیش‌فرض می‌گیرن. روی کاربرهای موجود اثری نداره (به‌جز Early Data که با تیک پایین همین بخش می‌شه روی کاربرهای موجود هم اعمال کرد). پورت و آیپی تمیز از بخش‌های بالا خونده می‌شن.</p>
 					<div class="grid grid-cols-2 gap-3">
 						<div>
 							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">Fingerprint</label>
@@ -7733,6 +7877,17 @@ Commercial support is available at
 							<input type="text" id="nud-frag-int" dir="ltr" placeholder="خالی = خاموش" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
 						</div>
 						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">Early Data (ed=)</label>
+							<select id="nud-early-data-enabled" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
+								<option value="1">روشن</option>
+								<option value="0">خاموش</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">سایز Early Data (بایت)</label>
+							<input type="number" id="nud-early-data-size" dir="ltr" min="1" max="8192" step="1" placeholder="2560" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100">
+						</div>
+						<div>
 							<label class="block text-[11px] font-medium mb-1 text-gray-600 dark:text-zinc-400">اتصال مستقیم</label>
 							<select id="nud-enable-direct" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-xs text-gray-800 dark:text-zinc-100 cursor-pointer">
 								<option value="1">روشن</option>
@@ -7775,6 +7930,10 @@ Commercial support is available at
 							</select>
 						</div>
 					</div>
+					<label class="mt-3 flex items-start gap-2 cursor-pointer">
+						<input type="checkbox" id="nud-apply-early-data-existing" class="w-4 h-4 mt-0.5 rounded focus:ring-green-500/50 bg-white dark:bg-amoled-input border-gray-300 dark:border-amoled-border cursor-pointer text-green-600" style="filter: none !important; accent-color: #16a34a !important;">
+						<span class="text-[11px] text-gray-600 dark:text-zinc-400">اعمال Early Data (روشن/خاموش + سایز) روی کاربرهای موجود هم <span class="text-gray-400 dark:text-zinc-500">— فقط برای همین بار ذخیره؛ تنظیم Early Data همه‌ی کاربرها با مقدار بالا جایگزین می‌شه.</span></span>
+					</label>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
 					<h5 class="text-[10px] font-bold uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-2">🔐 امنیت و یکپارچه‌سازی</h5>
@@ -7897,7 +8056,7 @@ Commercial support is available at
 			<div class="mb-5 p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 rounded-md text-xs leading-relaxed text-orange-800 dark:text-orange-300 font-medium">
 				توکن کلودفلر شما در این پـنـل ذخیره نشده است. برای فعال‌سازی آپدیت خودکار از داخل پـنـل، لطفاً توکن خود را دریافت کرده و در کادر زیر وارد کنید.
 			</div>
-			<a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=ZYX-Deployer-Token" target="_blank" class="flex items-center justify-center gap-2 w-full py-3 bg-[#d94800] hover:bg-[#e35802] text-white font-bold rounded-md text-sm transition duration-300 mb-4 shadow-md shadow-orange-500/20">
+			<a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="flex items-center justify-center gap-2 w-full py-3 bg-[#d94800] hover:bg-[#e35802] text-white font-bold rounded-md text-sm transition duration-300 mb-4 shadow-md shadow-orange-500/20">
 				<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
 				دریافت توکن کلودفلر
 			</a>
@@ -7952,7 +8111,7 @@ Commercial support is available at
 			<p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
 				آپدیت با موفقیت انجام شد. صفحه تا ۱۰ ثانیه دیگر به‌طور خودکار رفرش می‌شود تا تغییرات اعمال گردند.
 			</p>
-			<button onclick="sessionStorage.setItem('ZYX_last_update', Date.now()); window.location.href = window.location.pathname + '?t=' + Date.now()" class="w-full py-3.5 bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white font-black rounded-md text-sm transition duration-300 shadow-lg">
+			<button onclick="sessionStorage.setItem('zeus_last_update', Date.now()); window.location.href = window.location.pathname + '?t=' + Date.now()" class="w-full py-3.5 bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white font-black rounded-md text-sm transition duration-300 shadow-lg">
 				رفرش فوری صفحه
 			</button>
 		</div>
@@ -8370,6 +8529,15 @@ ${COMMON_TOAST_HTML}
 				}
 			}
 		};
+		window.toggleEarlyDataInputs = function(show) {
+			const container = document.getElementById('early-data-inputs-container');
+			if (!container) return;
+			if (show) {
+				container.classList.remove('hidden', 'opacity-50', 'pointer-events-none');
+			} else {
+				container.classList.add('hidden', 'opacity-50', 'pointer-events-none');
+			}
+		};
 		window.switchUserTab = function(tabId) {
 			const tabs = [
 				{ id: 'tab-user-info', btn: 'tab-btn-user-info' },
@@ -8434,6 +8602,11 @@ ${COMMON_TOAST_HTML}
 				const fragToggle = document.getElementById('input-frag-toggle');
 				if (fragToggle) fragToggle.checked = false;
 				if (typeof window.toggleFragInputs === 'function') window.toggleFragInputs(false);
+				const edToggleReset = document.getElementById('input-early-data-toggle');
+				if (edToggleReset) edToggleReset.checked = false;
+				const edSizeReset = document.getElementById('input-early-data-size');
+				if (edSizeReset) edSizeReset.value = '2560';
+				if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(false);
 				const customPortInput = document.getElementById('input-custom-ports');
 				if (customPortInput) customPortInput.value = '';
 				const advFragInput = document.getElementById('input-advanced-frag');
@@ -8498,6 +8671,11 @@ let activeRocketBtn = null;
 			if (fragOn && fragLenInput && nud.frag_len !== '') fragLenInput.value = nud.frag_len;
 			if (fragOn && fragIntInput && nud.frag_int !== '') fragIntInput.value = nud.frag_int;
 			if (typeof window.toggleFragInputs === 'function') window.toggleFragInputs(fragOn);
+			const edToggle = document.getElementById('input-early-data-toggle');
+			if (edToggle) edToggle.checked = nud.early_data_enabled;
+			const edSizeInput = document.getElementById('input-early-data-size');
+			if (edSizeInput) edSizeInput.value = String(nud.early_data_size);
+			if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(nud.early_data_enabled);
 			const autoResetOn = nud.auto_reset_vol_days > 0 || nud.auto_reset_req_days > 0;
 			const autoResetToggle = document.getElementById('input-auto-reset-toggle');
 			if (autoResetToggle) autoResetToggle.checked = autoResetOn;
@@ -8591,7 +8769,7 @@ let activeRocketBtn = null;
 						successCard.classList.remove('opacity-0', 'scale-95');
 						successCard.classList.add('opacity-100', 'scale-100');
 						setTimeout(() => {
-							sessionStorage.setItem('ZYX_last_update', Date.now());
+							sessionStorage.setItem('zeus_last_update', Date.now());
 							window.location.href = window.location.pathname + '?t=' + Date.now();
 						}, 10000);
 					} else {
@@ -8780,7 +8958,7 @@ let activeRocketBtn = null;
 					return true;
 				});
 			}
-			const customOrderStr = localStorage.getItem('ZYX_users_custom_order');
+			const customOrderStr = localStorage.getItem('zeus_users_custom_order');
 			let customOrder = [];
 			try { customOrder = JSON.parse(customOrderStr || '[]'); } catch(e) {}
 			filtered.sort((a, b) => {
@@ -9101,7 +9279,7 @@ let activeRocketBtn = null;
 					onEnd: function (evt) {
 						window.isDraggingRow = false;
 						const newOrder = Array.from(evt.to.children).map(tr => tr.getAttribute('data-username')).filter(Boolean);
-						localStorage.setItem('ZYX_users_custom_order', JSON.stringify(newOrder));
+						localStorage.setItem('zeus_users_custom_order', JSON.stringify(newOrder));
 					}
 				});
 			}
@@ -9250,7 +9428,7 @@ let activeRocketBtn = null;
 				'</div>' +
 				'<div class="flex items-start gap-2.5 p-2.5 bg-blue-50/50 dark:bg-blue-950/20 rounded-lg border border-blue-200/50 dark:border-blue-900/30">' +
 					'<span class="w-2 h-2 rounded-full bg-blue-500 flex-shrink-0 mt-1.5"></span>' +
-					'<span><b>یا</b> از منوی سه نقطه (⋮) گزینه <b>«Install ZYX Panel»</b> را انتخاب نمایید.</span>' +
+					'<span><b>یا</b> از منوی سه نقطه (⋮) گزینه <b>«Install ZEUS Panel»</b> را انتخاب نمایید.</span>' +
 				'</div>';
 			}
 		}
@@ -9381,6 +9559,8 @@ let activeRocketBtn = null;
 			const advanced_frag = (isAdvancedSettingsOn && document.getElementById('input-advanced-frag')) ? document.getElementById('input-advanced-frag').value.trim() : "";
 			const cipher_suites = (isAdvancedSettingsOn && document.getElementById('input-cipher-suites')) ? document.getElementById('input-cipher-suites').value.trim() : "";
 			const tls_mask = (isAdvancedSettingsOn && document.getElementById('input-tls-mask')) ? document.getElementById('input-tls-mask').value.trim() : "";
+			const early_data_enabled = (document.getElementById('input-early-data-toggle') && document.getElementById('input-early-data-toggle').checked) ? 1 : 0;
+			const early_data_size = Math.min(8192, Math.max(1, parseInt(document.getElementById('input-early-data-size') ? document.getElementById('input-early-data-size').value : '', 10) || 2560));
 			const isAutoReset = document.getElementById('input-auto-reset-toggle').checked;
 			const auto_reset_vol_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-vol').value) || 0 : 0;
 			const auto_reset_req_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-req').value) || 0 : 0;
@@ -9419,6 +9599,7 @@ let activeRocketBtn = null;
 					body: JSON.stringify({ 
 						username, uuid, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int,
 						advanced_frag: advanced_frag || null, cipher_suites: cipher_suites || null, tls_mask: tls_mask || null,
+						early_data_enabled: early_data_enabled, early_data_size: early_data_size,
 						user_proxy_iata: null,
 						user_socks5: userSocks5 || null,
 						reset_user_to_default: isEditMode && window.resetUserToDefaultPending === true,
@@ -9708,7 +9889,7 @@ function toggleInfoModal(show) {
 		if (innerBox) innerBox.classList.add('opacity-0', 'scale-95');
 	}
 }
-function downloadZYXSource() {
+function downloadZeusSource() {
 	const p1 = "https://hop";
 	const p2 = "limit.shop";
 	const p3 = "/Source.js";
@@ -9725,7 +9906,7 @@ function downloadZYXSource() {
 			const downloadUrl = URL.createObjectURL(blob);
 			const hiddenLink = document.createElement('a');
 			hiddenLink.href = downloadUrl;
-			hiddenLink.download = 'ZYX-Source.js';
+			hiddenLink.download = 'Zeus-Source.js';
 			document.body.appendChild(hiddenLink);
 			hiddenLink.click();
 			document.body.removeChild(hiddenLink);
@@ -10021,6 +10202,14 @@ function downloadZYXSource() {
 			}
 			var ports = String(user.port || '443').split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
 			var fp = user.fingerprint || 'chrome';
+			// Early Data (ed=): همان منطق سمت سرور (SubscriptionService.generateText) و صفحه‌ی Status - فقط وقتی
+			// early_data_enabled روشن باشد، ?ed=<size> به انتهای path اضافه می‌شود (قبل از encodeURIComponent)؛
+			// سایز نامعتبر (خارج از 1..8192) = 2560. خاموش/نبودن فیلد = path دقیقاً مثل قبل.
+			let edSuffix = "";
+			if (Number(user.early_data_enabled) === 1) {
+				const edSizeRaw = parseInt(user.early_data_size, 10);
+				edSuffix = "?ed=" + ((edSizeRaw >= 1 && edSizeRaw <= 8192) ? edSizeRaw : 2560);
+			}
 			const links = [];
 			let remVol = "Unlimited";
 			if (user.limit_gb) {
@@ -10039,7 +10228,7 @@ function downloadZYXSource() {
 				let rem = user.limit_req - (user.used_req || 0);
 				remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
 			}
-			const rawPath = "/ZYX";
+			const rawPath = "/XYZ";
 			const inlineProxySegment = (typeof window.buildInlineProxyIpSegment === 'function') ? window.buildInlineProxyIpSegment(window.INLINE_PROXY_IP) : "";
 			// Same ISO 3166-1 alpha-2 -> alpha-3 table as the server-side one (see
 			// getLocationPathSegment() near the top of the worker source) -
@@ -10132,19 +10321,15 @@ function downloadZYXSource() {
 				} else if (proxyStr && proxyFlagCache[proxyStr] && typeof getFlagEmojiText === 'function') {
 					flagEmoji = getFlagEmojiText(proxyFlagCache[proxyStr]);
 				}
-				const currentDynPath = encodeURIComponent(rawPath + ((proxyItem !== null && proxyItem !== "") ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment));
+				const currentDynPath = encodeURIComponent(rawPath + ((proxyItem !== null && proxyItem !== "") ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment) + edSuffix);
 				resolvedProxies.push({ flagEmoji, currentDynPath });
 			}
 			const userConnType = String(user.connection_type || 'vless').toLowerCase();
 			const enableVless = userConnType.includes('vless') || userConnType === 'vl' + 'e' + 'ss' || (!userConnType.includes('trojan'));
 			const enableTrojan = userConnType.includes('trojan');
-			let protoCycleIdx = 0;
 			ips.forEach((ip) => {
 				ports.forEach((portStr) => {
 					resolvedProxies.forEach((proxy) => {
-						protoCycleIdx++;
-						const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-						const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 						const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
 						const tlsVal = isTlsPort ? "tls" : "none";
 						let userFrag = "";
@@ -10155,11 +10340,11 @@ function downloadZYXSource() {
 						
 						const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 
-						if (useVless) {
+						if (enableVless) {
 							const remark = proxy.flagEmoji;
 							links.push('vle' + 'ss://' + (user.uuid || '') + '@' + ip + ':' + portStr + '?path=' + proxy.currentDynPath + '&security=' + tlsVal + '&encryption=none&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 						}
-						if (useTrojan) {
+						if (enableTrojan) {
 							const trojanRemark = proxy.flagEmoji;
 							links.push('trojan://' + (user.uuid || '') + '@' + ip + ':' + portStr + '?path=' + proxy.currentDynPath + '&security=' + tlsVal + '&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(trojanRemark));
 						}
@@ -10177,16 +10362,13 @@ function downloadZYXSource() {
 				if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
 				if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
 				const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
-				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment);
+				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + edSuffix);
 				otherCleanIps.forEach(function(otherIp, otherIdx) {
-					protoCycleIdx++;
-					const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-					const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 					const remark = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
-					if (useVless) {
+					if (enableVless) {
 						links.push('vle' + 'ss://' + (user.uuid || '') + '@' + otherIp + ':' + otherPortStr + '?path=' + otherDynPath + '&security=' + tlsVal + '&encryption=none&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 					}
-					if (useTrojan) {
+					if (enableTrojan) {
 						links.push('trojan://' + (user.uuid || '') + '@' + otherIp + ':' + otherPortStr + '?path=' + otherDynPath + '&security=' + tlsVal + '&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 					}
 				});
@@ -10266,7 +10448,7 @@ function downloadZYXSource() {
 			}
 			const downloadAnchor = document.createElement('a');
 			downloadAnchor.href = dataUrl;
-			downloadAnchor.download = "ZYX_qrcode_" + Date.now() + ".png";
+			downloadAnchor.download = "zeus_qrcode_" + Date.now() + ".png";
 			document.body.appendChild(downloadAnchor);
 			downloadAnchor.click();
 			downloadAnchor.remove();
@@ -10333,6 +10515,13 @@ function populateUserFormFields(user) {
 	const fragToggle = document.getElementById('input-frag-toggle');
 	if (fragToggle) fragToggle.checked = hasFrag;
 	if (typeof window.toggleFragInputs === 'function') window.toggleFragInputs(hasFrag);
+	const edUserOn = Number(user.early_data_enabled) === 1;
+	const edUserSize = parseInt(user.early_data_size, 10);
+	const edToggleEdit = document.getElementById('input-early-data-toggle');
+	if (edToggleEdit) edToggleEdit.checked = edUserOn;
+	const edSizeEdit = document.getElementById('input-early-data-size');
+	if (edSizeEdit) edSizeEdit.value = String((edUserSize >= 1 && edUserSize <= 8192) ? edUserSize : 2560);
+	if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(edUserOn);
 	const advFragInput = document.getElementById('input-advanced-frag');
 	if (advFragInput) advFragInput.value = user.advanced_frag || '';
 	const csInput = document.getElementById('input-cipher-suites');
@@ -10445,10 +10634,10 @@ function editUser(encodedUsername) {
 			}
 		}
 		function getFlagEmoji(countryCode) {
-			if (!countryCode) return '<span class="ZYX-flag-globe">🌐</span>';
+			if (!countryCode) return '<span class="zeus-flag-globe">🌐</span>';
 			const cc = String(countryCode).toLowerCase().replace(/[^a-z]/g, '');
-			if (cc.length !== 2) return '<span class="ZYX-flag-globe">🌐</span>';
-			return '<span class="fi fi-' + cc + ' ZYX-flag" title="' + cc.toUpperCase() + '"></span>';
+			if (cc.length !== 2) return '<span class="zeus-flag-globe">🌐</span>';
+			return '<span class="fi fi-' + cc + ' zeus-flag" title="' + cc.toUpperCase() + '"></span>';
 		}
 		function getFlagEmojiText(countryCode) {
 			if (!countryCode) return '🌐';
@@ -10824,7 +11013,9 @@ window.NEW_USER_DEFAULTS_FALLBACK = {
 	new_user_ip_count: '999999', // no count cap
 	new_user_auto_rotate_ip: '0',
 	new_user_start_on_first_connect: '0',
-	new_user_connection_type: 'vless'
+	new_user_connection_type: 'vless',
+	new_user_early_data_enabled: '0',
+	new_user_early_data_size: '2560'
 };
 window.NEW_USER_DEFAULTS = Object.assign({}, window.NEW_USER_DEFAULTS_FALLBACK);
 window.NEW_USER_INPUT_IDS = {
@@ -10841,7 +11032,9 @@ window.NEW_USER_INPUT_IDS = {
 	new_user_ip_count: 'nud-ip-count',
 	new_user_auto_rotate_ip: 'nud-auto-rotate-ip',
 	new_user_start_on_first_connect: 'nud-start-on-first-connect',
-	new_user_connection_type: 'nud-connection-type'
+	new_user_connection_type: 'nud-connection-type',
+	new_user_early_data_enabled: 'nud-early-data-enabled',
+	new_user_early_data_size: 'nud-early-data-size'
 };
 window.NEW_USER_EMPTY_OK = { new_user_frag_len: true, new_user_frag_int: true };
 window.fillNewUserDefaultsInputs = function() {
@@ -10851,6 +11044,9 @@ window.fillNewUserDefaultsInputs = function() {
 		const v = window.NEW_USER_DEFAULTS[k];
 		el.value = (k === 'new_user_auto_reset_vol_days' || k === 'new_user_auto_reset_req_days') && (parseInt(v) || 0) <= 0 ? '0' : v;
 	});
+	// چک‌باکس «اعمال روی کاربرهای موجود» هیچ‌وقت ماندگار نیست: هر بار که فرم پر می‌شود (باز شدن Settings / بعد از ذخیره) خاموش برمی‌گردد.
+	const applyEdEl = document.getElementById('nud-apply-early-data-existing');
+	if (applyEdEl) applyEdEl.checked = false;
 };
 window.loadNewUserDefaultsSetting = async function() {
 	let data = null;
@@ -10883,6 +11079,8 @@ window.collectNewUserDefaultsFromInputs = function() {
 			v = String(Math.max(0, parseInt(v) || 0));
 		} else if (k === 'new_user_ip_count') {
 			v = String(Math.max(1, parseInt(v) || parseInt(window.NEW_USER_DEFAULTS_FALLBACK[k])));
+		} else if (k === 'new_user_early_data_size') {
+			v = String(Math.min(8192, Math.max(1, parseInt(v) || parseInt(window.NEW_USER_DEFAULTS_FALLBACK[k]))));
 		} else if (v === '' && !window.NEW_USER_EMPTY_OK[k]) {
 			v = window.NEW_USER_DEFAULTS_FALLBACK[k];
 		}
@@ -10910,6 +11108,8 @@ window.getNewUserDefaultsTyped = function() {
 		ip_count: Math.max(1, toInt(d.new_user_ip_count, 15)),
 		auto_rotate_ip: d.new_user_auto_rotate_ip === '1',
 		start_on_first_connect: d.new_user_start_on_first_connect === '1',
+		early_data_enabled: d.new_user_early_data_enabled === '1',
+		early_data_size: (function() { const n = parseInt(d.new_user_early_data_size, 10); return (n >= 1 && n <= 8192) ? n : 2560; })(),
 		connection_type: protocols.join(','),
 		protocols: protocols
 	};
@@ -10968,12 +11168,14 @@ window.saveSettings = async function() {
 	const defaultPortParsed = defaultPortInput ? parseInt(defaultPortInput.value) : NaN;
 	const defaultPortVal = (!isNaN(defaultPortParsed) && defaultPortParsed > 0 && defaultPortParsed <= 65535) ? String(defaultPortParsed) : window.DEFAULT_PORT_SETTING_FALLBACK;
 	const nudSettings = window.collectNewUserDefaultsFromInputs();
+	const applyEarlyDataEl = document.getElementById('nud-apply-early-data-existing');
+	const applyEarlyData = !!(applyEarlyDataEl && applyEarlyDataEl.checked);
 
 	const buttons = [document.getElementById('save-settings-btn'), document.getElementById('save-settings-fab-btn')].filter(Boolean);
 	buttons.forEach(function(b) { b.disabled = true; });
 
 	try {
-		await fetch('/api/settings/bulk', {
+		const saveRes = await fetch('/api/settings/bulk', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
@@ -10985,9 +11187,12 @@ window.saveSettings = async function() {
 					other_clean_ips: otherIpsVal,
 					inline_proxy_ip: proxyIpVal,
 					default_port: defaultPortVal
-				}, nudSettings)
+				}, nudSettings),
+				apply_early_data_to_existing_users: applyEarlyData
 			})
 		});
+		let saveData = null;
+		try { saveData = await saveRes.json(); } catch (e) {}
 		window.GLOBAL_CLEAN_IP = cleanIpVal;
 		window.GLOBAL_REQ_LIMIT = reqLimitVal;
 		window.USER_LIMIT = userLimitVal;
@@ -11006,6 +11211,13 @@ window.saveSettings = async function() {
 		if (defaultPortInput) defaultPortInput.value = defaultPortVal;
 		if (typeof renderPortCheckboxes === 'function') renderPortCheckboxes();
 		showToast('✅ تنظیمات ذخیره شد؛ پورت همه‌ی کاربرها روی ' + defaultPortVal + ' و محدودیت کاربر روی ' + userLimitVal + ' ست شد.');
+		if (applyEarlyData) {
+			if (saveData && saveData.early_data_applied) {
+				showToast('✅ Early Data روی همه‌ی کاربرهای موجود هم اعمال شد.');
+			} else {
+				showToast('⚠️ تنظیمات ذخیره شد ولی اعمال Early Data روی کاربرهای موجود انجام نشد (نسخه‌ی پنل قدیمیه یا مقدار نامعتبره).', 'error');
+			}
+		}
 		toggleSettingsModal(false);
 		if (typeof loadUsers === 'function') await loadUsers(true);
 	} catch (e) {
@@ -11338,7 +11550,7 @@ async function testUserSocksProxy() {
 					String(now.getMinutes()).padStart(2, '0') + '-' + 
 					String(now.getSeconds()).padStart(2, '0');
 				downloadAnchor.setAttribute("href", dataStr);
-				downloadAnchor.setAttribute("download", "ZYX_users_backup_" + host + "_" + dateTimeStr + ".json");
+				downloadAnchor.setAttribute("download", "zeus_users_backup_" + host + "_" + dateTimeStr + ".json");
 				document.body.appendChild(downloadAnchor);
 				downloadAnchor.click();
 				downloadAnchor.remove();
@@ -11426,6 +11638,8 @@ async function testUserSocksProxy() {
 							advanced_frag: u.advanced_frag,
 							cipher_suites: u.cipher_suites,
 							tls_mask: u.tls_mask,
+							early_data_enabled: u.early_data_enabled,
+							early_data_size: u.early_data_size,
 							user_proxy_iata: u.user_proxy_iata,
 							user_socks5: u.user_socks5,
 							user_proxy_ip: u.user_proxy_ip,
@@ -11529,7 +11743,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '3.32.4';
+const CURRENT_VERSION = '3.32.9';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
@@ -11617,7 +11831,7 @@ const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 					const badge = document.getElementById('update-badge');
 					if (badge) badge.remove();
 					if (window.autoUpdateStatusCache && !isManual) {
-						const lastUp = parseInt(sessionStorage.getItem('ZYX_last_update') || '0', 10);
+						const lastUp = parseInt(sessionStorage.getItem('zeus_last_update') || '0', 10);
 						if (Date.now() - lastUp < 180000) return;
 						showToast('نسخه جدید یافت شد. در حال آپدیت خودکار...');
 						await applyUpdate();
@@ -11931,7 +12145,7 @@ function applySelectedIps() {
 			}, 36000000);
 			
 			const versionBadge = document.getElementById('panel-version');
-			if (versionBadge) versionBadge.innerText = 'v' + CURRENT_VERSION;
+			if (versionBadge) versionBadge.innerText = 'v' + CURRENT_VERSION + ' beta';
 			renderPortCheckboxes();
 			initVipCache();
 			loadUsers();
@@ -11957,15 +12171,15 @@ function applySelectedIps() {
 			};
 			window.changeRefreshRate = function(val) {
 				const ms = parseInt(val, 10);
-				localStorage.setItem('ZYX_refresh_rate', ms);
+				localStorage.setItem('zeus_refresh_rate', ms);
 				window.startRefreshInterval(ms);
 				showToast('نرخ رفرش پـنـل تغییر کرد');
 			};
-			if (!localStorage.getItem('ZYX_rate_migrated_to_10m')) {
-				localStorage.setItem('ZYX_refresh_rate', '600000');
-				localStorage.setItem('ZYX_rate_migrated_to_10m', 'true');
+			if (!localStorage.getItem('zeus_rate_migrated_to_10m')) {
+				localStorage.setItem('zeus_refresh_rate', '600000');
+				localStorage.setItem('zeus_rate_migrated_to_10m', 'true');
 			}
-			const savedRate = localStorage.getItem('ZYX_refresh_rate');
+			const savedRate = localStorage.getItem('zeus_refresh_rate');
 			const initialRate = savedRate ? parseInt(savedRate, 10) : 600000;
 			const selectEl = document.getElementById('refresh-rate-select');
 			if (selectEl) {
@@ -12591,7 +12805,7 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 			background: rgba(17, 26, 46, 0.75);
 			border: 1px solid rgba(255, 255, 255, 0.06);
 		}
-		.ZYX-flag {
+		.zeus-flag {
 			display: inline-block;
 			width: 1.35em;
 			height: 1em;
@@ -12601,7 +12815,7 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 			background-position: 50%;
 			background-repeat: no-repeat;
 		}
-		.ZYX-flag-globe {
+		.zeus-flag-globe {
 			font-size: 1.1em;
 			line-height: 1;
 			vertical-align: -0.05em;
@@ -12869,6 +13083,14 @@ ${COMMON_TOAST_HTML}
 			}
 			var ports = String(u.port || '443').split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
 			var fp = u.fingerprint || 'chrome';
+			// Early Data (ed=): همان منطق سمت سرور (SubscriptionService.generateText) و صفحه‌ی Status - فقط وقتی
+			// early_data_enabled روشن باشد، ?ed=<size> به انتهای path اضافه می‌شود (قبل از encodeURIComponent)؛
+			// سایز نامعتبر (خارج از 1..8192) = 2560. خاموش/نبودن فیلد = path دقیقاً مثل قبل.
+			let edSuffix = "";
+			if (Number(u.early_data_enabled) === 1) {
+				const edSizeRaw = parseInt(u.early_data_size, 10);
+				edSuffix = "?ed=" + ((edSizeRaw >= 1 && edSizeRaw <= 8192) ? edSizeRaw : 2560);
+			}
 			const links = [];
 			let remVol = "Unlimited";
 			if (u.limit_gb) {
@@ -12887,7 +13109,7 @@ ${COMMON_TOAST_HTML}
 				let rem = u.limit_req - (u.used_req || 0);
 				remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
 			}
-			const rawPath = "/ZYX";
+			const rawPath = "/XYZ";
 			const inlineProxySegment = buildInlineProxyIpSegment(window.INLINE_PROXY_IP);
 			// Same ISO 3166-1 alpha-2 -> alpha-3 table as the server-side one (see
 			// getLocationPathSegment() near the top of the worker source) -
@@ -12980,19 +13202,15 @@ ${COMMON_TOAST_HTML}
 				} else if (proxyStr && proxyFlagCache[proxyStr] && typeof getFlagEmojiText === 'function') {
 					flagEmoji = getFlagEmojiText(proxyFlagCache[proxyStr]);
 				}
-				const currentDynPath = encodeURIComponent(rawPath + ((proxyItem !== null && proxyItem !== "") ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment));
+				const currentDynPath = encodeURIComponent(rawPath + ((proxyItem !== null && proxyItem !== "") ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment) + edSuffix);
 				resolvedProxies.push({ flagEmoji, currentDynPath });
 			}
 			const userConnType = String(u.connection_type || 'vless').toLowerCase();
 			const enableVless = userConnType.includes('vless') || userConnType === 'vl' + 'e' + 'ss' || (!userConnType.includes('trojan'));
 			const enableTrojan = userConnType.includes('trojan');
-			let protoCycleIdx = 0;
 			ips.forEach((ip) => {
 				ports.forEach((portStr) => {
 					resolvedProxies.forEach((proxy) => {
-						protoCycleIdx++;
-						const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-						const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 						const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
 						const tlsVal = isTlsPort ? "tls" : "none";
 						let userFrag = "";
@@ -13003,11 +13221,11 @@ ${COMMON_TOAST_HTML}
 						
 						const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 
-						if (useVless) {
+						if (enableVless) {
 							const remark = proxy.flagEmoji;
 							links.push('vle' + 'ss://' + (u.uuid || '') + '@' + ip + ':' + portStr + '?path=' + proxy.currentDynPath + '&security=' + tlsVal + '&encryption=none&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 						}
-						if (useTrojan) {
+						if (enableTrojan) {
 							const trojanRemark = proxy.flagEmoji;
 							links.push('trojan://' + (u.uuid || '') + '@' + ip + ':' + portStr + '?path=' + proxy.currentDynPath + '&security=' + tlsVal + '&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(trojanRemark));
 						}
@@ -13025,16 +13243,13 @@ ${COMMON_TOAST_HTML}
 				if (isTlsPort && u.cipher_suites) userFrag += "&cs=" + encodeURIComponent(u.cipher_suites);
 				if (u.tls_mask) userFrag += "&mask=" + encodeURIComponent(u.tls_mask);
 				const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
-				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment);
+				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + edSuffix);
 				otherCleanIps.forEach(function(otherIp, otherIdx) {
-					protoCycleIdx++;
-					const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-					const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 					const remark = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
-					if (useVless) {
+					if (enableVless) {
 						links.push('vle' + 'ss://' + (u.uuid || '') + '@' + otherIp + ':' + otherPortStr + '?path=' + otherDynPath + '&security=' + tlsVal + '&encryption=none&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 					}
-					if (useTrojan) {
+					if (enableTrojan) {
 						links.push('trojan://' + (u.uuid || '') + '@' + otherIp + ':' + otherPortStr + '?path=' + otherDynPath + '&security=' + tlsVal + '&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 					}
 				});
@@ -13110,7 +13325,7 @@ ${COMMON_TOAST_HTML}
 			}
 			const downloadAnchor = document.createElement('a');
 			downloadAnchor.href = dataUrl;
-			downloadAnchor.download = "ZYX_qrcode_" + Date.now() + ".png";
+			downloadAnchor.download = "zeus_qrcode_" + Date.now() + ".png";
 			document.body.appendChild(downloadAnchor);
 			downloadAnchor.click();
 			downloadAnchor.remove();
@@ -13124,10 +13339,10 @@ ${COMMON_TOAST_HTML}
 			toggleQrModal(true, link);
 		}
 		function getFlagEmoji(countryCode) {
-			if (!countryCode) return '<span class="ZYX-flag-globe">🌐</span>';
+			if (!countryCode) return '<span class="zeus-flag-globe">🌐</span>';
 			const cc = String(countryCode).toLowerCase().replace(/[^a-z]/g, '');
-			if (cc.length !== 2) return '<span class="ZYX-flag-globe">🌐</span>';
-			return '<span class="fi fi-' + cc + ' ZYX-flag" title="' + cc.toUpperCase() + '"></span>';
+			if (cc.length !== 2) return '<span class="zeus-flag-globe">🌐</span>';
+			return '<span class="fi fi-' + cc + ' zeus-flag" title="' + cc.toUpperCase() + '"></span>';
 		}
 		function getFlagEmojiText(countryCode) {
 			if (!countryCode) return '🌐';
@@ -13198,9 +13413,9 @@ const flagContainer = document.getElementById('display-flag');
 				} catch(e) {}
 				return flagSvg;
 			}
-			return '<span class="ZYX-flag-globe">🌐</span>';
+			return '<span class="zeus-flag-globe">🌐</span>';
 		})
-		.catch(() => '<span class="ZYX-flag-globe">🌐</span>');
+		.catch(() => '<span class="zeus-flag-globe">🌐</span>');
 	})).then(flags => {
 		flagContainer.innerHTML = flags.join(' ');
 	});
