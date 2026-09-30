@@ -168,7 +168,7 @@ async function syncAllVipProxies() {
 	return { countries, perCountry, totalCountries: countries.length, totalProxies, fetchedAt: now };
 }
 // Both update endpoints (/api/update-panel, /api/update-panel-github) upload the fetched file to
-// Cloudflare unchanged, as an ES module (main_module: "zeus.js"). The plain decoded source (vX_Y.js)
+// Cloudflare unchanged, as an ES module (main_module: "ZYX.js"). The plain decoded source (vX_Y.js)
 // is only a function BODY that ends with a top-level "return" of the worker object - it is not a
 // module (no default export, and a top-level return is illegal in a module), so Cloudflare refuses it.
 // Only the obfuscated stub (import ... + default export) or a real module can be deployed this way.
@@ -185,7 +185,7 @@ async function checkAutoResets(env, ctx) {
 	if (now - localLastAutoResetCheck < 3600000) return;
 	try {
 		const cache = caches.default;
-		const cacheReq = new Request("https://internal.zeus/auto_reset");
+		const cacheReq = new Request("https://internal.ZYX/auto_reset");
 		if (await cache.match(cacheReq)) return;
 		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_auto_reset_check'").first();
 		const dbLastCheck = row ? parseInt(row.value) || 0 : 0;
@@ -237,7 +237,7 @@ const GLOBAL_REQ_LIMIT_CACHE_TTL_SECONDS = 60;
 // لازمه: نزدیکی به سقف، جایی که دقت بیشتر اهمیت داره.
 const GLOBAL_REQ_LIMIT_CF_CHECK_THRESHOLD_RATIO = 0.9;
 function globalReqLimitCacheRequest() {
-	return new Request("https://internal.zeus/global_req_limit_status");
+	return new Request("https://internal.ZYX/global_req_limit_status");
 }
 async function isGlobalReqLimitReached(env, ctx) {
 	try {
@@ -339,7 +339,7 @@ function recordDailyTraffic(env, ctx, deltaGb) {
 // writes would erase most of the D1-read savings for close to no real benefit.
 const USER_AUTH_CACHE_TTL_SECONDS = 10;
 function userAuthCacheRequest(kind, key) {
-	return new Request(`https://internal.zeus/user_auth/${kind}/${encodeURIComponent(String(key))}`);
+	return new Request(`https://internal.ZYX/user_auth/${kind}/${encodeURIComponent(String(key))}`);
 }
 async function getCachedAuthUser(kind, key) {
 	if (!key) return undefined;
@@ -811,7 +811,7 @@ async function mergePinnedLocationsForUser(existingProxyList, pinnedLocations) {
 // modal is saved. The modal only keeps the bare proxy string of each slot (populateUserFormFields
 // drops the `country` tag) and posts user_socks5 back as a plain string / array of strings, so
 // without this every "save" - whatever field was changed - wiped every country tag, and
-// getSelectedUserProxy() (which matches /XYZ/<country-code> against slot.country) then found
+// getSelectedUserProxy() (which matches /ZYX/<country-code> against slot.country) then found
 // nothing and the config silently fell back to a direct/Cloudflare connection.
 // Every incoming string that is identical to a tagged slot already stored for this user gets that
 // slot's country back (each stored slot is consumed once, so duplicated proxy strings can't steal
@@ -1238,18 +1238,18 @@ const __WORKER_EXPORT__ = {
 };
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
-    <radialGradient id="zeusBg" cx="50%" cy="50%" r="50%">
+    <radialGradient id="ZYXBg" cx="50%" cy="50%" r="50%">
       <stop offset="0%" stop-color="#0e2348"/>
       <stop offset="100%" stop-color="#020617"/>
     </radialGradient>
-    <filter id="zeusGlow" x="-20%" y="-20%" width="140%" height="140%">
+    <filter id="ZYXGlow" x="-20%" y="-20%" width="140%" height="140%">
       <feDropShadow dx="0" dy="0" stdDeviation="16" flood-color="#3b82f6" flood-opacity="0.6"/>
     </filter>
   </defs>
   <rect width="512" height="512" rx="128" fill="#000000"/>
-  <rect x="48" y="48" width="416" height="416" rx="96" fill="url(#zeusBg)" stroke="#3b82f6" stroke-width="16" filter="url(#zeusGlow)"/>
+  <rect x="48" y="48" width="416" height="416" rx="96" fill="url(#ZYXBg)" stroke="#3b82f6" stroke-width="16" filter="url(#ZYXGlow)"/>
   <rect x="56" y="56" width="400" height="400" rx="88" fill="none" stroke="#60a5fa" stroke-width="4" stroke-opacity="0.4"/>
-  <g transform="translate(128, 128) scale(10.666)" filter="url(#zeusGlow)">
+  <g transform="translate(128, 128) scale(10.666)" filter="url(#ZYXGlow)">
     <path d="M13 10V3L4 14h7v7l9-11h-7z" fill="#38bdf8" fill-opacity="0.3" stroke="#60a5fa" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
   </g>
 </svg>`;
@@ -1273,7 +1273,7 @@ const PWA_MANIFEST = JSON.stringify({
 			purpose: "any maskable"
 		},
 		{
-			src: "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20512%20512%22%20width%3D%22512%22%20height%3D%22512%22%3E%0A%20%20%3Cdefs%3E%0A%20%20%20%20%3CradialGradient%20id%3D%22zeusBg%22%20cx%3D%2250%25%22%20cy%3D%2250%25%22%20r%3D%2250%25%22%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%230e2348%22%2F%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%23020617%22%2F%3E%0A%20%20%20%20%3C%2FradialGradient%3E%0A%20%20%20%20%3Cfilter%20id%3D%22zeusGlow%22%20x%3D%22-20%25%22%20y%3D%22-20%25%22%20width%3D%22140%25%22%20height%3D%22140%25%22%3E%0A%20%20%20%20%20%20%3CfeDropShadow%20dx%3D%220%22%20dy%3D%220%22%20stdDeviation%3D%2216%22%20flood-color%3D%22%233b82f6%22%20flood-opacity%3D%220.6%22%2F%3E%0A%20%20%20%20%3C%2Ffilter%3E%0A%20%20%3C%2Fdefs%3E%0A%20%20%3Crect%20width%3D%22512%22%20height%3D%22512%22%20rx%3D%22128%22%20fill%3D%22%23000000%22%2F%3E%0A%20%20%3Crect%20x%3D%2248%22%20y%3D%2248%22%20width%3D%22416%22%20height%3D%22416%22%20rx%3D%2296%22%20fill%3D%22url(%23zeusBg)%22%20stroke%3D%22%233b82f6%22%20stroke-width%3D%2216%22%20filter%3D%22url(%23zeusGlow)%22%2F%3E%0A%20%20%3Crect%20x%3D%2256%22%20y%3D%2256%22%20width%3D%22400%22%20height%3D%22400%22%20rx%3D%2288%22%20fill%3D%22none%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%224%22%20stroke-opacity%3D%220.4%22%2F%3E%0A%20%20%3Cg%20transform%3D%22translate(128%2C%20128)%20scale(10.666)%22%20filter%3D%22url(%23zeusGlow)%22%3E%0A%20%20%20%20%3Cpath%20d%3D%22M13%2010V3L4%2014h7v7l9-11h-7z%22%20fill%3D%22%2338bdf8%22%20fill-opacity%3D%220.3%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%221.6%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%20%20%3C%2Fg%3E%0A%3C%2Fsvg%3E",
+			src: "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20512%20512%22%20width%3D%22512%22%20height%3D%22512%22%3E%0A%20%20%3Cdefs%3E%0A%20%20%20%20%3CradialGradient%20id%3D%22ZYXBg%22%20cx%3D%2250%25%22%20cy%3D%2250%25%22%20r%3D%2250%25%22%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%230e2348%22%2F%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%23020617%22%2F%3E%0A%20%20%20%20%3C%2FradialGradient%3E%0A%20%20%20%20%3Cfilter%20id%3D%22ZYXGlow%22%20x%3D%22-20%25%22%20y%3D%22-20%25%22%20width%3D%22140%25%22%20height%3D%22140%25%22%3E%0A%20%20%20%20%20%20%3CfeDropShadow%20dx%3D%220%22%20dy%3D%220%22%20stdDeviation%3D%2216%22%20flood-color%3D%22%233b82f6%22%20flood-opacity%3D%220.6%22%2F%3E%0A%20%20%20%20%3C%2Ffilter%3E%0A%20%20%3C%2Fdefs%3E%0A%20%20%3Crect%20width%3D%22512%22%20height%3D%22512%22%20rx%3D%22128%22%20fill%3D%22%23000000%22%2F%3E%0A%20%20%3Crect%20x%3D%2248%22%20y%3D%2248%22%20width%3D%22416%22%20height%3D%22416%22%20rx%3D%2296%22%20fill%3D%22url(%23ZYXBg)%22%20stroke%3D%22%233b82f6%22%20stroke-width%3D%2216%22%20filter%3D%22url(%23ZYXGlow)%22%2F%3E%0A%20%20%3Crect%20x%3D%2256%22%20y%3D%2256%22%20width%3D%22400%22%20height%3D%22400%22%20rx%3D%2288%22%20fill%3D%22none%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%224%22%20stroke-opacity%3D%220.4%22%2F%3E%0A%20%20%3Cg%20transform%3D%22translate(128%2C%20128)%20scale(10.666)%22%20filter%3D%22url(%23ZYXGlow)%22%3E%0A%20%20%20%20%3Cpath%20d%3D%22M13%2010V3L4%2014h7v7l9-11h-7z%22%20fill%3D%22%2338bdf8%22%20fill-opacity%3D%220.3%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%221.6%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%20%20%3C%2Fg%3E%0A%3C%2Fsvg%3E",
 			sizes: "192x192 512x512",
 			type: "image/svg+xml",
 			purpose: "any maskable"
@@ -1282,7 +1282,7 @@ const PWA_MANIFEST = JSON.stringify({
 	categories: ["utilities", "productivity"]
 });
 const PWA_SERVICE_WORKER = `
-const CACHE_NAME = "zeus-pwa-cache-v1";
+const CACHE_NAME = "ZYX-pwa-cache-v1";
 const STATIC_ASSETS = [
 	"https://cdn.tailwindcss.com",
 	"https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js",
@@ -1671,7 +1671,7 @@ const Router = {
 			try {
 				const cfHeaders = {
 					Authorization: "Bearer " + currentToken,
-					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZeusPanel/1.0",
+					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZYXPanel/1.0",
 				};
 				if (!currentAccountId) {
 					const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: cfHeaders });
@@ -1716,14 +1716,14 @@ const Router = {
 				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
 				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
 				const metadata = {
-					main_module: "zeus.js",
+					main_module: "ZYX.js",
 					compatibility_date: "2026-07-10",
 					compatibility_flags: ["nodejs_compat"],
 					bindings: newBindings,
 				};
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
-				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
+				formData.append("ZYX.js", new Blob([newCode], { type: "application/javascript+module" }), "ZYX.js");
 				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
 					method: "PUT",
 					headers: cfHeaders,
@@ -1756,7 +1756,7 @@ const Router = {
 			try {
 				const cfHeaders = {
 					Authorization: "Bearer " + currentToken,
-					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZeusPanel/1.0",
+					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZYXPanel/1.0",
 				};
 				if (!currentAccountId) {
 					const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: cfHeaders });
@@ -1803,14 +1803,14 @@ const Router = {
 				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
 				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
 				const metadata = {
-					main_module: "zeus.js",
+					main_module: "ZYX.js",
 					compatibility_date: "2026-07-10",
 					compatibility_flags: ["nodejs_compat"],
 					bindings: newBindings,
 				};
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
-				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
+				formData.append("ZYX.js", new Blob([newCode], { type: "application/javascript+module" }), "ZYX.js");
 				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
 					method: "PUT",
 					headers: cfHeaders,
@@ -3262,7 +3262,7 @@ const SubscriptionService = {
 			let rem = user.limit_req - liveUsedReq;
 			remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
 		}
-		const rawPath = "/XYZ";
+		const rawPath = "/ZYX";
 		const subIpSettings = await getSubscriptionIpSettings(env);
 		const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
 		let proxyList = [];
@@ -3356,9 +3356,13 @@ const SubscriptionService = {
 		const connType = String(user.connection_type || "vless").toLowerCase();
 		const enableVless = connType.includes("vless") || connType === "vl" + "e" + "ss" || (!connType.includes("trojan"));
 		const enableTrojan = connType.includes("trojan");
+		let protoCycleIdx = 0;
 		ips.forEach((ip) => {
 			ports.forEach((portStr) => {
 				resolvedProxies.forEach((proxy) => {
+					protoCycleIdx++;
+					const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+					const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 					const isTlsPort = TLS_PORTS.has(portStr);
 					const tlsVal = isTlsPort ? "tls" : "none";
 					let userFrag = "";
@@ -3369,11 +3373,11 @@ const SubscriptionService = {
 						
 					const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 
-					if (enableVless) {
+					if (useVless) {
 						const remark = proxy.flagEmoji;
 						links.push("vl" + "e" + "ss://" + user.uuid + "@" + ip + ":" + portStr + "?path=" + proxy.currentDynPath + "&security=" + tlsVal + "&encryption=none&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
 					}
-					if (enableTrojan) {
+					if (useTrojan) {
 						const trojanRemark = proxy.flagEmoji;
 						links.push("trojan://" + user.uuid + "@" + ip + ":" + portStr + "?path=" + proxy.currentDynPath + "&security=" + tlsVal + "&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(trojanRemark));
 					}
@@ -3393,11 +3397,14 @@ const SubscriptionService = {
 			const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 			const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + buildEarlyDataPathSuffix(user));
 			otherCleanIps.forEach((otherIp, otherIdx) => {
+				protoCycleIdx++;
+				const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+				const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 				const remark = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
-				if (enableVless) {
+				if (useVless) {
 					links.push("vl" + "e" + "ss://" + user.uuid + "@" + otherIp + ":" + otherPortStr + "?path=" + otherDynPath + "&security=" + tlsVal + "&encryption=none&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
 				}
-				if (enableTrojan) {
+				if (useTrojan) {
 					links.push("trojan://" + user.uuid + "@" + otherIp + ":" + otherPortStr + "?path=" + otherDynPath + "&security=" + tlsVal + "&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
 				}
 			});
@@ -3442,7 +3449,7 @@ const SubscriptionService = {
 		}
 		const ports = String(user.port || "443").split(",").map((p) => p.trim()).filter((p) => p.length > 0);
 		const fp = user.fingerprint || "chrome";
-		const rawPath = "/XYZ";
+		const rawPath = "/ZYX";
 		const subIpSettings = await getSubscriptionIpSettings(env);
 		const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
 
@@ -3474,19 +3481,23 @@ const SubscriptionService = {
 		const enableTrojan = connType.includes("trojan");
 
 		let locIdx = 0;
+		let protoCycleIdx = 0;
 		for (let proxyItem of proxyList) {
 			const countryCode = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.country : "";
 			const currentDynPath = rawPath + (proxyItem !== null && proxyItem !== "" ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment);
 			ips.forEach((ip) => {
 				ports.forEach((portStr) => {
+					protoCycleIdx++;
+					const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+					const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 					const isTlsPort = TLS_PORTS.has(portStr);
 					const sni = user.tls_mask || host;
 					const safeFp = (fp === "unsafe") ? "chrome" : fp;
 					
-					if (enableVless) {
+					if (useVless) {
 						let outbound = {
 							type: "vless",
-							tag: `ZEUS-VLESS-${ip}-${portStr}-loc${locIdx}`,
+							tag: `ZYX-VLESS-${ip}-${portStr}-loc${locIdx}`,
 							server: ip,
 							server_port: parseInt(portStr),
 							uuid: user.uuid,
@@ -3509,10 +3520,10 @@ const SubscriptionService = {
 						applySingboxEarlyData(outbound.transport, user);
 						outbounds.push(outbound);
 					}
-					if (enableTrojan) {
+					if (useTrojan) {
 						let outbound = {
 							type: "trojan",
-							tag: `ZEUS-Trojan-${ip}-${portStr}-loc${locIdx}`,
+							tag: `ZYX-Trojan-${ip}-${portStr}-loc${locIdx}`,
 							server: ip,
 							server_port: parseInt(portStr),
 							password: user.uuid,
@@ -3547,8 +3558,11 @@ const SubscriptionService = {
 			const safeFp = (fp === "unsafe") ? "chrome" : fp;
 			const otherDynPath = rawPath + inlineProxySegment;
 			otherCleanIps.forEach((otherIp, otherIdx) => {
+				protoCycleIdx++;
+				const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+				const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 				const flagTag = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
-				if (enableVless) {
+				if (useVless) {
 					let outbound = {
 						type: "vless",
 						tag: flagTag + (enableTrojan ? " (VLESS)" : ""),
@@ -3564,7 +3578,7 @@ const SubscriptionService = {
 					applySingboxEarlyData(outbound.transport, user);
 					outbounds.push(outbound);
 				}
-				if (enableTrojan) {
+				if (useTrojan) {
 					let outbound = {
 						type: "trojan",
 						tag: flagTag + (enableVless ? " (Trojan)" : ""),
@@ -3719,12 +3733,12 @@ async function flushExpiredTraffic(env) {
 	}
 }
 // Decodes an optional trailing path segment shaped like base64(JSON), e.g. the
-// segment after "/XYZ/" in ".../XYZ/eyJqdW5rIjoi...". The JSON looks like
+// segment after "/ZYX/" in ".../ZYX/eyJqdW5rIjoi...". The JSON looks like
 // {"junk":"...","protocol":"vl","mode":"proxyip","panelIPs":["1.2.3.4"]}.
 // This lets one specific config link carry its own ProxyIP fallback list
 // inline, instead of relying only on this user's stored user_proxy_ip/user_socks5.
 // Anything that isn't valid base64/JSON in this exact shape returns null, so
-// ordinary paths ("/XYZ", "/XYZ/loc-3", "/XYZ/K-a-z", ...) are unaffected.
+// ordinary paths ("/ZYX", "/ZYX/loc-3", "/ZYX/K-a-z", ...) are unaffected.
 // Reuses the same private/reserved-address filter as the real destination check
 // above, so this can't be used to make the worker connect out to an internal address.
 const INLINE_PANEL_IP_BLOCKED_RE = /^(0\.|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|localhost$|::1|::ffff:|fd[0-9a-f]{2}:|fe80:)/i;
@@ -4291,7 +4305,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			reqUUID = user.uuid;
 			if (request) {
 				const reqUrl = new URL(request.url);
-				if (!reqUrl.pathname.startsWith("/XYZ")) {
+				if (!reqUrl.pathname.startsWith("/ZYX")) {
 					serverSock.close();
 					return;
 				}
@@ -5705,7 +5719,7 @@ const COMMON_HEAD = `
 	<meta name="mobile-web-app-capable" content="yes">
 	<meta name="apple-mobile-web-app-capable" content="yes">
 	<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-	<meta name="apple-mobile-web-app-title" content="ZEUS Panel">
+	<meta name="apple-mobile-web-app-title" content="ZYX Panel">
 	<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
 	<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/lipis/flag-icons@7.3.2/css/flag-icons.min.css">
 	<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700&display=swap" rel="stylesheet">
@@ -5882,7 +5896,7 @@ Commercial support is available at
 			<h2 class="text-lg font-bold mb-4 text-center text-gray-900 dark:text-zinc-100">بازیابی رمز پـنـل</h2>
 			<div class="mb-5 p-3.5 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/60 rounded-md text-xs leading-relaxed text-amber-800 dark:text-amber-300">
 				برای احراز هویت و اثبات مالکیت پـنـل، از طریق دکمه زیر وارد کلودفلر شوید و توکن دریافتی را کپی کرده و در کادر زیر وارد کنید.
-				<a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-white dark:bg-amoled-input border border-amber-300 dark:border-amber-800 text-amber-800 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/50 rounded-md font-semibold transition">
+				<a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=ZYX-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-white dark:bg-amoled-input border border-amber-300 dark:border-amber-800 text-amber-800 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/50 rounded-md font-semibold transition">
 					<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
 					دریافت توکن
 				</a>
@@ -6004,7 +6018,7 @@ Commercial support is available at
 			letter-spacing: 0.03em;
 			opacity: 0.9;
 		}
-		.zeus-flag {
+		.ZYX-flag {
 			display: inline-block;
 			width: 1.35em;
 			height: 1em;
@@ -6014,7 +6028,7 @@ Commercial support is available at
 			background-position: 50%;
 			background-repeat: no-repeat;
 		}
-		.zeus-flag-globe {
+		.ZYX-flag-globe {
 			font-size: 1.1em;
 			line-height: 1;
 			vertical-align: -0.05em;
@@ -6697,7 +6711,7 @@ Commercial support is available at
 		
 		<div class="flex flex-col gap-2 mt-auto">
 			<div class="flex flex-col sm:flex-row gap-2 w-full">
-				<button onclick="downloadZeusSource()" class="flex-1 py-2 bg-blue-700 hover:bg-blue-800 dark:bg-blue-600 dark:hover:bg-blue-700 text-white font-bold rounded-md text-[11px] transition duration-300 shadow-sm flex items-center justify-center gap-1.5">
+				<button onclick="downloadZYXSource()" class="flex-1 py-2 bg-blue-700 hover:bg-blue-800 dark:bg-blue-600 dark:hover:bg-blue-700 text-white font-bold rounded-md text-[11px] transition duration-300 shadow-sm flex items-center justify-center gap-1.5">
 					<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"></path></svg>
 					دریافت سورس‌کد
 				</button>
@@ -6909,7 +6923,7 @@ Commercial support is available at
 									<span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
 										<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
 									</span>
-									<input type="text" id="input-name" placeholder="zeus" dir="ltr" class="w-full pl-3 pr-9 py-2.5 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400 transition shadow-sm">
+									<input type="text" id="input-name" placeholder="ZYX" dir="ltr" class="w-full pl-3 pr-9 py-2.5 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400 transition shadow-sm">
 								</div>
 							</div>
 
@@ -8056,7 +8070,7 @@ Commercial support is available at
 			<div class="mb-5 p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 rounded-md text-xs leading-relaxed text-orange-800 dark:text-orange-300 font-medium">
 				توکن کلودفلر شما در این پـنـل ذخیره نشده است. برای فعال‌سازی آپدیت خودکار از داخل پـنـل، لطفاً توکن خود را دریافت کرده و در کادر زیر وارد کنید.
 			</div>
-			<a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="flex items-center justify-center gap-2 w-full py-3 bg-[#d94800] hover:bg-[#e35802] text-white font-bold rounded-md text-sm transition duration-300 mb-4 shadow-md shadow-orange-500/20">
+			<a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=ZYX-Deployer-Token" target="_blank" class="flex items-center justify-center gap-2 w-full py-3 bg-[#d94800] hover:bg-[#e35802] text-white font-bold rounded-md text-sm transition duration-300 mb-4 shadow-md shadow-orange-500/20">
 				<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
 				دریافت توکن کلودفلر
 			</a>
@@ -8111,7 +8125,7 @@ Commercial support is available at
 			<p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
 				آپدیت با موفقیت انجام شد. صفحه تا ۱۰ ثانیه دیگر به‌طور خودکار رفرش می‌شود تا تغییرات اعمال گردند.
 			</p>
-			<button onclick="sessionStorage.setItem('zeus_last_update', Date.now()); window.location.href = window.location.pathname + '?t=' + Date.now()" class="w-full py-3.5 bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white font-black rounded-md text-sm transition duration-300 shadow-lg">
+			<button onclick="sessionStorage.setItem('ZYX_last_update', Date.now()); window.location.href = window.location.pathname + '?t=' + Date.now()" class="w-full py-3.5 bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white font-black rounded-md text-sm transition duration-300 shadow-lg">
 				رفرش فوری صفحه
 			</button>
 		</div>
@@ -8769,7 +8783,7 @@ let activeRocketBtn = null;
 						successCard.classList.remove('opacity-0', 'scale-95');
 						successCard.classList.add('opacity-100', 'scale-100');
 						setTimeout(() => {
-							sessionStorage.setItem('zeus_last_update', Date.now());
+							sessionStorage.setItem('ZYX_last_update', Date.now());
 							window.location.href = window.location.pathname + '?t=' + Date.now();
 						}, 10000);
 					} else {
@@ -8958,7 +8972,7 @@ let activeRocketBtn = null;
 					return true;
 				});
 			}
-			const customOrderStr = localStorage.getItem('zeus_users_custom_order');
+			const customOrderStr = localStorage.getItem('ZYX_users_custom_order');
 			let customOrder = [];
 			try { customOrder = JSON.parse(customOrderStr || '[]'); } catch(e) {}
 			filtered.sort((a, b) => {
@@ -9279,7 +9293,7 @@ let activeRocketBtn = null;
 					onEnd: function (evt) {
 						window.isDraggingRow = false;
 						const newOrder = Array.from(evt.to.children).map(tr => tr.getAttribute('data-username')).filter(Boolean);
-						localStorage.setItem('zeus_users_custom_order', JSON.stringify(newOrder));
+						localStorage.setItem('ZYX_users_custom_order', JSON.stringify(newOrder));
 					}
 				});
 			}
@@ -9428,7 +9442,7 @@ let activeRocketBtn = null;
 				'</div>' +
 				'<div class="flex items-start gap-2.5 p-2.5 bg-blue-50/50 dark:bg-blue-950/20 rounded-lg border border-blue-200/50 dark:border-blue-900/30">' +
 					'<span class="w-2 h-2 rounded-full bg-blue-500 flex-shrink-0 mt-1.5"></span>' +
-					'<span><b>یا</b> از منوی سه نقطه (⋮) گزینه <b>«Install ZEUS Panel»</b> را انتخاب نمایید.</span>' +
+					'<span><b>یا</b> از منوی سه نقطه (⋮) گزینه <b>«Install ZYX Panel»</b> را انتخاب نمایید.</span>' +
 				'</div>';
 			}
 		}
@@ -9889,7 +9903,7 @@ function toggleInfoModal(show) {
 		if (innerBox) innerBox.classList.add('opacity-0', 'scale-95');
 	}
 }
-function downloadZeusSource() {
+function downloadZYXSource() {
 	const p1 = "https://hop";
 	const p2 = "limit.shop";
 	const p3 = "/Source.js";
@@ -9906,7 +9920,7 @@ function downloadZeusSource() {
 			const downloadUrl = URL.createObjectURL(blob);
 			const hiddenLink = document.createElement('a');
 			hiddenLink.href = downloadUrl;
-			hiddenLink.download = 'Zeus-Source.js';
+			hiddenLink.download = 'ZYX-Source.js';
 			document.body.appendChild(hiddenLink);
 			hiddenLink.click();
 			document.body.removeChild(hiddenLink);
@@ -10228,7 +10242,7 @@ function downloadZeusSource() {
 				let rem = user.limit_req - (user.used_req || 0);
 				remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
 			}
-			const rawPath = "/XYZ";
+			const rawPath = "/ZYX";
 			const inlineProxySegment = (typeof window.buildInlineProxyIpSegment === 'function') ? window.buildInlineProxyIpSegment(window.INLINE_PROXY_IP) : "";
 			// Same ISO 3166-1 alpha-2 -> alpha-3 table as the server-side one (see
 			// getLocationPathSegment() near the top of the worker source) -
@@ -10327,9 +10341,13 @@ function downloadZeusSource() {
 			const userConnType = String(user.connection_type || 'vless').toLowerCase();
 			const enableVless = userConnType.includes('vless') || userConnType === 'vl' + 'e' + 'ss' || (!userConnType.includes('trojan'));
 			const enableTrojan = userConnType.includes('trojan');
+			let protoCycleIdx = 0;
 			ips.forEach((ip) => {
 				ports.forEach((portStr) => {
 					resolvedProxies.forEach((proxy) => {
+						protoCycleIdx++;
+						const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+						const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 						const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
 						const tlsVal = isTlsPort ? "tls" : "none";
 						let userFrag = "";
@@ -10340,11 +10358,11 @@ function downloadZeusSource() {
 						
 						const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 
-						if (enableVless) {
+						if (useVless) {
 							const remark = proxy.flagEmoji;
 							links.push('vle' + 'ss://' + (user.uuid || '') + '@' + ip + ':' + portStr + '?path=' + proxy.currentDynPath + '&security=' + tlsVal + '&encryption=none&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 						}
-						if (enableTrojan) {
+						if (useTrojan) {
 							const trojanRemark = proxy.flagEmoji;
 							links.push('trojan://' + (user.uuid || '') + '@' + ip + ':' + portStr + '?path=' + proxy.currentDynPath + '&security=' + tlsVal + '&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(trojanRemark));
 						}
@@ -10364,11 +10382,14 @@ function downloadZeusSource() {
 				const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + edSuffix);
 				otherCleanIps.forEach(function(otherIp, otherIdx) {
+					protoCycleIdx++;
+					const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+					const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 					const remark = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
-					if (enableVless) {
+					if (useVless) {
 						links.push('vle' + 'ss://' + (user.uuid || '') + '@' + otherIp + ':' + otherPortStr + '?path=' + otherDynPath + '&security=' + tlsVal + '&encryption=none&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 					}
-					if (enableTrojan) {
+					if (useTrojan) {
 						links.push('trojan://' + (user.uuid || '') + '@' + otherIp + ':' + otherPortStr + '?path=' + otherDynPath + '&security=' + tlsVal + '&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 					}
 				});
@@ -10448,7 +10469,7 @@ function downloadZeusSource() {
 			}
 			const downloadAnchor = document.createElement('a');
 			downloadAnchor.href = dataUrl;
-			downloadAnchor.download = "zeus_qrcode_" + Date.now() + ".png";
+			downloadAnchor.download = "ZYX_qrcode_" + Date.now() + ".png";
 			document.body.appendChild(downloadAnchor);
 			downloadAnchor.click();
 			downloadAnchor.remove();
@@ -10634,10 +10655,10 @@ function editUser(encodedUsername) {
 			}
 		}
 		function getFlagEmoji(countryCode) {
-			if (!countryCode) return '<span class="zeus-flag-globe">🌐</span>';
+			if (!countryCode) return '<span class="ZYX-flag-globe">🌐</span>';
 			const cc = String(countryCode).toLowerCase().replace(/[^a-z]/g, '');
-			if (cc.length !== 2) return '<span class="zeus-flag-globe">🌐</span>';
-			return '<span class="fi fi-' + cc + ' zeus-flag" title="' + cc.toUpperCase() + '"></span>';
+			if (cc.length !== 2) return '<span class="ZYX-flag-globe">🌐</span>';
+			return '<span class="fi fi-' + cc + ' ZYX-flag" title="' + cc.toUpperCase() + '"></span>';
 		}
 		function getFlagEmojiText(countryCode) {
 			if (!countryCode) return '🌐';
@@ -11550,7 +11571,7 @@ async function testUserSocksProxy() {
 					String(now.getMinutes()).padStart(2, '0') + '-' + 
 					String(now.getSeconds()).padStart(2, '0');
 				downloadAnchor.setAttribute("href", dataStr);
-				downloadAnchor.setAttribute("download", "zeus_users_backup_" + host + "_" + dateTimeStr + ".json");
+				downloadAnchor.setAttribute("download", "ZYX_users_backup_" + host + "_" + dateTimeStr + ".json");
 				document.body.appendChild(downloadAnchor);
 				downloadAnchor.click();
 				downloadAnchor.remove();
@@ -11831,7 +11852,7 @@ const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 					const badge = document.getElementById('update-badge');
 					if (badge) badge.remove();
 					if (window.autoUpdateStatusCache && !isManual) {
-						const lastUp = parseInt(sessionStorage.getItem('zeus_last_update') || '0', 10);
+						const lastUp = parseInt(sessionStorage.getItem('ZYX_last_update') || '0', 10);
 						if (Date.now() - lastUp < 180000) return;
 						showToast('نسخه جدید یافت شد. در حال آپدیت خودکار...');
 						await applyUpdate();
@@ -12171,15 +12192,15 @@ function applySelectedIps() {
 			};
 			window.changeRefreshRate = function(val) {
 				const ms = parseInt(val, 10);
-				localStorage.setItem('zeus_refresh_rate', ms);
+				localStorage.setItem('ZYX_refresh_rate', ms);
 				window.startRefreshInterval(ms);
 				showToast('نرخ رفرش پـنـل تغییر کرد');
 			};
-			if (!localStorage.getItem('zeus_rate_migrated_to_10m')) {
-				localStorage.setItem('zeus_refresh_rate', '600000');
-				localStorage.setItem('zeus_rate_migrated_to_10m', 'true');
+			if (!localStorage.getItem('ZYX_rate_migrated_to_10m')) {
+				localStorage.setItem('ZYX_refresh_rate', '600000');
+				localStorage.setItem('ZYX_rate_migrated_to_10m', 'true');
 			}
-			const savedRate = localStorage.getItem('zeus_refresh_rate');
+			const savedRate = localStorage.getItem('ZYX_refresh_rate');
 			const initialRate = savedRate ? parseInt(savedRate, 10) : 600000;
 			const selectEl = document.getElementById('refresh-rate-select');
 			if (selectEl) {
@@ -12805,7 +12826,7 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 			background: rgba(17, 26, 46, 0.75);
 			border: 1px solid rgba(255, 255, 255, 0.06);
 		}
-		.zeus-flag {
+		.ZYX-flag {
 			display: inline-block;
 			width: 1.35em;
 			height: 1em;
@@ -12815,7 +12836,7 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 			background-position: 50%;
 			background-repeat: no-repeat;
 		}
-		.zeus-flag-globe {
+		.ZYX-flag-globe {
 			font-size: 1.1em;
 			line-height: 1;
 			vertical-align: -0.05em;
@@ -13109,7 +13130,7 @@ ${COMMON_TOAST_HTML}
 				let rem = u.limit_req - (u.used_req || 0);
 				remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
 			}
-			const rawPath = "/XYZ";
+			const rawPath = "/ZYX";
 			const inlineProxySegment = buildInlineProxyIpSegment(window.INLINE_PROXY_IP);
 			// Same ISO 3166-1 alpha-2 -> alpha-3 table as the server-side one (see
 			// getLocationPathSegment() near the top of the worker source) -
@@ -13208,9 +13229,13 @@ ${COMMON_TOAST_HTML}
 			const userConnType = String(u.connection_type || 'vless').toLowerCase();
 			const enableVless = userConnType.includes('vless') || userConnType === 'vl' + 'e' + 'ss' || (!userConnType.includes('trojan'));
 			const enableTrojan = userConnType.includes('trojan');
+			let protoCycleIdx = 0;
 			ips.forEach((ip) => {
 				ports.forEach((portStr) => {
 					resolvedProxies.forEach((proxy) => {
+						protoCycleIdx++;
+						const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+						const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 						const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
 						const tlsVal = isTlsPort ? "tls" : "none";
 						let userFrag = "";
@@ -13221,11 +13246,11 @@ ${COMMON_TOAST_HTML}
 						
 						const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 
-						if (enableVless) {
+						if (useVless) {
 							const remark = proxy.flagEmoji;
 							links.push('vle' + 'ss://' + (u.uuid || '') + '@' + ip + ':' + portStr + '?path=' + proxy.currentDynPath + '&security=' + tlsVal + '&encryption=none&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 						}
-						if (enableTrojan) {
+						if (useTrojan) {
 							const trojanRemark = proxy.flagEmoji;
 							links.push('trojan://' + (u.uuid || '') + '@' + ip + ':' + portStr + '?path=' + proxy.currentDynPath + '&security=' + tlsVal + '&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(trojanRemark));
 						}
@@ -13245,11 +13270,14 @@ ${COMMON_TOAST_HTML}
 				const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + edSuffix);
 				otherCleanIps.forEach(function(otherIp, otherIdx) {
+					protoCycleIdx++;
+					const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+					const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
 					const remark = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
-					if (enableVless) {
+					if (useVless) {
 						links.push('vle' + 'ss://' + (u.uuid || '') + '@' + otherIp + ':' + otherPortStr + '?path=' + otherDynPath + '&security=' + tlsVal + '&encryption=none&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 					}
-					if (enableTrojan) {
+					if (useTrojan) {
 						links.push('trojan://' + (u.uuid || '') + '@' + otherIp + ':' + otherPortStr + '?path=' + otherDynPath + '&security=' + tlsVal + '&host=' + host + '&type=ws' + tlsParams + userFrag + '#' + encodeURIComponent(remark));
 					}
 				});
@@ -13325,7 +13353,7 @@ ${COMMON_TOAST_HTML}
 			}
 			const downloadAnchor = document.createElement('a');
 			downloadAnchor.href = dataUrl;
-			downloadAnchor.download = "zeus_qrcode_" + Date.now() + ".png";
+			downloadAnchor.download = "ZYX_qrcode_" + Date.now() + ".png";
 			document.body.appendChild(downloadAnchor);
 			downloadAnchor.click();
 			downloadAnchor.remove();
@@ -13339,10 +13367,10 @@ ${COMMON_TOAST_HTML}
 			toggleQrModal(true, link);
 		}
 		function getFlagEmoji(countryCode) {
-			if (!countryCode) return '<span class="zeus-flag-globe">🌐</span>';
+			if (!countryCode) return '<span class="ZYX-flag-globe">🌐</span>';
 			const cc = String(countryCode).toLowerCase().replace(/[^a-z]/g, '');
-			if (cc.length !== 2) return '<span class="zeus-flag-globe">🌐</span>';
-			return '<span class="fi fi-' + cc + ' zeus-flag" title="' + cc.toUpperCase() + '"></span>';
+			if (cc.length !== 2) return '<span class="ZYX-flag-globe">🌐</span>';
+			return '<span class="fi fi-' + cc + ' ZYX-flag" title="' + cc.toUpperCase() + '"></span>';
 		}
 		function getFlagEmojiText(countryCode) {
 			if (!countryCode) return '🌐';
@@ -13413,9 +13441,9 @@ const flagContainer = document.getElementById('display-flag');
 				} catch(e) {}
 				return flagSvg;
 			}
-			return '<span class="zeus-flag-globe">🌐</span>';
+			return '<span class="ZYX-flag-globe">🌐</span>';
 		})
-		.catch(() => '<span class="zeus-flag-globe">🌐</span>');
+		.catch(() => '<span class="ZYX-flag-globe">🌐</span>');
 	})).then(flags => {
 		flagContainer.innerHTML = flags.join(' ');
 	});
