@@ -769,6 +769,124 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 	}
 }
 
+// ==================== «بررسی کشورهای سالم» (دکمه‌ی کنار «افزودن» در تنظیمات لوکیشن‌ها) ====================
+// هدف: برخلاف testVipCountryProxy (که فقط برای یک کشور از پیش شناخته‌شده صداست)، اینجا اول باید
+// خودِ کشورهای کاندید رو کشف کنیم - چون میرور ۴ (ریپوی شخصی hmditts/XYD-Panel) هیچ فایل vip-list
+// نداره، تنها راه دیدن proxy_vip/*.txt که فقط اونجاست (مثل FR که ادمین دستی اضافه کرد) یک فچ به
+// GitHub Contents API است. طبق تصمیم صریح ادمین (۲۰۲۶-۰۹-۳۰) این محدود به همین دکمه‌ست، نه
+// syncAllVipProxies/دراپ‌داون همیشگی.
+let HEALTHY_VIP_COUNTRIES_CACHE = null; // { codes: string[], checkedCount: number, checkedAt: number }
+const HEALTHY_VIP_CACHE_TTL = 600000; // ۱۰ دقیقه - طبق خواسته‌ی صریح ادمین: کلیک‌های پشت‌سرهم دوباره کل تست connect را تکرار نکنند
+
+async function fetchPersonalRepoVipCountries() {
+	try {
+		const res = await fetch("https://api.github.com/repos/hmditts/XYD-Panel/contents/proxy_vip", {
+			headers: { "User-Agent": "ChildPanel-VIP-HealthCheck" },
+		});
+		if (!res.ok) return [];
+		const files = await res.json();
+		if (!Array.isArray(files)) return [];
+		return files
+			.map((f) => f && f.name)
+			.filter((name) => typeof name === "string" && name.toLowerCase().endsWith(".txt"))
+			.map((name) => name.slice(0, -4).trim().toUpperCase())
+			.filter((cc) => /^[A-Z]{2}$/.test(cc));
+	} catch (e) {
+		return [];
+	}
+}
+
+// تست سبک «حداقل ۱ آی‌پی زنده دارد یا نه» - نه تست کامل مثل testVipCountryProxy. عمداً حداکثر ۲ خط
+// امتحان می‌شود و این ۲ خط پشت‌سرهم (نه هم‌زمان با Promise.any) تست می‌شوند تا هر کشور حداکثر یک
+// سوکت باز هم‌زمان داشته باشد - چون این تابع خودش در batch های ۵تایی صدا زده می‌شود (پایین‌تر) و
+// سقف واقعی Cloudflare «۶ اتصال هم‌زمان در هر invocation» مستقل از پلن Free/Paid است.
+async function quickCountryHasLiveIp(country) {
+	try {
+		const text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
+		if (!text) return false;
+		const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+		if (lines.length === 0) return false;
+		for (let i = lines.length - 1; i > 0; i--) {
+			const j = Math.floor(Math.random() * (i + 1));
+			[lines[i], lines[j]] = [lines[j], lines[i]];
+		}
+		const candidates = lines.slice(0, 2).map((line) =>
+			line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks") ? line : `socks5://${line}`
+		);
+		for (const p of candidates) {
+			const ok = await new Promise((resolve) => {
+				let sock = null;
+				const timeoutId = setTimeout(() => {
+					try { sock && sock.close(); } catch (e) { }
+					resolve(false);
+				}, 4000);
+				(async () => {
+					try {
+						const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+						sock = await connectProxy(p, "1.1.1.1", 80, payload);
+						const reader = sock.readable.getReader();
+						const readRes = await reader.read();
+						clearTimeout(timeoutId);
+						try { sock.close(); } catch (e) { }
+						resolve(!readRes.done && !!readRes.value);
+					} catch (e) {
+						clearTimeout(timeoutId);
+						try { sock && sock.close(); } catch (err) { }
+						resolve(false);
+					}
+				})();
+			});
+			if (ok) return true; // اولین موفقیت کافیست - خط دوم اصلاً تست نمی‌شود
+		}
+		return false;
+	} catch (e) {
+		return false;
+	}
+}
+
+// دسته‌های ۵تایی و متوالی (نه Promise.all روی کل لیست) تا از سقف ۶ اتصال هم‌زمان Cloudflare رد نشویم.
+async function checkCountriesInBatches(countries, batchSize = 5) {
+	const healthy = [];
+	for (let i = 0; i < countries.length; i += batchSize) {
+		const batch = countries.slice(i, i + batchSize);
+		const results = await Promise.all(batch.map((cc) => quickCountryHasLiveIp(cc)));
+		batch.forEach((cc, idx) => { if (results[idx]) healthy.push(cc); });
+	}
+	return healthy;
+}
+
+// کاندیدها: vip-list رسمی (میرور ۱-۳) + فایل‌های proxy_vip ریپوی شخصی (میرور ۴، از GitHub API) +
+// کلیدهای MANUAL_VIP_PROXIES - یکتا. نتیجه‌ی نهایی ۱۰ دقیقه کش می‌شود.
+async function getHealthyVipCountries(force) {
+	const now = Date.now();
+	if (!force && HEALTHY_VIP_COUNTRIES_CACHE && now - HEALTHY_VIP_COUNTRIES_CACHE.checkedAt < HEALTHY_VIP_CACHE_TTL) {
+		return { ...HEALTHY_VIP_COUNTRIES_CACHE, fromCache: true };
+	}
+	const [officialRes, personalCodes] = await Promise.all([
+		fetchWithFallback("vip-list").catch(() => null),
+		fetchPersonalRepoVipCountries(),
+	]);
+	let officialCodes = [];
+	if (officialRes && officialRes.ok) {
+		try {
+			const files = await officialRes.json();
+			officialCodes = (Array.isArray(files) ? files : [])
+				.map((f) => f && f.name)
+				.filter((name) => typeof name === "string" && name.toLowerCase().endsWith(".txt"))
+				.map((name) => name.slice(0, -4).trim().toUpperCase())
+				.filter((cc) => /^[A-Z]{2}$/.test(cc));
+		} catch (e) { }
+	}
+	const manualCodes = Object.keys(MANUAL_VIP_PROXIES).map((c) => c.toUpperCase());
+	const candidates = [...new Set([...officialCodes, ...personalCodes, ...manualCodes])];
+	const healthy = await checkCountriesInBatches(candidates, 5);
+	healthy.sort();
+	const result = { codes: healthy, checkedCount: candidates.length, checkedAt: now };
+	HEALTHY_VIP_COUNTRIES_CACHE = result;
+	return { ...result, fromCache: false };
+}
+// ==================== پایان «بررسی کشورهای سالم» ====================
+
 // Builds the permanent proxy list for a BRAND-NEW user: one slot per country
 // in `locations` (the current pinned_locations setting - see
 // getPinnedLocationsSetting()), in that exact order, so loc-0..loc-N map to
@@ -2150,6 +2268,22 @@ const Router = {
 					if (fetchedAt === null || entry.timestamp > fetchedAt) fetchedAt = entry.timestamp;
 				}
 				return new Response(JSON.stringify({ success: true, perCountry, totalCountries: Object.keys(perCountry).length, fetchedAt }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		// دکمه‌ی «بررسی کشورهای سالم» کنار «افزودن» در تنظیمات لوکیشن‌ها - کشف کاندیدها از میرور ۱-۳
+		// (vip-list) + میرور ۴ (ریپوی شخصی، GitHub API) + MANUAL_VIP_PROXIES، تست سبک زنده‌بودن، کش ۱۰ دقیقه‌ای.
+		if (url.pathname === "/api/settings/vip-healthy-countries" && request.method === "GET") {
+			try {
+				const force = url.searchParams.get("force") === "1";
+				const result = await getHealthyVipCountries(force);
+				return new Response(JSON.stringify({ success: true, codes: result.codes, checkedCount: result.checkedCount, checkedAt: result.checkedAt, fromCache: result.fromCache }), {
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			} catch (e) {
+				return new Response(JSON.stringify({ error: e.message || "خطا در بررسی کشورهای سالم" }), {
+					status: 502,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
 			}
 		}
 		if (url.pathname === "/api/proxy-ip") {
@@ -7830,8 +7964,9 @@ Commercial support is available at
 						<span id="pinned-locations-count" class="text-[10px] font-normal text-gray-400 dark:text-zinc-500"></span>
 					</label>
 					<div id="pinned-locations-list" class="max-h-48 overflow-y-auto border border-gray-200 dark:border-amoled-border rounded-md bg-white dark:bg-amoled-input mb-2"></div>
-					<div class="flex items-center gap-2">
+					<div class="flex items-center gap-2 flex-wrap">
 						<select id="pinned-location-add-select" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 text-xs font-mono text-center text-gray-800 dark:text-zinc-100"></select>
+						<button type="button" onclick="checkHealthyVipCountries()" id="check-healthy-countries-btn" title="فقط کشورهایی که حداقل ۱ آی‌پی زنده دارند (میرور ۱ یا میرور ۴) را در لیست بالا نشان می‌دهد" class="px-3 py-2 bg-sky-700 hover:bg-sky-800 dark:bg-sky-600 dark:hover:bg-sky-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">🩺 بررسی کشورهای سالم</button>
 						<button type="button" onclick="pinnedLocationAdd()" class="px-3 py-2 bg-gray-600 hover:bg-gray-700 dark:bg-zinc-600 dark:hover:bg-zinc-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">افزودن</button>
 						<button type="button" onclick="savePinnedLocations()" id="save-pinned-locations-btn" class="px-3 py-2 bg-emerald-700 hover:bg-emerald-800 dark:bg-emerald-600 dark:hover:bg-emerald-700 text-white rounded-md text-xs font-bold transition shadow-sm whitespace-nowrap">ذخیره</button>
 					</div>
@@ -11042,6 +11177,53 @@ window.populatePinnedLocationSelects = async function(force) {
 	// حالا که لیست VIP معلوم شد، ⚠ کشورهای پین‌شده‌ی بدون VIP را هم به‌روز کن.
 	if (typeof window.renderPinnedLocationsList === 'function') window.renderPinnedLocationsList();
 };
+// دکمه‌ی «بررسی کشورهای سالم»: برخلاف populatePinnedLocationSelects (که کل vip-list رسمی را بدون
+// تست زنده بودن می‌ریزد تو دراپ‌داون)، این فقط کشورهایی را می‌گذارد که سرور واقعاً حداقل ۱ آی‌پی
+// زنده برایشان پیدا کرده - چه در میرور ۱ (رسمی) چه فقط در میرور ۴ (ریپوی شخصی). چند ثانیه طول
+// می‌کشد چون سرور دارد واقعاً کانکشن باز می‌کند؛ نتیجه ۱۰ دقیقه سمت سرور کش می‌شود.
+window.checkHealthyVipCountries = async function() {
+	const btn = document.getElementById('check-healthy-countries-btn');
+	const select = document.getElementById('pinned-location-add-select');
+	if (btn) { btn.disabled = true; btn.innerText = '⏳ در حال بررسی... (چند ثانیه)'; }
+	if (select) {
+		select.setAttribute('data-vip-state', 'loading');
+		select.innerHTML = '<option value="">در حال بررسی کشورهای سالم...</option>';
+	}
+	try {
+		const res = await fetch('/api/settings/vip-healthy-countries');
+		const data = await res.json();
+		if (!res.ok || !data.success) throw new Error((data && data.error) || 'خطا در بررسی کشورهای سالم');
+		const codes = Array.isArray(data.codes) ? data.codes : [];
+		window.VIP_COUNTRY_CODES = codes; // از این به بعد دراپ‌داون فقط همین کشورهای سالم را نشان می‌دهد
+		if (select) {
+			select.innerHTML = '';
+			if (codes.length === 0) {
+				select.setAttribute('data-vip-state', 'failed');
+				select.innerHTML = '<option value="">هیچ کشور سالمی پیدا نشد</option>';
+			} else {
+				select.setAttribute('data-vip-state', 'ok');
+				select.innerHTML = '<option value="">یک کشور سالم انتخاب کنید...</option>';
+				codes.forEach(function(cc) {
+					const option = document.createElement('option');
+					option.value = cc;
+					const flag = typeof getFlagEmojiText === 'function' ? getFlagEmojiText(cc) : '🌐';
+					option.textContent = flag + ' ' + cc;
+					select.appendChild(option);
+				});
+			}
+		}
+		showToast('✅ از ' + data.checkedCount + ' کشور بررسی‌شده، ' + codes.length + ' تا حداقل ۱ آی‌پی زنده داشتن' + (data.fromCache ? ' (نتیجه‌ی کش‌شده‌ی ۱۰ دقیقه‌ی اخیر)' : '') + '.');
+		if (typeof window.renderPinnedLocationsList === 'function') window.renderPinnedLocationsList();
+	} catch (e) {
+		showToast('❌ بررسی کشورهای سالم ناموفق بود.');
+		if (select) {
+			select.setAttribute('data-vip-state', 'failed');
+			select.innerHTML = '<option value="">خطا - دوباره امتحان کنید</option>';
+		}
+	} finally {
+		if (btn) { btn.disabled = false; btn.innerText = '🩺 بررسی کشورهای سالم'; }
+	}
+};
 
 function generateInlineProxyJunkClient(len) {
 	len = len || 10;
@@ -11840,7 +12022,7 @@ async function testUserSocksProxy() {
 // افزایش پیدا می‌کند (مثلاً 3.32.0 -> 3.32.1). وقتی رقم patch به 9 برسه، تغییر بعدی رقم دوم
 // (minor) رو یکی زیاد و patch رو صفر می‌کنه (مثلاً 3.32.9 -> 3.33.0). این قانون هم‌زمان در
 // vip-proxy-changes.md مستند شده — هر تغییری در این md هم باید همراه با این ورژن ثبت بشه.
-const CURRENT_VERSION = '3.9.0';
+const CURRENT_VERSION = '3.10.0';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
