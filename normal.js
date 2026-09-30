@@ -698,14 +698,29 @@ const PINNED_PROVISION_TEST_LIMIT = 3;
 
 // Fetch proxy_vip/<country>.txt, shuffle it, and live-test a handful of
 // candidates by actually opening a connection through each one. Returns
-// { proxy, country } using a working proxy when one is found. If the file
-// exists but nothing answers in time, falls back to an untested line so the
-// slot still carries the right country tag (replaceBrokenProxy's same-country
-// cooldown/heal logic will keep retrying later). Returns null only if the
-// country's VIP list itself is missing or empty.
+// { proxy, country, tested } using a working proxy when one is found
+// (tested: true). If the file exists but nothing answers in time, it hands
+// over an UNTESTED (dead-or-unknown) line (tested: false) so the slot ALWAYS
+// keeps a real fixed-IP proxy and the right country tag.
+// ⚠️ ADMIN DECISION (do not change without asking): a pinned country whose
+// live test failed must still carry its (dead) proxy - the panel must never
+// decide on its own to give that country a slot WITHOUT a fixed IP
+// (proxy: "" = direct connection = no exit IP). replaceBrokenProxy()'s
+// same-country cooldown/heal logic swaps a dead proxy for a live one later.
+// Returns null only if the country's VIP list itself is missing or empty
+// even after one retry of the list fetch (the callers then retry the whole
+// country once more - see retryEmptyPinnedSlots() - and
+// mergePinnedLocationsForUser() re-fills such an empty slot on the next
+// "locations" call instead of leaving it empty forever).
 async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LIMIT) {
 	try {
-		const text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
+		let text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
+		if (!text) {
+			// One retry of a missed list fetch: a transient mirror/network hiccup used to turn
+			// straight into an empty (direct-only, no fixed IP) slot for the whole country.
+			await new Promise((r) => setTimeout(r, 400));
+			text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
+		}
 		if (!text) return null;
 		const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
 		if (lines.length === 0) return null;
@@ -743,10 +758,11 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 					});
 				})
 			);
-			return { proxy: working, country };
+			return { proxy: working, country, tested: true };
 		} catch (e) {
-			// Nothing answered in time - keep the country tag, use an untested line.
-			return { proxy: lines[0], country };
+			// Nothing answered in time - keep the country tag AND a real proxy: use an untested
+			// (dead-or-unknown) line, never an empty slot (see the ADMIN DECISION above).
+			return { proxy: lines[0], country, tested: false };
 		}
 	} catch (e) {
 		return null;
@@ -766,10 +782,33 @@ async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LI
 // automatically for every existing user right after the pinned list is saved.
 async function buildPinnedDefaultProxyList(locations) {
 	const results = await Promise.all(locations.map((cc) => testVipCountryProxy(cc)));
-	return locations.map((cc, i) => ({
+	const list = locations.map((cc, i) => ({
 		proxy: (results[i] && results[i].proxy) || "",
 		country: cc,
 	}));
+	await retryEmptyPinnedSlots(list);
+	return list;
+}
+
+// Second chance for slots that came back with NO proxy at all (the country's VIP list could not be
+// fetched during the parallel round - typically a mirror/network hiccup or the per-invocation
+// subrequest cap eating the later countries). Runs one country at a time, only for the empty slots,
+// and stops after PINNED_EMPTY_RETRY_BUDGET_MS so a real outage can never stall the request that
+// called it. Mutates `list` in place and returns it. A slot that is still empty afterwards is
+// repaired by mergePinnedLocationsForUser() on the next "locations" call (Push / Save).
+const PINNED_EMPTY_RETRY_BUDGET_MS = 15000;
+async function retryEmptyPinnedSlots(list) {
+	const deadline = Date.now() + PINNED_EMPTY_RETRY_BUDGET_MS;
+	for (let i = 0; i < list.length; i++) {
+		const slot = list[i];
+		if (!slot || typeof slot !== "object" || !slot.country || String(slot.proxy || "").trim()) continue;
+		if (Date.now() > deadline) break;
+		try {
+			const r = await testVipCountryProxy(slot.country);
+			if (r && r.proxy) slot.proxy = r.proxy;
+		} catch (e) { }
+	}
+	return list;
 }
 
 // Additive update for an EXISTING user: tests and appends only the pinned
@@ -788,6 +827,26 @@ async function buildPinnedDefaultProxyList(locations) {
 // "حذف کشور از کاربران" bulk action instead).
 async function mergePinnedLocationsForUser(existingProxyList, pinnedLocations) {
 	const list = Array.isArray(existingProxyList) ? existingProxyList.slice() : [];
+	// REPAIR (admin decision: never a fixed-IP-less country): a country-tagged slot that holds NO
+	// proxy (an earlier fill could not reach the VIP list) used to count as "already present" here
+	// and stayed empty forever - its config carried the country flag/path but connected directly
+	// (no fixed IP), and replaceBrokenProxy() never touches it because a direct connection never
+	// "fails". Such a slot is now re-filled in place (same position, same country tag). Only empty
+	// slots are touched; every slot that already has a proxy is left exactly as it is.
+	const emptyIdx = [];
+	list.forEach((p, i) => {
+		if (p && typeof p === "object" && p.country && !String(p.proxy || "").trim()) emptyIdx.push(i);
+	});
+	const repaired = [];
+	if (emptyIdx.length > 0) {
+		const fixes = await Promise.all(emptyIdx.map((i) => testVipCountryProxy(list[i].country)));
+		emptyIdx.forEach((i, k) => {
+			if (fixes[k] && fixes[k].proxy) {
+				list[i] = Object.assign({}, list[i], { proxy: fixes[k].proxy });
+				repaired.push(String(list[i].country).toUpperCase());
+			}
+		});
+	}
 	const haveCountries = new Set(
 		list
 			.map((p) => (typeof p === "object" && p !== null ? p.country : null))
@@ -803,8 +862,9 @@ async function mergePinnedLocationsForUser(existingProxyList, pinnedLocations) {
 		toAdd.forEach((cc, i) => {
 			list.push({ proxy: (results[i] && results[i].proxy) || "", country: cc });
 		});
+		await retryEmptyPinnedSlots(list);
 	}
-	return { list, added: toAdd, cappedOut };
+	return { list, added: toAdd, cappedOut, repaired };
 }
 
 // Re-attaches the {proxy, country} tag to slots the admin did NOT touch when the edit-user
@@ -2685,13 +2745,29 @@ const Router = {
 						// Clears any stale negative-cache ("no such user") entry that might exist for
 						// this uuid/hash from an earlier probe or connection attempt with this UUID.
 						await invalidateUserAuthCache(ctx, finalUuid, trojanHash);
+						// ⚠️⚠️ باگ مهم (چندبار تکرار شده — «کاربر تازه فقط کانفیگ مستقیم کلودفلر دارد، کانفیگ‌های VIP/آیپی ثابت
+						// در SUB نیست، ولی بعد از Save در Configure ZYX Panel پنل مادر ظاهر می‌شوند»): پرکردن لیست لوکیشن‌ها اینجا فقط
+						// یک کار پس‌زمینه‌ی بدون تضمین است (ctx.waitUntil) و قبلاً هر خطایش با catch خالی بلعیده می‌شد؛ اگر کنسل می‌شد
+						// (سقف زمان/subrequest همین invocation) user_socks5 برای همیشه NULL می‌ماند و SUB فقط کانفیگ مستقیم می‌ساخت.
+						// مسیری که واقعاً کار می‌کند PUT همگام { reset_action: "locations" } است (همان چیزی که Save/Push پنل مادر می‌زند).
+						// حالا: (۱) این کار پس‌زمینه تا ۲ بار تلاش می‌کند و خطا را لاگ می‌کند، (۲) فقط لیستِ «هنوز خالی» را می‌نویسد تا
+						// لیستی که PUT همگام همان لحظه نوشته را پایمال نکند، (۳) پنل مادر بعد از ساخت هر کاربر خودش همان PUT همگام را
+						// می‌زند (zyxEnsureUserLocations در MainPanel.js) — پس درستی نتیجه دیگر به این کار پس‌زمینه وابسته نیست.
 						if (ctx) {
 							ctx.waitUntil((async () => {
-								try {
-									const pinnedLocations = await getPinnedLocationsSetting(env);
-									const pinnedList = await buildPinnedDefaultProxyList(pinnedLocations);
-									await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(pinnedList), username).run();
-								} catch (e) { }
+								for (let fillAttempt = 1; fillAttempt <= 2; fillAttempt++) {
+									try {
+										const pinnedLocations = await getPinnedLocationsSetting(env);
+										const pinnedList = await buildPinnedDefaultProxyList(pinnedLocations);
+										// Only while the list is STILL empty: a concurrent PUT { reset_action: "locations" } (the mother panel's
+										// zyxEnsureUserLocations) may already have written a fully tested list, and this slower fill must not clobber it.
+										await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ? AND (user_socks5 IS NULL OR TRIM(user_socks5) = '' OR TRIM(user_socks5) = '[]')").bind(JSON.stringify(pinnedList), username).run();
+										break;
+									} catch (e) {
+										console.error("pinned-locations fill failed for", username, "(attempt " + fillAttempt + "):", e && e.message);
+										if (fillAttempt < 2) await new Promise((r) => setTimeout(r, 2000));
+									}
+								}
 								// The row above may already have been cached (with a null user_socks5)
 								// by a connection that landed in the gap between insert and this
 								// background update finishing - invalidate again so the next
