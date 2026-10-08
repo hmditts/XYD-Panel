@@ -1,5 +1,5 @@
 import { connect } from "cloudflare:sockets";
-const __zeusBuildNoiseBundle__ = (function() {
+const __buildNoiseBundleFn__ = (function() {
   const __pool = new Uint32Array(16384);
   let __poolIdx = __pool.length;
   function randomUint32() {
@@ -295,10 +295,6 @@ async function fetchPersonalRepoFile(path) {
 }
 async function fetchWithFallback(path, options = {}) {
   const urls = [
-    `https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev/${path}`,
-    `https://testfnryjnrjrurjejne4r6uju.pages.dev/${path}`,
-    `https://hoplimit.shop/${path}`,
-    // میرور ۴ - مخزن شخصی خودمون
     `${PERSONAL_REPO_RAW_BASE}${path}`
   ];
   for (const url of urls) {
@@ -318,7 +314,7 @@ async function getCachedRepoFile(path, ttl = 9e5) {
   const vipMatch = path.match(/^proxy_vip\/([A-Za-z0-9]+)\.txt$/);
   try {
     const [mainRes, personalText] = await Promise.all([
-      fetchWithFallback(path).catch(() => null),
+      vipMatch ? Promise.resolve(null) : fetchWithFallback(path).catch(() => null),
       vipMatch ? fetchPersonalRepoFile(path) : Promise.resolve(null)
     ]);
     const mainText = mainRes && mainRes.ok ? await mainRes.text() : "";
@@ -333,10 +329,8 @@ async function getCachedRepoFile(path, ttl = 9e5) {
 }
 async function syncAllVipProxies() {
   const now = Date.now();
-  const listRes = await fetchWithFallback("vip-list");
-  if (!listRes.ok) throw new Error("لیست کشورهای VIP در حال حاضر در دسترس نیست");
-  const files = await listRes.json();
-  const countries = (Array.isArray(files) ? files : []).filter((f) => f && f.name && f.name.endsWith(".txt")).map((f) => f.name.replace(".txt", "").toUpperCase());
+  const personalList = await fetchPersonalRepoVipCountries();
+  const countries = (personalList.codes || []).slice();
   const manualOnlyCountries = Object.keys(MANUAL_VIP_PROXIES).map((c) => c.toUpperCase()).filter((c) => !countries.includes(c));
   countries.push(...manualOnlyCountries);
   if (countries.length === 0) throw new Error("هیچ کشوری در مخزن VIP یافت نشد");
@@ -383,7 +377,7 @@ async function performChildSelfUpdate(request2, env, url) {
   try {
     const cfHeaders = {
       Authorization: "Bearer " + currentToken,
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZYXPanel/1.0"
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     };
     if (!currentAccountId) {
       const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: cfHeaders });
@@ -404,7 +398,7 @@ async function performChildSelfUpdate(request2, env, url) {
     if (!template || template.trim().length < 100) throw new Error("فایل worker.js دریافتی از ریپوی شخصی شما خالی یا نامعتبر است.");
     assertDeployableWorkerModule(template, "worker.js");
     const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
-    const { before, after } = __zeusBuildNoiseBundle__(template);
+    const { before, after } = __buildNoiseBundleFn__(template);
     const newCode = before + template + after;
     const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
       headers: cfHeaders
@@ -467,7 +461,7 @@ async function checkAutoResets(env, ctx) {
   if (now - localLastAutoResetCheck < 36e5) return;
   try {
     const cache = caches.default;
-    const cacheReq = new Request("https://internal.ZYX/auto_reset");
+    const cacheReq = new Request("https://internal.invalid/auto_reset");
     if (await cache.match(cacheReq)) return;
     const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_auto_reset_check'").first();
     const dbLastCheck = row ? parseInt(row.value) || 0 : 0;
@@ -492,7 +486,7 @@ const GLOBAL_REQ_LIMIT_DEFAULT = 75e3;
 const GLOBAL_REQ_LIMIT_CACHE_TTL_SECONDS = 60;
 const GLOBAL_REQ_LIMIT_CF_CHECK_THRESHOLD_RATIO = 0.9;
 function globalReqLimitCacheRequest() {
-  return new Request("https://internal.ZYX/global_req_limit_status");
+  return new Request("https://internal.invalid/global_req_limit_status");
 }
 async function isGlobalReqLimitReached(env, ctx) {
   try {
@@ -560,7 +554,7 @@ function recordDailyTraffic(env, ctx, deltaGb) {
 }
 const USER_AUTH_CACHE_TTL_SECONDS = 10;
 function userAuthCacheRequest(kind, key) {
-  return new Request(`https://internal.ZYX/user_auth/${kind}/${encodeURIComponent(String(key))}`);
+  return new Request(`https://internal.invalid/user_auth/${kind}/${encodeURIComponent(String(key))}`);
 }
 async function getCachedAuthUser(kind, key) {
   if (!key) return void 0;
@@ -1128,7 +1122,7 @@ async function checkVipCountriesChunk(codes, force) {
 }
 async function getVipHealthCandidates(githubToken) {
   const [officialRes, personal] = await Promise.all([
-    fetchWithFallback("vip-list").catch(() => null),
+    Promise.resolve(null),
     fetchPersonalRepoVipCountries(githubToken)
   ]);
   let officialCodes = [];
@@ -7417,10 +7411,6 @@ Commercial support is available at
 									<svg class="w-4 h-4 text-red-500" fill="currentColor" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3 9.24 3 10.91 3.81 12 5.08 13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
 									<span>اهدای پروکسی شخصی به مخزن</span>
 								</button>
-								<button type="button" onclick="copyScannerCode('bash <(curl -sL https://hoplimit.shop/zeus-relay.sh | tr -d &quot;\\\\r&quot;)', this)" class="py-2.5 px-3 bg-blue-700 hover:bg-blue-800 dark:bg-blue-600 dark:hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
-									<svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-									<span>کپی دستور ساخت پروکسی ریلی</span>
-								</button>
 							</div>
 						</div>
 					</div>
@@ -7496,37 +7486,7 @@ Commercial support is available at
 			</button>
 		</div>
 		<div class="p-5 space-y-4 overflow-y-auto flex-1">
-			<div class="border border-green-200 dark:border-green-900/50 bg-green-50/50 dark:bg-green-900/10 rounded-md p-4 shadow-sm">
-				<div class="flex items-center gap-2 mb-2">
-					<svg class="w-5 h-5 text-green-600 dark:text-green-500" fill="currentColor" viewBox="0 0 24 24"><path d="M17.523 15.3414c-.5511 0-.9993-.4486-.9993-.9997s.4482-.9993.9993-.9993c.5511 0 .9993.4482.9993.9993.0004.5511-.4482.9997-.9993.9997m-11.046 0c-.5511 0-.9993-.4486-.9993-.9997s.4482-.9993.9993-.9993c.5511 0 .9993.4482.9993.9993 0 .5511-.4482.9997-.9993.9997m11.4045-6.02L19.695 6.183c.1568-.2716.0637-.6182-.2079-.7754-.2716-.1564-.6183-.0633-.775.2082l-1.8584 3.2185c-1.3853-.6328-2.9697-.9881-4.6644-.9881-1.6946 0-3.279.3553-4.664.9881L5.6664 5.6158c-.1567-.2715-.5038-.3646-.775-.2082-.2716.1572-.3647.5038-.2079.7754l1.8136 3.1385C2.963 11.2384 1.1571 14.5422 1 18.4234h22c-.1572-3.8812-1.963-7.185-5.4955-9.102"/></svg>
-					<h4 class="font-black text-sm text-green-700 dark:text-green-400">کاربران موبایل (Pydroid 3)</h4>
-				</div>
-				<p class="text-[11px] text-gray-600 dark:text-gray-400 mb-3 leading-relaxed font-medium">
-					اپلیکیشن <a href="https://play.google.com/store/apps/details?id=ru.iiec.pydroid3" target="_blank" class="text-blue-500 hover:text-blue-600 dark:text-blue-400 font-bold underline">Pydroid 3</a> را نصب کنید. از منوی کناری برنامه وارد بخش <b>Terminal</b> شوید و کد زیر را اجرا کنید؛ سپس آدرس <code class="bg-white dark:bg-zinc-800 px-1 py-0.5 rounded text-blue-500 font-bold shadow-sm" dir="ltr">http://127.0.0.1:8000</code> را در مرورگر باز کنید.
-				</p>
-				<div class="flex flex-col gap-2">
-					<div class="w-full bg-gray-100 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md p-2.5 text-[10px] font-mono text-left text-gray-800 dark:text-zinc-300 break-all select-all overflow-x-auto whitespace-pre-wrap max-h-24 overflow-y-auto" dir="ltr">python -c "import urllib.request; req = urllib.request.Request('https://hoplimit.shop/zeus-scanner.txt', headers={'User-Agent': 'Mozilla/5.0'}); exec(urllib.request.urlopen(req).read().decode('utf-8').split('---PYTH' + 'ON---')[1].split('---POWERSHELL---')[0].strip())"</div>
-					<button type="button" onclick="copyScannerCode('python -c &quot;import urllib.request; req = urllib.request.Request(\\'https://hoplimit.shop/zeus-scanner.txt\\', headers={\\'User-Agent\\': \\'Mozilla/5.0\\'}); exec(urllib.request.urlopen(req).read().decode(\\'utf-8\\').split(\\'---PYTH\\' + \\'ON---\\')[1].split(\\'---POWERSHELL---\\')[0].strip())&quot;', this)" class="w-full flex items-center justify-center gap-1.5 py-2 bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-gray-600 dark:text-zinc-300 hover:bg-gray-50 dark:hover:bg-zinc-700/80 rounded text-xs font-bold transition shadow-sm">
-						<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-						<span>کپی کد Pydroid</span>
-					</button>
-				</div>
-			</div>
-			<div class="border border-blue-200 dark:border-blue-900/50 bg-blue-50/50 dark:bg-blue-900/10 rounded-md p-4 shadow-sm">
-				<div class="flex items-center gap-2 mb-2">
-					<svg class="w-5 h-5 text-blue-600 dark:text-blue-500" fill="currentColor" viewBox="0 0 24 24"><path d="M0 3.449L9.75 2.1v9.451H0m10.949-9.602L24 0v11.4H10.949M0 12.6h9.75v9.451L0 20.699M10.949 12.6H24V24l-13.051-1.801"/></svg>
-					<h4 class="font-black text-sm text-blue-700 dark:text-blue-400">کاربران ویندوز (CMD)</h4>
-				</div>
-				<p class="text-[11px] text-gray-600 dark:text-gray-400 mb-3 leading-relaxed font-medium">
-					محیط <code class="font-bold">CMD</code> (Command Prompt) را در ویندوز باز کنید و کد زیر را برای اجرای اسکنر در آن پیست کنید و اینتر بزنید.
-				</p>
-				<div class="flex flex-col gap-2">
-					<div class="w-full bg-gray-100 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md p-2.5 text-[10px] font-mono text-left text-gray-800 dark:text-zinc-300 break-all select-all overflow-x-auto whitespace-pre-wrap max-h-24 overflow-y-auto" dir="ltr">powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13; $wc = New-Object System.Net.WebClient; $wc.Encoding = [System.Text.Encoding]::UTF8; $text = ($wc.DownloadString('https://hoplimit.shop/zeus-scanner.txt') -split '---POWERSHELL---')[1].Trim(); [IO.File]::WriteAllText('zeus-scanner.ps1', $text, [System.Text.Encoding]::UTF8); .zeus-scanner.ps1"</div>
-					<button type="button" onclick="copyScannerCode('powershell -ExecutionPolicy Bypass -Command &quot;[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13; $wc = New-Object System.Net.WebClient; $wc.Encoding = [System.Text.Encoding]::UTF8; $text = ($wc.DownloadString(\\'https://hoplimit.shop/zeus-scanner.txt\\') -split \\'---POWERSHELL---\\')[1].Trim(); [IO.File]::WriteAllText(\\'zeus-scanner.ps1\\', $text, [System.Text.Encoding]::UTF8); .\\\\zeus-scanner.ps1&quot;', this)" class="w-full flex items-center justify-center gap-1.5 py-2 bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-gray-600 dark:text-zinc-300 hover:bg-gray-50 dark:hover:bg-zinc-700/80 rounded text-xs font-bold transition shadow-sm">
-						<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-						<span>کپی کد CMD</span>
-					</button>
-				</div>
+			<p class="text-[12px] text-gray-600 dark:text-gray-400 leading-relaxed text-center font-medium">این قابلیت غیرفعال شده است.</p>
 			</div>
 		</div>
 		<div class="p-4 border-t border-gray-150 dark:border-amoled-border bg-gray-50 dark:bg-zinc-900/50 flex-shrink-0">
@@ -8143,9 +8103,6 @@ ${COMMON_TOAST_HTML}
 	<script>
 		async function fetchWithFallbackUI(path, options = {}) {
 			const urls = [
-				'https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev/' + path,
-				'https://testfnryjnrjrurjejne4r6uju.pages.dev/' + path,
-				'https://hoplimit.shop/' + path,
 				'https://raw.githubusercontent.com/hmditts/XYD-Panel/main/' + path
 			];
 			// فاز ۵ (بازبینی نهایی): شاخه‌ی مرده‌ی zeus.obfuscated.js/میرور رسمی Zeus از اینجا هم حذف شد —
