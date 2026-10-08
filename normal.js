@@ -1,26 +1,252 @@
-const GLOBAL_TRAFFIC_CACHE = new Map();
-const ACTIVE_CONNECTIONS_COUNT = new Map();
-const GLOBAL_LAST_ACTIVE_WRITE = new Map();
-const GLOBAL_LAST_DB_WRITE = new Map();
-const GLOBAL_WRITE_LOCK = new Map();
-// Serializes read-merge-write cycles on `active_ips` per username within the same isolate
-// (promise-chaining mutex). See persistActiveIp() near getActiveIpCount() for why this exists
-// (shared with confirmActiveIp() - see the «دیده‌شده/تأییدشده» device policy notes there).
-const GLOBAL_ACTIVE_IPS_WRITE_LOCK = new Map();
-// «سیاست ثبت دستگاه متصل» (device seen/confirmed policy - see DEVICE_CONFIRM_* below): best-effort,
-// per-isolate running total of bytes (both directions) moved by short-lived connections of the
-// same (username, clientIP) pair, within a rolling DEVICE_CONFIRM_BURST_WINDOW_MS window. Used to
-// confirm a device that never keeps a single connection open for DEVICE_CONFIRM_MIN_DURATION_MS,
-// but reconnects often with real usage each time (a chat/browser app is the common case). Not
-// shared across isolates and not persisted to D1 - approximate by design, see handlevIees().
-// Pruned opportunistically in flushExpiredTraffic().
-const IP_BURST_BYTES = new Map();
-const DNS_CACHE = new Map();
-const USER_REQ_CACHE = new Map();
-const LOGIN_ATTEMPTS = new Map();
+import { connect } from "cloudflare:sockets";
+const __zeusBuildNoiseBundle__ = (function() {
+  const __pool = new Uint32Array(16384);
+  let __poolIdx = __pool.length;
+  function randomUint32() {
+    if (__poolIdx >= __pool.length) {
+      crypto.getRandomValues(__pool);
+      __poolIdx = 0;
+    }
+    return __pool[__poolIdx++];
+  }
+  function randomInt(min, max) {
+    const range = max - min + 1;
+    if (range <= 1) return min;
+    const limit = Math.floor(4294967296 / range) * range;
+    let x;
+    do {
+      x = randomUint32();
+    } while (x >= limit);
+    return min + x % range;
+  }
+  function randomFloat() {
+    return randomUint32() / 4294967296;
+  }
+  function pick(arr) {
+    return arr[randomInt(0, arr.length - 1)];
+  }
+  function weightedPick(entries) {
+    const total = entries.reduce((s, e) => s + e[1], 0);
+    let r = randomFloat() * total;
+    for (const [value, weight] of entries) {
+      r -= weight;
+      if (r <= 0) return value;
+    }
+    return entries[entries.length - 1][0];
+  }
+  function shuffleCopy(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = randomInt(0, i);
+      const tmp = a[i];
+      a[i] = a[j];
+      a[j] = tmp;
+    }
+    return a;
+  }
+  const NAME_CHARSETS = [
+    "abcdefghijklmnopqrstuvwxyz0123456789",
+    "abcdefghijklmnopqrstuvwxyz",
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  ];
+  function randomToken(charset, len) {
+    let s = "";
+    for (let i = 0; i < len; i++) s += charset[randomInt(0, charset.length - 1)];
+    return s;
+  }
+  function pickUniquePrefix(templateSource) {
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const charset = pick(NAME_CHARSETS);
+      const len = randomInt(6, 14);
+      const prefix = "_p" + randomToken(charset, len) + "_";
+      if (!templateSource || !templateSource.includes(prefix)) return prefix;
+    }
+    return "_p" + randomToken(NAME_CHARSETS[0], 20) + "_";
+  }
+  function randomNumberLiteral() {
+    const style = pick(["plain", "plain", "plain", "separated", "hex", "float"]);
+    if (style === "hex") return "0x" + randomInt(0, 16777215).toString(16);
+    if (style === "float") return (randomFloat() * randomInt(1, 1e5)).toFixed(randomInt(2, 6));
+    const n = randomInt(0, 999999);
+    if (style === "separated" && n > 999) {
+      const s = String(n);
+      return s.length > 3 ? s.slice(0, s.length - 3) + "_" + s.slice(-3) : s;
+    }
+    return String(n);
+  }
+  function randomStringLiteral(charset) {
+    const quote = pick(['"', "'", "`"]);
+    const text = randomToken(charset, randomInt(4, 16));
+    return quote + text + quote;
+  }
+  const STATEMENT_KINDS = [
+    "intVar",
+    "floatVar",
+    "strVar",
+    "arrVar",
+    "objVar",
+    "funcDecl",
+    "arrowConst",
+    "comment"
+  ];
+  function nextName(ctx, idx) {
+    return ctx.prefix + randomToken(ctx.charset, ctx.idLen) + "_" + idx;
+  }
+  function genIntVar(ctx, idx) {
+    const kw = pick(ctx.profile.varKeywords);
+    return `${kw} ${nextName(ctx, idx)} = ${randomNumberLiteral()};`;
+  }
+  function genFloatVar(ctx, idx) {
+    const kw = pick(ctx.profile.varKeywords);
+    const a = randomNumberLiteral();
+    const b = randomNumberLiteral();
+    const op = pick(["+", "-", "*"]);
+    return `${kw} ${nextName(ctx, idx)} = ${a} ${op} ${b};`;
+  }
+  function genStrVar(ctx, idx) {
+    const kw = pick(ctx.profile.varKeywords);
+    return `${kw} ${nextName(ctx, idx)} = ${randomStringLiteral(ctx.charset)};`;
+  }
+  function genArrVar(ctx, idx) {
+    const kw = pick(ctx.profile.varKeywords);
+    const len = randomInt(2, 5);
+    const items = Array.from({ length: len }, () => randomNumberLiteral());
+    return `${kw} ${nextName(ctx, idx)} = [${items.join(", ")}];`;
+  }
+  function genObjVar(ctx, idx) {
+    const kw = pick(ctx.profile.varKeywords);
+    const len = randomInt(2, 4);
+    const entries = Array.from({ length: len }, () => {
+      const key = randomToken(ctx.charset, randomInt(3, 7));
+      return `"${key}": ${randomNumberLiteral()}`;
+    });
+    return `${kw} ${nextName(ctx, idx)} = { ${entries.join(", ")} };`;
+  }
+  function genFuncDecl(ctx, idx) {
+    return `function ${nextName(ctx, idx)}() { return ${randomNumberLiteral()}; }`;
+  }
+  function genArrowConst(ctx, idx) {
+    return `const ${nextName(ctx, idx)} = () => ${randomNumberLiteral()};`;
+  }
+  const COMMENT_WORDS = [
+    "cache",
+    "buffer",
+    "offset",
+    "window",
+    "shard",
+    "batch",
+    "pending",
+    "warmup",
+    "tick",
+    "slot",
+    "queue",
+    "retry",
+    "reserve",
+    "margin",
+    "stub",
+    "placeholder",
+    "pad",
+    "spacer",
+    "init",
+    "scratch",
+    "tmp",
+    "guard",
+    "fallback"
+  ];
+  function genComment() {
+    const words = randomInt(1, 4);
+    const parts = Array.from({ length: words }, () => pick(COMMENT_WORDS));
+    return "// " + parts.join(" ") + " " + randomInt(0, 9999);
+  }
+  const GENERATORS = {
+    intVar: genIntVar,
+    floatVar: genFloatVar,
+    strVar: genStrVar,
+    arrVar: genArrVar,
+    objVar: genObjVar,
+    funcDecl: genFuncDecl,
+    arrowConst: genArrowConst,
+    comment: () => genComment()
+  };
+  function buildRandomProfile() {
+    const kindCount = randomInt(3, STATEMENT_KINDS.length);
+    const kinds = shuffleCopy(STATEMENT_KINDS).slice(0, kindCount);
+    if (!kinds.includes("comment") && randomFloat() < 0.6) kinds.push("comment");
+    const weights = kinds.map((k) => [k, randomInt(1, 10)]);
+    const varKeywordPool = shuffleCopy(["let", "const", "var"]).slice(0, randomInt(1, 3));
+    return {
+      kinds: weights,
+      varKeywords: varKeywordPool.length ? varKeywordPool : ["let"],
+      charset: pick(NAME_CHARSETS),
+      idLen: randomInt(5, 14),
+      blankLineEvery: pick([0, 0, 8, 12, 20]),
+      placement: pick(["before", "before", "before", "split"]),
+      splitRatio: randomFloat() * 0.5 + 0.2
+    };
+  }
+  function buildStatements(ctx, count) {
+    const lines = [];
+    for (let i = 0; i < count; i++) {
+      const kind = weightedPick(ctx.profile.kinds);
+      lines.push(GENERATORS[kind](ctx, i));
+      if (ctx.profile.blankLineEvery && (i + 1) % ctx.profile.blankLineEvery === 0) {
+        lines.push("");
+      }
+    }
+    return lines.join("\n");
+  }
+  const MAX_NOISE_BYTES = 61440;
+  const MIN_NOISE_STATEMENTS = 60;
+  const MAX_NOISE_STATEMENTS = 520;
+  function buildNoiseBundle(templateSource) {
+    const prefix = pickUniquePrefix(templateSource);
+    const profile = buildRandomProfile();
+    const ctx = { prefix, charset: profile.charset, idLen: profile.idLen, profile };
+    let totalCount = randomInt(MIN_NOISE_STATEMENTS, MAX_NOISE_STATEMENTS);
+    let block = buildStatements(ctx, totalCount);
+    let guard = 0;
+    while (block.length > MAX_NOISE_BYTES && guard < 5) {
+      totalCount = Math.max(MIN_NOISE_STATEMENTS, Math.floor(totalCount * 0.7));
+      block = buildStatements(ctx, totalCount);
+      guard++;
+    }
+    let before = block;
+    let after = "";
+    if (profile.placement === "split" && totalCount > 20) {
+      const lines = block.split("\n");
+      const splitAt = Math.floor(lines.length * (1 - profile.splitRatio));
+      before = lines.slice(0, splitAt).join("\n");
+      after = lines.slice(splitAt).join("\n");
+    }
+    return {
+      before: before ? before + "\n" : "",
+      after: after ? after + "\n" : "",
+      meta: {
+        prefix,
+        statementCount: totalCount,
+        byteLength: block.length,
+        kinds: profile.kinds.map((k) => k[0]),
+        varKeywords: profile.varKeywords,
+        placement: profile.placement
+      }
+    };
+  }
+  return buildNoiseBundle;
+})();
+const GLOBAL_TRAFFIC_CACHE = /* @__PURE__ */ new Map();
+const ACTIVE_CONNECTIONS_COUNT = /* @__PURE__ */ new Map();
+const GLOBAL_LAST_ACTIVE_WRITE = /* @__PURE__ */ new Map();
+const GLOBAL_LAST_DB_WRITE = /* @__PURE__ */ new Map();
+const GLOBAL_WRITE_LOCK = /* @__PURE__ */ new Map();
+const GLOBAL_ACTIVE_IPS_WRITE_LOCK = /* @__PURE__ */ new Map();
+const IP_BURST_BYTES = /* @__PURE__ */ new Map();
+const DNS_CACHE = /* @__PURE__ */ new Map();
+const USER_REQ_CACHE = /* @__PURE__ */ new Map();
+const LOGIN_ATTEMPTS = /* @__PURE__ */ new Map();
 let GLOBAL_REQ_COUNT = 0;
 let GLOBAL_LAST_REQ_WRITE = 0;
-const DNS_CACHE_TTL = 5 * 60 * 1000;
+const DNS_CACHE_TTL = 5 * 60 * 1e3;
 const DOH_RESOLVER = "https://cloudflare-dns.com/dns-query";
 const UPSTREAM_BUNDLE_TARGET_BYTES = 128 * 1024;
 const UPSTREAM_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
@@ -28,1409 +254,1341 @@ const UPSTREAM_QUEUE_MAX_ITEMS = 4096;
 const DNS_CACHE_MAX_ENTRIES = 2048;
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
-const TLS_PORTS = new Set(["443", "2053", "2083", "2087", "2096", "8443"]);
+const TLS_PORTS = /* @__PURE__ */ new Set(["443", "2053", "2083", "2087", "2096", "8443"]);
 function safeDecodeURI(value) {
-	try {
-		return decodeURIComponent(value);
-	} catch (e) {
-		return value;
-	}
+  try {
+    return decodeURIComponent(value);
+  } catch (e) {
+    return value;
+  }
 }
-async function readJsonBody(request) {
-	try {
-		const body = await request.json();
-		return body && typeof body === "object" ? body : {};
-	} catch (e) {
-		return {};
-	}
+async function readJsonBody(request2) {
+  try {
+    const body = await request2.json();
+    return body && typeof body === "object" ? body : {};
+  } catch (e) {
+    return {};
+  }
 }
-// «پروکسی‌های دستی» که به‌عنوان بخشی از «مخزن خودمون» (میرور ۴) در نظر گرفته می‌شن؛ موقع sync با
-// پروکسی‌های کش‌شده از مخزن اصلی ترکیب می‌شن. هر کد کشور یک آرایه از خط‌های پروکسی (همون فرمتی که
-// در proxy_vip/*.txt هست). فعلاً خالی است — خودتان پر کنید، یا بعداً به D1 منتقلش کنید.
 const MANUAL_VIP_PROXIES = {
-	// DE: ["1.2.3.4:443#My-DE-1", "5.6.7.8:2053#My-DE-2"],
-	// US: ["9.9.9.9:443#My-US-1"],
+  // DE: ["1.2.3.4:443#My-DE-1", "5.6.7.8:2053#My-DE-2"],
+  // US: ["9.9.9.9:443#My-US-1"],
 };
 function getManualVipProxies(country) {
-	const list = MANUAL_VIP_PROXIES[String(country).toUpperCase()];
-	return Array.isArray(list) ? list : [];
+  const list = MANUAL_VIP_PROXIES[String(country).toUpperCase()];
+  return Array.isArray(list) ? list : [];
 }
-// متن فچ‌شده از مخزن اصلی را با متن مخزن شخصی (میرور ۴) و MANUAL_VIP_PROXIES همون کشور ترکیب و یکتا می‌کند.
 function mergeVipProxyText(country, fetchedText, personalText) {
-	const fetchedLines = (fetchedText || "").split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
-	const personalLines = (personalText || "").split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
-	const manualLines = getManualVipProxies(country).map((l) => l.trim()).filter((l) => l.length > 5);
-	return [...new Set([...fetchedLines, ...personalLines, ...manualLines])].join("\n");
+  const fetchedLines = (fetchedText || "").split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+  const personalLines = (personalText || "").split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+  const manualLines = getManualVipProxies(country).map((l) => l.trim()).filter((l) => l.length > 5);
+  return [.../* @__PURE__ */ new Set([...fetchedLines, ...personalLines, ...manualLines])].join("\n");
 }
-// میرور ۴ - مخزن شخصی خودمون. این خط رو با آدرس raw واقعی ریپوی خودتون پر کنید (owner/repo/branch).
-// هم fetchWithFallback (به‌عنوان آخرین میرور توی زنجیره) و هم fetchPersonalRepoFile (که همیشه/بدون
-// شرط صداش می‌زنیم، مخصوص proxy_vip/*.txt) از همین یک آدرس استفاده می‌کنن.
 const PERSONAL_REPO_RAW_BASE = "https://raw.githubusercontent.com/hmditts/XYD-Panel/main/";
-// برخلاف fetchWithFallback (که با اولین جواب OK متوقف می‌شه)، این تابع مستقیم و همیشه از مخزن
-// شخصی می‌خونه - even اگه میرورهای ۱ تا ۳ هم OK برگردونده باشن - چون هدفش اینه که وقتی فایل رسمی
-// وجود داره ولی پروکسی‌هاش مرده‌ن، پروکسی‌های خودمون همچنان اضافه بشن نه این‌که نادیده گرفته بشن.
 async function fetchPersonalRepoFile(path) {
-	try {
-		const res = await fetch(`${PERSONAL_REPO_RAW_BASE}${path}`);
-		if (res.ok) return await res.text();
-	} catch (e) { }
-	return null;
+  try {
+    const res = await fetch(`${PERSONAL_REPO_RAW_BASE}${path}`);
+    if (res.ok) return await res.text();
+  } catch (e) {
+  }
+  return null;
 }
 async function fetchWithFallback(path, options = {}) {
-	const urls = [
-		`https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev/${path}`,
-		`https://testfnryjnrjrurjejne4r6uju.pages.dev/${path}`,
-		`https://hoplimit.shop/${path}`,
-		// میرور ۴ - مخزن شخصی خودمون
-		`${PERSONAL_REPO_RAW_BASE}${path}`
-	];
-	if (path.includes('zeus.obfuscated.js')) {
-		urls.push(`https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main/zeus.obfuscated.js` + (path.includes('?') ? path.substring(path.indexOf('?')) : ''));
-	}
-	for (const url of urls) {
-		try {
-			const res = await fetch(url, options);
-			if (res.ok) return res;
-		} catch (e) { }
-	}
-	return new Response(null, { status: 500 });
+  const urls = [
+    `https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev/${path}`,
+    `https://testfnryjnrjrurjejne4r6uju.pages.dev/${path}`,
+    `https://hoplimit.shop/${path}`,
+    // میرور ۴ - مخزن شخصی خودمون
+    `${PERSONAL_REPO_RAW_BASE}${path}`
+  ];
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, options);
+      if (res.ok) return res;
+    } catch (e) {
+    }
+  }
+  return new Response(null, { status: 500 });
 }
-// کش مشترک فایل‌های مخزن (proxy_vip/*.txt و غیره) — به‌جای فراخوانی مستقیم fetchWithFallback در
-// هر جا، این تابع یک بار فچ می‌کند و تا پایان TTL از حافظه برمی‌گرداند. در حافظه‌ی ایزوله‌ی Worker
-// است (نه D1/KV)، پس با هر cold start خالی می‌شود.
-const REPO_FILE_CACHE = new Map();
-async function getCachedRepoFile(path, ttl = 900000) { // پیش‌فرض: ۱۵ دقیقه
-	const now = Date.now();
-	const cached = REPO_FILE_CACHE.get(path);
-	if (cached && (now - cached.timestamp < ttl)) return cached.data;
-	// proxy_vip/<CC>.txt همیشه با مخزن شخصی (میرور ۴) ترکیب می‌شه - حتی اگه fetchWithFallback از
-	// میرور ۱ تا ۳ یه جواب OK بگیره (مثلاً فایل رسمی وجود داره ولی پروکسی‌هاش خراب/مرده‌ن)، چون
-	// fetchWithFallback با اولین OK متوقف می‌شه و میرور ۴ رو اصلاً چک نمی‌کنه.
-	const vipMatch = path.match(/^proxy_vip\/([A-Za-z0-9]+)\.txt$/);
-	try {
-		const [mainRes, personalText] = await Promise.all([
-			fetchWithFallback(path).catch(() => null),
-			vipMatch ? fetchPersonalRepoFile(path) : Promise.resolve(null),
-		]);
-		const mainText = mainRes && mainRes.ok ? await mainRes.text() : "";
-		if (mainText || personalText) {
-			const finalText = vipMatch ? mergeVipProxyText(vipMatch[1], mainText, personalText) : mainText;
-			REPO_FILE_CACHE.set(path, { data: finalText, timestamp: now });
-			return finalText;
-		}
-	} catch (e) { }
-	return cached ? cached.data : null; // اگه فچ تازه خراب شد، نسخه‌ی قدیمی رو بده نه خالی
+const REPO_FILE_CACHE = /* @__PURE__ */ new Map();
+async function getCachedRepoFile(path, ttl = 9e5) {
+  const now = Date.now();
+  const cached = REPO_FILE_CACHE.get(path);
+  if (cached && now - cached.timestamp < ttl) return cached.data;
+  const vipMatch = path.match(/^proxy_vip\/([A-Za-z0-9]+)\.txt$/);
+  try {
+    const [mainRes, personalText] = await Promise.all([
+      fetchWithFallback(path).catch(() => null),
+      vipMatch ? fetchPersonalRepoFile(path) : Promise.resolve(null)
+    ]);
+    const mainText = mainRes && mainRes.ok ? await mainRes.text() : "";
+    if (mainText || personalText) {
+      const finalText = vipMatch ? mergeVipProxyText(vipMatch[1], mainText, personalText) : mainText;
+      REPO_FILE_CACHE.set(path, { data: finalText, timestamp: now });
+      return finalText;
+    }
+  } catch (e) {
+  }
+  return cached ? cached.data : null;
 }
-// همیشه تازه می‌گیرد (نه از کش) چون فراخوانی‌اش یعنی کاربر صریحاً خواسته بروزرسانی شود؛ ولی نتیجه
-// را در REPO_FILE_CACHE می‌نویسد تا بعد از آن getCachedRepoFile (testVipCountryProxy/replaceBrokenProxy)
-// تا پایان TTL از همین نسخه‌ی تازه استفاده کنند. فقط proxy_vip/*.txt — به فایل‌های عمومی کاری ندارد.
 async function syncAllVipProxies() {
-	const now = Date.now();
-	const listRes = await fetchWithFallback("vip-list");
-	if (!listRes.ok) throw new Error("لیست کشورهای VIP در حال حاضر در دسترس نیست");
-	const files = await listRes.json();
-	const countries = (Array.isArray(files) ? files : [])
-		.filter((f) => f && f.name && f.name.endsWith(".txt"))
-		.map((f) => f.name.replace(".txt", "").toUpperCase());
-	// کشورهایی که فقط در MANUAL_VIP_PROXIES هستن (در مخزن اصلی نیستن) هم اضافه می‌شن تا حذف نشن.
-	const manualOnlyCountries = Object.keys(MANUAL_VIP_PROXIES)
-		.map((c) => c.toUpperCase())
-		.filter((c) => !countries.includes(c));
-	countries.push(...manualOnlyCountries);
-	if (countries.length === 0) throw new Error("هیچ کشوری در مخزن VIP یافت نشد");
-
-	const perCountry = {};
-	let totalProxies = 0;
-	await Promise.all(countries.map(async (cc) => {
-		const key = `proxy_vip/${cc}.txt`;
-		let text = "";
-		let fetchOk = false;
-		try {
-			const res = await fetchWithFallback(key);
-			if (res.ok) { text = await res.text(); fetchOk = true; }
-		} catch (e) { }
-		if (!fetchOk) {
-			// فچ ناموفق بود؛ به‌جای پاک کردن کش قبلی، همون نسخه‌ی قبلی (اگه بود) رو پایه می‌گیریم
-			// و فقط دوباره با مخزن شخصی/MANUAL_VIP_PROXIES ترکیب می‌کنیم (idempotent - تکراری اضافه نمی‌شه).
-			const prev = REPO_FILE_CACHE.get(key);
-			text = prev ? prev.data : "";
-		}
-		// مخزن شخصی (میرور ۴) همیشه چک می‌شه - حتی وقتی fetchOk true بوده - تا وقتی فایل رسمی وجود
-		// داره ولی پروکسی‌هاش خراب/مرده‌ن، پروکسی‌های خودمون همچنان اضافه بشن نه نادیده گرفته بشن.
-		const personalText = await fetchPersonalRepoFile(key);
-		const merged = mergeVipProxyText(cc, text, personalText);
-		const lines = merged.split("\n").filter((l) => l.length > 5);
-		REPO_FILE_CACHE.set(key, { data: merged, timestamp: now });
-		perCountry[cc] = lines.length;
-		totalProxies += lines.length;
-	}));
-
-	return { countries, perCountry, totalCountries: countries.length, totalProxies, fetchedAt: now };
+  const now = Date.now();
+  const listRes = await fetchWithFallback("vip-list");
+  if (!listRes.ok) throw new Error("لیست کشورهای VIP در حال حاضر در دسترس نیست");
+  const files = await listRes.json();
+  const countries = (Array.isArray(files) ? files : []).filter((f) => f && f.name && f.name.endsWith(".txt")).map((f) => f.name.replace(".txt", "").toUpperCase());
+  const manualOnlyCountries = Object.keys(MANUAL_VIP_PROXIES).map((c) => c.toUpperCase()).filter((c) => !countries.includes(c));
+  countries.push(...manualOnlyCountries);
+  if (countries.length === 0) throw new Error("هیچ کشوری در مخزن VIP یافت نشد");
+  const perCountry = {};
+  let totalProxies = 0;
+  await Promise.all(countries.map(async (cc) => {
+    const key = `proxy_vip/${cc}.txt`;
+    let text = "";
+    let fetchOk = false;
+    try {
+      const res = await fetchWithFallback(key);
+      if (res.ok) {
+        text = await res.text();
+        fetchOk = true;
+      }
+    } catch (e) {
+    }
+    if (!fetchOk) {
+      const prev = REPO_FILE_CACHE.get(key);
+      text = prev ? prev.data : "";
+    }
+    const personalText = await fetchPersonalRepoFile(key);
+    const merged = mergeVipProxyText(cc, text, personalText);
+    const lines = merged.split("\n").filter((l) => l.length > 5);
+    REPO_FILE_CACHE.set(key, { data: merged, timestamp: now });
+    perCountry[cc] = lines.length;
+    totalProxies += lines.length;
+  }));
+  return { countries, perCountry, totalCountries: countries.length, totalProxies, fetchedAt: now };
 }
-// Both update endpoints (/api/update-panel, /api/update-panel-github) upload the fetched file to
-// Cloudflare unchanged, as an ES module (main_module: "ZYX.js"). The plain decoded source (vX_Y.js)
-// is only a function BODY that ends with a top-level "return" of the worker object - it is not a
-// module (no default export, and a top-level return is illegal in a module), so Cloudflare refuses it.
-// Only the obfuscated stub (import ... + default export) or a real module can be deployed this way.
-// Fail early with a message that says so, instead of a bare Cloudflare syntax error. A valid module
-// can never end in a top-level return, so this can't block a good file; anything else is left to Cloudflare.
 function assertDeployableWorkerModule(code, sourceLabel) {
-	if (/return\s+__WORKER_EXPORT__\s*;?\s*$/.test(String(code).trim())) {
-		throw new Error("فایل «" + sourceLabel + "» نسخه‌ی decode‌شده (خوانا) است، نه فایل قابل‌دیپلوی: با «return __WORKER_EXPORT__» تمام می‌شود و export default ندارد، برای همین کلودفلر آن را رد می‌کند. نسخه‌ی obfuscated (stub دارای export default) را در گیت‌هاب بگذارید.");
-	}
+  if (/return\s+__WORKER_EXPORT__\s*;?\s*$/.test(String(code).trim())) {
+    throw new Error("فایل «" + sourceLabel + "» نسخه‌ی decode‌شده (خوانا) است، نه فایل قابل‌دیپلوی: با «return __WORKER_EXPORT__» تمام می‌شود و export default ندارد، برای همین کلودفلر آن را رد می‌کند. در worker.js شخصی‌تان حتماً «export default __WORKER_EXPORT__؛» باشد.");
+  }
+}
+async function performChildSelfUpdate(request2, env, url) {
+  const body = await request2.json().catch(() => ({}));
+  const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
+  let currentToken = env.CF_API_TOKEN || (dbTokenRow ? dbTokenRow.value : null) || body.cf_token || null;
+  let currentAccountId = env.CF_ACCOUNT_ID;
+  if (!currentToken) {
+    return new Response(JSON.stringify({ error: "TOKEN_REQUIRED" }), { status: 400, headers: { "Content-Type": "application/json" } });
+  }
+  try {
+    const cfHeaders = {
+      Authorization: "Bearer " + currentToken,
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZYXPanel/1.0"
+    };
+    if (!currentAccountId) {
+      const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: cfHeaders });
+      if (!accRes.ok) throw new Error("کلودفلر درخواست اکانت را رد کرد (وضعیت: " + accRes.status + ")");
+      const accData = await accRes.json().catch(() => ({}));
+      if (!accData.success || !accData.result || accData.result.length === 0) throw new Error("توکن نامعتبر است یا اکانتی یافت نشد.");
+      currentAccountId = accData.result[0].id;
+    }
+    const templateUrl = PERSONAL_REPO_RAW_BASE + "worker.js?t=" + Date.now();
+    const githubRes = await fetch(templateUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        "Cache-Control": "no-cache"
+      }
+    });
+    if (!githubRes.ok) throw new Error("خطا در دریافت worker.js از ریپوی شخصی شما (وضعیت: " + githubRes.status + ")");
+    const template = await githubRes.text();
+    if (!template || template.trim().length < 100) throw new Error("فایل worker.js دریافتی از ریپوی شخصی شما خالی یا نامعتبر است.");
+    assertDeployableWorkerModule(template, "worker.js");
+    const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
+    const { before, after } = __zeusBuildNoiseBundle__(template);
+    const newCode = before + template + after;
+    const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
+      headers: cfHeaders
+    });
+    if (!bindingsRes.ok) {
+      const bindingsErr = await bindingsRes.json().catch(() => ({}));
+      const bindingsErrMsg = bindingsErr && bindingsErr.errors && bindingsErr.errors[0] ? bindingsErr.errors[0].message : "";
+      throw new Error("عدم دسترسی به تنظیمات ورکر «" + scriptName + "». کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")" + (bindingsErrMsg ? ": " + bindingsErrMsg : ""));
+    }
+    const bindingsData = await bindingsRes.json().catch(() => ({}));
+    if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
+    const newBindings = [];
+    for (const b of bindingsData.result || []) {
+      if (b.name === "CF_API_TOKEN" || b.name === "CF_ACCOUNT_ID") continue;
+      if (b.type === "d1") {
+        newBindings.push({ type: "d1", name: b.name, id: b.database_id || b.id });
+      } else if (b.type === "kv_namespace") {
+        newBindings.push({ type: "kv_namespace", name: b.name, namespace_id: b.namespace_id || b.id });
+      } else if (b.type === "plain_text") {
+        newBindings.push({ type: "plain_text", name: b.name, text: b.text || "" });
+      } else if (b.type !== "secret_text") {
+        newBindings.push(b);
+      }
+    }
+    newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
+    newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
+    const moduleName = scriptName + ".js";
+    const metadata = {
+      main_module: moduleName,
+      compatibility_date: "2026-07-10",
+      compatibility_flags: ["nodejs_compat"],
+      observability: { enabled: false },
+      bindings: newBindings
+    };
+    const formData = new FormData();
+    formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
+    formData.append(moduleName, new Blob([newCode], { type: "application/javascript+module" }), moduleName);
+    const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
+      method: "PUT",
+      headers: cfHeaders,
+      body: formData
+    });
+    if (!deployRes.ok) {
+      const errText = await deployRes.text().catch(() => "");
+      throw new Error("خطای کلودفلر هنگام دیپلوی (" + deployRes.status + "): " + errText.substring(0, 150));
+    }
+    const deployData = await deployRes.json().catch(() => ({}));
+    if (!deployData.success) {
+      const cfError = deployData.errors && deployData.errors.length > 0 ? deployData.errors[0].message : "خطا در اعمال آپدیت.";
+      throw new Error(cfError);
+    }
+    return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message }), { status: 400, headers: { "Content-Type": "application/json" } });
+  }
 }
 let localLastAutoResetCheck = 0;
 async function checkAutoResets(env, ctx) {
-	const now = Date.now();
-	if (now - localLastAutoResetCheck < 3600000) return;
-	try {
-		const cache = caches.default;
-		const cacheReq = new Request("https://internal.ZYX/auto_reset");
-		if (await cache.match(cacheReq)) return;
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_auto_reset_check'").first();
-		const dbLastCheck = row ? parseInt(row.value) || 0 : 0;
-		if (now - dbLastCheck < 3600000) {
-			localLastAutoResetCheck = dbLastCheck;
-			const ttl = Math.floor((3600000 - (now - dbLastCheck)) / 1000);
-			if (ttl > 0 && ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": `max-age=${ttl}` } })));
-			return;
-		}
-		await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_auto_reset_check', ?)").bind(String(now)).run();
-		localLastAutoResetCheck = now;
-		if (ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": "max-age=3600" } })));
-		const todayUtc = Math.floor(now / 86400000) * 86400000;
-		await env.DB.prepare(`UPDATE users SET used_gb = 0, is_active = 1, last_reset_vol_time = ? WHERE auto_reset_vol_days > 0 AND ? >= (last_reset_vol_time + (auto_reset_vol_days * 86400000))`).bind(todayUtc, todayUtc).run();
-		await env.DB.prepare(`UPDATE users SET used_req = 0, is_active = 1, last_reset_req_time = ? WHERE auto_reset_req_days > 0 AND ? >= (last_reset_req_time + (auto_reset_req_days * 86400000))`).bind(todayUtc, todayUtc).run();
-		// پاکسازی ردیف‌های ترافیک روزانه‌ی قدیمی‌تر از 30 روز (کاربر بیشتر از 30 روز نیاز ندارد)
-		const cutoffDateStr = utcDateKey(now - 30 * 86400000);
-		await env.DB.prepare("DELETE FROM daily_traffic WHERE date < ?").bind(cutoffDateStr).run();
-	} catch (e) { }
+  const now = Date.now();
+  if (now - localLastAutoResetCheck < 36e5) return;
+  try {
+    const cache = caches.default;
+    const cacheReq = new Request("https://internal.ZYX/auto_reset");
+    if (await cache.match(cacheReq)) return;
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_auto_reset_check'").first();
+    const dbLastCheck = row ? parseInt(row.value) || 0 : 0;
+    if (now - dbLastCheck < 36e5) {
+      localLastAutoResetCheck = dbLastCheck;
+      const ttl = Math.floor((36e5 - (now - dbLastCheck)) / 1e3);
+      if (ttl > 0 && ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": `max-age=${ttl}` } })));
+      return;
+    }
+    await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_auto_reset_check', ?)").bind(String(now)).run();
+    localLastAutoResetCheck = now;
+    if (ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": "max-age=3600" } })));
+    const todayUtc = Math.floor(now / 864e5) * 864e5;
+    await env.DB.prepare(`UPDATE users SET used_gb = 0, is_active = 1, last_reset_vol_time = ? WHERE auto_reset_vol_days > 0 AND ? >= (last_reset_vol_time + (auto_reset_vol_days * 86400000))`).bind(todayUtc, todayUtc).run();
+    await env.DB.prepare(`UPDATE users SET used_req = 0, is_active = 1, last_reset_req_time = ? WHERE auto_reset_req_days > 0 AND ? >= (last_reset_req_time + (auto_reset_req_days * 86400000))`).bind(todayUtc, todayUtc).run();
+    const cutoffDateStr = utcDateKey(now - 30 * 864e5);
+    await env.DB.prepare("DELETE FROM daily_traffic WHERE date < ?").bind(cutoffDateStr).run();
+  } catch (e) {
+  }
 }
-// ---- محدودیت کل ریکوئست روزانه‌ی اکانت (global_req_limit) --------------------------------------
-// همون عددی که کارت "Request" توی داشبورد نشون می‌ده، با سقفی که ادمین در تنظیمات ست کرده مقایسه
-// می‌شه. این عدد از دو منبع ترکیب می‌شه، دقیقاً به همون شکلی که خود کارت داشبورد (GET /api/users)
-// انجامش می‌ده:
-//   ۱) شمارنده‌ی خودِ پنل (req_today در جدول settings + GLOBAL_REQ_COUNT هنوز-flush-نشده‌ی این
-//      ایزوله) - این روی هر ریکوئستی که وورکر واقعاً اجرا بشه (شامل اسکن/ترافیک مزاحم) افزایش پیدا
-//      می‌کنه، صرف‌نظر از اینکه پنل باز باشه یا نه.
-//   ۲) عدد واقعیِ Cloudflare (getCfUsage -> GraphQL Analytics، از حساب واقعی کلودفلر شما، نه فقط
-//      حدس پنل) - اگه CF_API_TOKEN/CF_ACCOUNT_ID تنظیم نشده باشه، این تابع فقط صفر برمی‌گردونه و
-//      محاسبه بی‌صدا فقط به شمارنده‌ی خودِ پنل تکیه می‌کنه.
-// هر کدوم بزرگ‌تر بود ملاک عمل قرار می‌گیره (Math.max) - دقیقاً برای همون نگرانی که اگه یه جایی
-// شمارنده‌ی خودِ پنل عقب بمونه یا با خطا مواجه بشه (کلد-استارت ایزوله، خطای نوشتن در D1، و...)، عدد
-// واقعیِ کلودفلر جایگزینش بشه. اگه عدد کلودفلر از عدد ذخیره‌شده بیشتر بود، همون‌جا هم در settings
-// بازنویسی می‌شه تا این «ترمیم» ماندگار بمونه، نه فقط برای همین یک چک.
-// نتیجه‌ی نهایی (فقط یک بایت "0"/"1") با TTL کوتاه روی caches.default کش می‌شه تا این چک روی هر
-// اتصال/هارتبیت، دیتابیس یا Cloudflare API رو صدا نزنه (خودِ getCfUsage هم کش ۱۵ثانیه‌ای جدا داره).
-// چون req_today و عدد کلودفلر هر دو دقیقاً سر تاریخ UTC جدید از نو شمارش می‌شن، این قفل هم خودکار
-// سر ساعت 00:00 UTC آزاد می‌شه - عمداً هیچ فیلدی روی جدول users نوشته نمی‌شه (بر خلاف قطعیِ
-// per-user)، چون این یک محدودیتِ موقتِ سراسریه، نه غیرفعال‌سازی دائمیِ یک کاربر خاص.
-const GLOBAL_REQ_LIMIT_DEFAULT = 75000;
-// تی‌تی‌ال کش نتیجه‌ی نهایی (0/1) - چون خودتون گفتید چند ده‌ثانیه/چند دقیقه تاخیر مهم نیست، این عدد
-// از ۲۰ به ۶۰ ثانیه افزایش پیدا کرد تا تعداد دفعاتی که این تابع به‌جای cache باید واقعاً به D1/Cloudflare
-// سر بزنه، حدود ۳ برابر کمتر بشه (مستقیماً هزینه‌ی D1 read و درخواست به Cloudflare API رو کم می‌کنه).
+const GLOBAL_REQ_LIMIT_DEFAULT = 75e3;
 const GLOBAL_REQ_LIMIT_CACHE_TTL_SECONDS = 60;
-// فقط وقتی شمارنده‌ی خودِ پنل به این نسبت از سقف نزدیک شده، زحمت صدا زدن Cloudflare GraphQL API
-// (که یک HTTP fetch واقعی به خارج از Workers هست، نه یک خواندن ارزان از D1) رو به خودمون می‌دیم.
-// در بقیه‌ی روز (مثلاً وقتی مصرف ۱۰٪ سقفه) اصلاً به کلودفلر سر نمی‌زنیم و فقط شمارنده‌ی خودِ پنل
-// (که همیشه در دسترسه و رایگانه) ملاک قرار می‌گیره. این تنها جایی هست که "لایه‌ی دومِ" کلودفلر واقعاً
-// لازمه: نزدیکی به سقف، جایی که دقت بیشتر اهمیت داره.
 const GLOBAL_REQ_LIMIT_CF_CHECK_THRESHOLD_RATIO = 0.9;
 function globalReqLimitCacheRequest() {
-	return new Request("https://internal.ZYX/global_req_limit_status");
+  return new Request("https://internal.ZYX/global_req_limit_status");
 }
 async function isGlobalReqLimitReached(env, ctx) {
-	try {
-		const cached = await caches.default.match(globalReqLimitCacheRequest());
-		if (cached) return (await cached.text()) === "1";
-	} catch (e) { }
-	let reached = false;
-	try {
-		const today = new Date().toISOString().split("T")[0];
-		// به‌جای ۳ کوئری جدای SELECT ... first() (که هر کدوم یه رفت‌وبرگشت جدا به D1 هست)، هر سه
-		// کلید توی یک کوئری با IN (...) خونده می‌شن - نتیجه یکیه، ولی یک رفت‌وبرگشت D1 به‌جای سه‌تا.
-		const settingsRows = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('global_req_limit','req_today','req_last_date')").all();
-		const settingsMap = {};
-		(settingsRows.results || []).forEach((r) => { settingsMap[r.key] = r.value; });
-		const limitVal = settingsMap.global_req_limit;
-		const limit = limitVal !== undefined && limitVal !== null && limitVal !== "" ? parseInt(limitVal) || 0 : GLOBAL_REQ_LIMIT_DEFAULT;
-		// اگر آخرین flush مربوط به دیروز (یا قبل‌تر) باشه، یعنی هنوز هیچ ایزوله‌ای برای امروز چیزی
-		// commit نکرده - req_today فعلاً متعلق به دیروزه، پس نباید به‌عنوان مصرف امروز حساب بشه.
-		let dbTodayTotal = settingsMap.req_last_date === today && settingsMap.req_today !== undefined ? parseInt(settingsMap.req_today) || 0 : 0;
-		let liveTotal = dbTodayTotal + GLOBAL_REQ_COUNT;
-		// فقط اگه به آستانه‌ی نزدیکی به سقف رسیده باشیم، برای اطمینان بیشتر سراغ عدد واقعیِ کلودفلر
-		// می‌ریم. تا قبل از اون آستانه، شمارنده‌ی خودِ پنل به‌تنهایی کافیه و هیچ fetch خارجی‌ای زده نمی‌شه.
-		if (limit > 0 && liveTotal >= limit * GLOBAL_REQ_LIMIT_CF_CHECK_THRESHOLD_RATIO) {
-			const liveCf = await getCfUsage(env);
-			const cfTodayTotal = (liveCf && liveCf.today) || 0;
-			if (cfTodayTotal > dbTodayTotal) {
-				dbTodayTotal = cfTodayTotal;
-				liveTotal = dbTodayTotal + GLOBAL_REQ_COUNT;
-				const persistTask = (async () => {
-					try {
-						await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTodayTotal), String(dbTodayTotal)).run();
-						await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
-					} catch (e) { }
-				})();
-				if (ctx) ctx.waitUntil(persistTask);
-				else persistTask.catch(() => { });
-			}
-		}
-		reached = limit > 0 && liveTotal >= limit;
-	} catch (e) {
-		reached = false;
-	}
-	try {
-		const res = new Response(reached ? "1" : "0", { headers: { "Cache-Control": `max-age=${GLOBAL_REQ_LIMIT_CACHE_TTL_SECONDS}` } });
-		const task = caches.default.put(globalReqLimitCacheRequest(), res);
-		if (ctx) ctx.waitUntil(task);
-		else task.catch(() => { });
-	} catch (e) { }
-	return reached;
+  try {
+    const cached = await caches.default.match(globalReqLimitCacheRequest());
+    if (cached) return await cached.text() === "1";
+  } catch (e) {
+  }
+  let reached = false;
+  try {
+    const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+    const settingsRows = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('global_req_limit','req_today','req_last_date')").all();
+    const settingsMap = {};
+    (settingsRows.results || []).forEach((r) => {
+      settingsMap[r.key] = r.value;
+    });
+    const limitVal = settingsMap.global_req_limit;
+    const limit = limitVal !== void 0 && limitVal !== null && limitVal !== "" ? parseInt(limitVal) || 0 : GLOBAL_REQ_LIMIT_DEFAULT;
+    let dbTodayTotal = settingsMap.req_last_date === today && settingsMap.req_today !== void 0 ? parseInt(settingsMap.req_today) || 0 : 0;
+    let liveTotal = dbTodayTotal + GLOBAL_REQ_COUNT;
+    if (limit > 0 && liveTotal >= limit * GLOBAL_REQ_LIMIT_CF_CHECK_THRESHOLD_RATIO) {
+      const liveCf = await getCfUsage(env);
+      const cfTodayTotal = liveCf && liveCf.today || 0;
+      if (cfTodayTotal > dbTodayTotal) {
+        dbTodayTotal = cfTodayTotal;
+        liveTotal = dbTodayTotal + GLOBAL_REQ_COUNT;
+        const persistTask = (async () => {
+          try {
+            await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTodayTotal), String(dbTodayTotal)).run();
+            await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
+          } catch (e) {
+          }
+        })();
+        if (ctx) ctx.waitUntil(persistTask);
+        else persistTask.catch(() => {
+        });
+      }
+    }
+    reached = limit > 0 && liveTotal >= limit;
+  } catch (e) {
+    reached = false;
+  }
+  try {
+    const res = new Response(reached ? "1" : "0", { headers: { "Cache-Control": `max-age=${GLOBAL_REQ_LIMIT_CACHE_TTL_SECONDS}` } });
+    const task = caches.default.put(globalReqLimitCacheRequest(), res);
+    if (ctx) ctx.waitUntil(task);
+    else task.catch(() => {
+    });
+  } catch (e) {
+  }
+  return reached;
 }
-// کلید روزانه به وقت UTC، به فرم YYYY-MM-DD - ریست ساعت 00:00 UTC. هنوز برای گروه‌بندی
-// نمودار 30 روزه (/api/stats-history) و برای cutoff پاکسازی استفاده می‌شود؛ خودِ ذخیره‌سازی
-// ردیف‌های daily_traffic/daily_requests دیگر روزانه نیست، ساعتی است (به utcHourKey زیر نگاه کنید).
 function utcDateKey(ts) {
-	return new Date(ts).toISOString().split("T")[0];
+  return new Date(ts).toISOString().split("T")[0];
 }
-// کلید ساعتی به وقت UTC، به فرم YYYY-MM-DDTHH (پیشوند دقیق ISO، پس مرتب‌سازی رشته‌ای = مرتب‌سازی
-// زمانی واقعی). این همون ستون TEXT PRIMARY KEY "date" قبلی رو استفاده می‌کنه، فقط دیگه یک روز کامل
-// رو نماینده نیست، یک ساعت رو نماینده‌ست - پس نیازی به ALTER TABLE / migration نیست. چون این پیشوند
-// همیشه با فرمت روزانه‌ی قدیمی (YYYY-MM-DD) هم‌خوانی داره (۱۰ کاراکتر اول یکسانه)، مقایسه‌های رشته‌ای
-// (>=, <, ORDER BY) و همچنین cutoff پاکسازی که هنوز بر مبنای روزه، بدون تغییر درست کار می‌کنن.
 function utcHourKey(ts) {
-	return new Date(ts).toISOString().slice(0, 13); // "YYYY-MM-DDTHH"
+  return new Date(ts).toISOString().slice(0, 13);
 }
-// ثبت/جمع‌زدن مقدار مصرف (بر حسب گیگابایت) روی ردیف ساعت جاری (UTC) در daily_traffic.
-// این تابع در همان لحظاتی صدا زده می‌شود که ترافیک کاربران از کش حافظه به D1 flush می‌شود.
-// قبلاً کلید هر ردیف یک روز کامل بود (خطای بازه‌ی «7/30 روز گذشته» تا ۲۴ ساعت)؛ حالا هر ردیف یک
-// ساعت است، پس بازه‌های رولینگ (روزانه/7روزه/30روزه) با دقت ~۱ ساعت محاسبه می‌شن، در حالی که تعداد
-// کل ردیف‌ها همچنان محدود و ارزان می‌مونه (حداکثر ۲۴×۳۰=۷۲۰ ردیف با همون نگه‌داری 30 روزه‌ی فعلی) -
-// نه یک ردیف مستقل به ازای هر رویداد flush (که رشد نامحدود و هزینه‌ی خواندن/نوشتن غیرقابل‌کنترلی داشت).
 function recordDailyTraffic(env, ctx, deltaGb) {
-	if (!deltaGb || deltaGb <= 0) return;
-	const hourKey = utcHourKey(Date.now());
-	const task = env.DB.prepare("INSERT INTO daily_traffic (date, gb) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET gb = gb + excluded.gb").bind(hourKey, deltaGb).run().catch(() => { });
-	if (ctx) ctx.waitUntil(task);
-	// خودِ promise برگردونده می‌شه تا صداکننده‌هایی که ctx ندارن (مثل flushExpiredTraffic) بتونن
-	// await کنن؛ وگرنه اون نوشتن یتیم می‌موند و ممکن بود با تموم شدن ریکوئست اصلاً اجرا نشه.
-	return task;
+  if (!deltaGb || deltaGb <= 0) return;
+  const hourKey = utcHourKey(Date.now());
+  const task = env.DB.prepare("INSERT INTO daily_traffic (date, gb) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET gb = gb + excluded.gb").bind(hourKey, deltaGb).run().catch(() => {
+  });
+  if (ctx) ctx.waitUntil(task);
+  return task;
 }
-// ---- Per-connection user-auth cache (D1 read reduction) --------------------------------------
-// Same caches.default (edge Cache API) pattern as checkAutoResets() above, applied to the
-// single hottest D1 read in this file: "which user does this uuid / trojan-hash belong to" -
-// executed on every incoming VLESS/Trojan connection attempt, including garbage/scanner traffic
-// that never matches a real user. For Trojan specifically, a cache miss on the direct
-// trojan_hash/uuid lookup falls back to `SELECT * FROM users WHERE is_active = 1` (a full
-// table scan) - caching the outcome (positive AND negative) of that whole lookup means repeat
-// traffic from the same client, and repeat garbage from the same scanner, stops hitting D1
-// entirely once cached.
-//
-// TTL is short (10s) on purpose: this cache backs an authorization decision (is_active,
-// limit_gb, limit_req, expiry_days), not just display data. On top of the short TTL, every
-// place an admin (or the system) changes those fields for a specific user calls
-// invalidateUserAuthCache() right away, so a stale read can only survive for whatever is left
-// of those 10 seconds - never longer. Fields that are NOT auth/routing-critical (active_ips,
-// last_active, the live used_gb/used_req counters, proxy_rotate_cooldowns) are deliberately
-// left to expire on TTL alone: they're already eventually-consistent by design elsewhere in
-// this file (GLOBAL_TRAFFIC_CACHE / USER_REQ_CACHE add in-memory deltas on top of whatever
-// used_gb/used_req came back, cached or not), so invalidating on every one of those routine
-// writes would erase most of the D1-read savings for close to no real benefit.
 const USER_AUTH_CACHE_TTL_SECONDS = 10;
 function userAuthCacheRequest(kind, key) {
-	return new Request(`https://internal.ZYX/user_auth/${kind}/${encodeURIComponent(String(key))}`);
+  return new Request(`https://internal.ZYX/user_auth/${kind}/${encodeURIComponent(String(key))}`);
 }
 async function getCachedAuthUser(kind, key) {
-	if (!key) return undefined;
-	try {
-		const res = await caches.default.match(userAuthCacheRequest(kind, key));
-		if (!res) return undefined; // no cache entry at all -> caller must hit D1
-		const text = await res.text();
-		return text === "0" ? null : JSON.parse(text); // "0" = cached "no such user" (negative cache)
-	} catch (e) {
-		return undefined;
-	}
+  if (!key) return void 0;
+  try {
+    const res = await caches.default.match(userAuthCacheRequest(kind, key));
+    if (!res) return void 0;
+    const text = await res.text();
+    return text === "0" ? null : JSON.parse(text);
+  } catch (e) {
+    return void 0;
+  }
 }
 function putCachedAuthUser(ctx, kind, key, user) {
-	if (!key) return;
-	try {
-		const body = user ? JSON.stringify(user) : "0";
-		const res = new Response(body, { headers: { "Cache-Control": `max-age=${USER_AUTH_CACHE_TTL_SECONDS}` } });
-		const task = caches.default.put(userAuthCacheRequest(kind, key), res);
-		if (ctx) ctx.waitUntil(task);
-		else task.catch(() => { });
-	} catch (e) { }
+  if (!key) return;
+  try {
+    const body = user ? JSON.stringify(user) : "0";
+    const res = new Response(body, { headers: { "Cache-Control": `max-age=${USER_AUTH_CACHE_TTL_SECONDS}` } });
+    const task = caches.default.put(userAuthCacheRequest(kind, key), res);
+    if (ctx) ctx.waitUntil(task);
+    else task.catch(() => {
+    });
+  } catch (e) {
+  }
 }
-// Deletes both the vless-style (raw uuid) and trojan-style (sha224 of uuid) cache entries for a
-// user, so callers only ever need to pass the uuid they know about. Returns a promise the
-// caller may await (replaceBrokenProxy does, since it has no ctx to waitUntil with); when ctx
-// is available it's also registered there so callers that don't await still get to completion.
 function invalidateUserAuthCache(ctx, uuid, trojanHash) {
-	try {
-		const tasks = [];
-		if (uuid) tasks.push(caches.default.delete(userAuthCacheRequest("u", uuid)));
-		const tHash = trojanHash || (uuid ? sha224Pure(uuid) : null);
-		if (tHash) tasks.push(caches.default.delete(userAuthCacheRequest("t", tHash)));
-		const all = Promise.all(tasks).catch(() => { });
-		if (ctx) ctx.waitUntil(all);
-		return all;
-	} catch (e) {
-		return Promise.resolve();
-	}
+  try {
+    const tasks = [];
+    if (uuid) tasks.push(caches.default.delete(userAuthCacheRequest("u", uuid)));
+    const tHash = trojanHash || (uuid ? sha224Pure(uuid) : null);
+    if (tHash) tasks.push(caches.default.delete(userAuthCacheRequest("t", tHash)));
+    const all = Promise.all(tasks).catch(() => {
+    });
+    if (ctx) ctx.waitUntil(all);
+    return all;
+  } catch (e) {
+    return Promise.resolve();
+  }
 }
 let GLOBAL_IPS_CACHE = {};
 let GLOBAL_IPS_LAST_FETCH = 0;
 async function getCachedIps() {
-	const now = Date.now();
-	if (now - GLOBAL_IPS_LAST_FETCH < 86400000 && Object.keys(GLOBAL_IPS_CACHE).length > 0) {
-		return GLOBAL_IPS_CACHE;
-	}
-	try {
-		const res = await fetchWithFallback("ips.txt");
-		if (!res.ok) return GLOBAL_IPS_CACHE;
-		const text = await res.text();
-		const blocks = text.split("----------");
-		let newData = {};
-		blocks.forEach((block) => {
-			const lines = block
-				.trim()
-				.split("\n")
-				.map((l) => l.trim())
-				.filter((l) => l.length > 0);
-			if (lines.length === 0) return;
-			let opName = "Unknown";
-			const ips = [];
-			lines.forEach((line) => {
-				if (line.includes("#")) opName = line.split("#")[1].trim();
-				else if (!line.startsWith("[source")) ips.push(line);
-			});
-			if (ips.length > 0) newData[opName] = ips;
-		});
-		if (Object.keys(newData).length > 0) {
-			GLOBAL_IPS_CACHE = newData;
-			GLOBAL_IPS_LAST_FETCH = now;
-		}
-	} catch (e) {}
-	return GLOBAL_IPS_CACHE;
+  const now = Date.now();
+  if (now - GLOBAL_IPS_LAST_FETCH < 864e5 && Object.keys(GLOBAL_IPS_CACHE).length > 0) {
+    return GLOBAL_IPS_CACHE;
+  }
+  try {
+    const res = await fetchWithFallback("ips.txt");
+    if (!res.ok) return GLOBAL_IPS_CACHE;
+    const text = await res.text();
+    const blocks = text.split("----------");
+    let newData = {};
+    blocks.forEach((block) => {
+      const lines = block.trim().split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+      if (lines.length === 0) return;
+      let opName = "Unknown";
+      const ips = [];
+      lines.forEach((line) => {
+        if (line.includes("#")) opName = line.split("#")[1].trim();
+        else if (!line.startsWith("[source")) ips.push(line);
+      });
+      if (ips.length > 0) newData[opName] = ips;
+    });
+    if (Object.keys(newData).length > 0) {
+      GLOBAL_IPS_CACHE = newData;
+      GLOBAL_IPS_LAST_FETCH = now;
+    }
+  } catch (e) {
+  }
+  return GLOBAL_IPS_CACHE;
 }
 function getRandomIps(cachedIpsData, operator, count) {
-	let availableIps = [];
-	if (operator === "all") {
-		Object.values(cachedIpsData).forEach((ips) => (availableIps = availableIps.concat(ips)));
-	} else {
-		availableIps = cachedIpsData[operator] || [];
-	}
-	availableIps = [...new Set(availableIps)];
-	if (availableIps.length === 0) return [];
-	if (count >= availableIps.length) return availableIps;
-	const shuffled = availableIps.slice();
-	for (let i = shuffled.length - 1; i > 0; i--) {
-		const j = Math.floor(Math.random() * (i + 1));
-		[shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-	}
-	return shuffled.slice(0, count);
+  let availableIps = [];
+  if (operator === "all") {
+    Object.values(cachedIpsData).forEach((ips) => availableIps = availableIps.concat(ips));
+  } else {
+    availableIps = cachedIpsData[operator] || [];
+  }
+  availableIps = [...new Set(availableIps)];
+  if (availableIps.length === 0) return [];
+  if (count >= availableIps.length) return availableIps;
+  const shuffled = availableIps.slice();
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled.slice(0, count);
 }
 async function checkAutoRotates(env, ctx) {
 }
-
-// Default set of countries auto-provisioned for a brand-new user, and the set
-// that gets added to already-existing users automatically whenever the admin
-// saves the pinned-locations list in settings (see reset_action === "locations"
-// below, and applyPinnedLocationsToAllUsers() on the client). This is now just the built-in
-// FALLBACK: the real, admin-editable list lives in the `settings` table under
-// the key "pinned_locations" (see getPinnedLocationsSetting()). This constant
-// is only used if that setting has never been saved yet (fresh install), so
-// existing deployments keep working unchanged after this update.
-// replaceBrokenProxy() keeps each slot locked to its own country when healing
-// a broken proxy, so once a slot is tagged with a country it never drifts to
-// another country - regardless of whether that country is still "pinned".
 const PINNED_DEFAULT_LOCATIONS_FALLBACK = ["UZ", "KZ", "TR", "LY", "NL", "AL", "EE", "BG", "LV", "SE", "NO", "GB", "US", "ES", "BE"];
-// Built-in default/seed values for the three admin-editable settings-modal fields
-// "آیپی تمیز سراسری" (global_clean_ip), "آیپی های تمیز دیگر" (other_clean_ips) and
-// "Proxy IP" (inline_proxy_ip). Used in two places: (1) ensureSchema() seeds these
-// straight into the `settings` table on first run (INSERT OR IGNORE) so they exist
-// as real app defaults from the very first deploy - no manual "save" required in
-// the panel first - and (2) as the read-side fallback in the getters below, only
-// for the case where the row is missing entirely (never configured). If the admin
-// has explicitly saved an empty value (to turn a field off on purpose), that empty
-// value is respected and is NOT replaced by these defaults.
 const DEFAULT_GLOBAL_CLEAN_IP_FALLBACK = "104.20.25.138";
 const DEFAULT_OTHER_CLEAN_IPS_FALLBACK = ["104.26.1.116", "104.21.122.162", "185.162.228.105", "185.148.105.218", "104.18.39.219", "185.162.230.76"];
 const DEFAULT_INLINE_PROXY_IP_FALLBACK = "178.105.227.210";
-// «محدودیت کاربر» (user_limit) - سقف تعداد دستگاه هم‌زمان هر کاربر؛ همون فیلد «محدودیت
-// کاربر» توی فرم کاربر (ستون‌های ip_limit/max_connections). سه‌جا استفاده می‌شه: (۱) پیش‌فرض
-// کاربر جدید وقتی فرم/API چیزی توی این فیلد نفرستاده باشه (POST /api/users)، (۲) با «ذخیره‌ی
-// تنظیمات» یا Push پنل مادر روی ستون‌های ip_limit/max_connections همه‌ی کاربرهای *موجود* هم
-// اعمال می‌شه (POST /api/settings/bulk)، (۳) پیش‌فرض placeholder فرم. فقط وقتی مقدار
-// fallback استفاده می‌شه که تنظیم 'user_limit' هیچ‌وقت توی settings ذخیره نشده باشه (نصب تازه).
 const DEFAULT_USER_LIMIT_FALLBACK = 2;
-// «هشدار تعداد دستگاه» (device_warning_threshold) - آستانه‌ی سراسریِ *هشدار*: اگه تعداد
-// دستگاه‌های فعالِ یه کاربر از این عدد بیشتر بشه، device_warning_at ست می‌شه (persistActiveIp
-// پایین‌تر) و روی کارتش هشدار قرمز می‌آد. این عدد دیگه هیچ ربطی به ip_limit/max_connections
-// کاربرها نداره (اون‌ها با «محدودیت کاربر» بالا ست می‌شن) و هیچ اتصالی قطع نمی‌کنه.
-// 0 = هشدار خاموش. فقط وقتی fallback استفاده می‌شه که تنظیمش هیچ‌وقت ذخیره نشده باشه.
 const DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK = 4;
-// «سیاست ثبت دستگاه متصل» (device seen/confirmed policy). قبلاً همون لحظه‌ی اول پیام
-// VLESS/Trojan یه IP فوری «دستگاه» حساب می‌شد - بدون حداقل زمان یا حجم - برای همین یه
-// تست پینگِ چندثانیه‌ای (یا حتی یه هندشیکِ ناتمام) دقیقاً مثل یه دستگاه واقعی می‌شمرد.
-// حالا هر IPِ تازه اول فقط «دیده‌شده»ست (فقط توی حافظه‌ی خودِ همون اتصال - نه D1، نه
-// سقف ip_limit، نه شمارنده‌ی آنلاین) و با هر کدوم از این دو شرط «تأیید» می‌شه (نگاه
-// کنید به confirmActiveIp/checkDeviceConfirmation در handlevIees):
-//  (۱) اتصالِ پایدار: همون یک اتصال حداقل DEVICE_CONFIRM_MIN_DURATION_MS باز بمونه و
-//      حداقل DEVICE_CONFIRM_MIN_BYTES بایت (مجموع آپلود+دانلود، از addBytes) جابه‌جا کنه.
-//  (۲) اتصال‌های کوتاهِ زیاد: مجموع بایتِ همون (کاربر, IP) - نگاه کنید IP_BURST_BYTES -
-//      توی یه پنجره‌ی DEVICE_CONFIRM_BURST_WINDOW_MS به DEVICE_CONFIRM_BURST_BYTES برسه.
-// این عددها تخمینی‌ان (یه TLS handshake + یه پینگ معمولاً حدود ۵ تا ۸ کیلوبایته)، نه
-// اندازه‌گیری‌شده از داده‌ی واقعی - جایی برای تنظیم دقیق‌ترشون در آینده هست. سقفِ
-// «محدودیت کاربر»/ip_limit هم از همین نسخه به بعد فقط توی confirmActiveIp (لحظه‌ی
-// تأیید) اعمال می‌شه، نه موقع اولین هندشیک - یعنی یه تست پینگ همیشه رد می‌شه، ولی
-// استفاده‌ی واقعی‌ای که جا نداره بعد از چند ثانیه/چند KB قطع می‌شه. محدودیت‌های شناخته‌شده
-// (عمداً حل نشده): دستگاهی که همیشه خیلی کم‌حجمه اصلاً «تأیید» نمی‌شه (مصرفش همچنان
-// روی سهمیه‌ی حجم می‌ره)؛ IPِ قدیمیِ یه دستگاهی که شبکه عوض کرده تا ۱۸۰ ثانیه یه جای
-// سقف رو اشغال می‌کنه؛ IP_BURST_BYTES بین isolateها به اشتراک نیست (تقریبیه، نه دقیق).
-const DEVICE_CONFIRM_MIN_DURATION_MS = 10000;
+const DEVICE_CONFIRM_MIN_DURATION_MS = 1e4;
 const DEVICE_CONFIRM_MIN_BYTES = 30 * 1024;
-const DEVICE_CONFIRM_BURST_WINDOW_MS = 5 * 60 * 1000;
+const DEVICE_CONFIRM_BURST_WINDOW_MS = 5 * 60 * 1e3;
 const DEVICE_CONFIRM_BURST_BYTES = 1024 * 1024;
-// «تأخیر هشدار تعداد دستگاه» - device_warning_at دیگه با همون اولین باری که تعداد
-// دستگاه‌های تأییدشده از آستانه (device_warning_threshold) رد می‌شه ست نمی‌شه؛ باید
-// این تعداد بار پشت‌سرهم (هر بار = یک تأیید دستگاه تازه یا یک رفرش هیت‌بیت - نگاه کنید
-// evaluateDeviceWarning) عبور از آستانه دیده بشه. برگشتن به زیر آستانه (حتی یه بار)
-// شمارش رو صفر می‌کنه. یه IP که با یه اتصال کوتاهِ لحظه‌ای از سقف رد بشه و توی همون
-// دور بعدی دیگه نباشه، هیچ‌وقت هشدار نمی‌سازه.
 const DEVICE_WARNING_CONFIRM_STREAK = 2;
-// «پورت» - پورتی که هم به‌عنوان مقدار پیش‌فرض چک‌باکس پورت توی فرم افزودن
-// کاربر جدید انتخاب می‌شه (renderPortCheckboxes سمت کلاینت)، و هم موقع «ذخیره
-// تنظیمات» به‌صورت override کامل روی ستون port همه‌ی کاربرهای *موجود* هم
-// اعمال می‌شه (پورت‌های قبلی‌شون پاک و با همین یکی جایگزین می‌شه - نگاه کنید
-// به POST /api/settings/bulk). این مقدار فقط به‌عنوان پیش‌فرضِ اولیه استفاده
-// می‌شه، برای وقتی تنظیم 'default_port' هیچ‌وقت توی settings ذخیره نشده باشه
-// (نصب تازه).
 const DEFAULT_PORT_FALLBACK = "2083";
-// «پیش‌فرض‌های کاربر جدید» - دقیقاً همان مقادیری که فرم دستی «ایجاد کاربر جدید»
-// (openCreateModal سمت کلاینت) از قبل hardcode می‌کرد، حالا به‌صورت Settings واقعی
-// (کلیدهای new_user_* در جدول settings) تا هم از مودال «تنظیمات پـنـل» قابل ویرایش
-// باشند و هم پنل مادر بتواند با POST /api/settings/bulk همه‌ی پنل‌ها را با هم
-// یکسان کند. سه جا از این‌ها می‌خوانند: (۱) ensureSchema() اگر کلیدی نبود
-// seed می‌کند، (۲) POST /api/users برای هر فیلدی که درخواست نفرستاده باشد (مثلاً
-// وقتی پنل مادر فقط username می‌فرستد)، (۳) فرم «ایجاد کاربر جدید» و Import Users
-// سمت کلاینت. همه‌ی مقدارها رشته‌اند (ستون value جدول settings TEXT است):
-// فلگ‌ها "1"/"0"، frag_len/frag_int خالی = فرگمنتیشن خاموش.
 const NEW_USER_DEFAULTS_FALLBACK = {
-	new_user_fingerprint: "ios",
-	new_user_auto_reset_vol_days: "1",
-	new_user_auto_reset_req_days: "1",
-	new_user_auto_rotate_user_proxy: "1",
-	new_user_enable_direct: "0",
-	new_user_block_porn: "0",
-	new_user_block_ads: "0",
-	new_user_frag_len: "",
-	new_user_frag_int: "",
-	new_user_ip_operator: "all",
-	new_user_ip_count: "999999", // no count cap — getRandomIps() returns every available Clean IP once count >= pool size
-	new_user_auto_rotate_ip: "0",
-	new_user_start_on_first_connect: "0",
-	new_user_connection_type: "vless",
-	// Early Data (ed=): پیش‌فرض خاموش. new_user_early_data_size بایت early data است (مقدار
-	// پیشنهادی 2560، حداکثر 8192 طبق مستندات xray/sing-box WS early data).
-	new_user_early_data_enabled: "0",
-	new_user_early_data_size: "2560",
+  new_user_fingerprint: "ios",
+  new_user_auto_reset_vol_days: "1",
+  new_user_auto_reset_req_days: "1",
+  new_user_auto_rotate_user_proxy: "1",
+  new_user_enable_direct: "0",
+  new_user_block_porn: "0",
+  new_user_block_ads: "0",
+  new_user_frag_len: "",
+  new_user_frag_int: "",
+  new_user_ip_operator: "all",
+  new_user_ip_count: "999999",
+  // no count cap — getRandomIps() returns every available Clean IP once count >= pool size
+  new_user_auto_rotate_ip: "0",
+  new_user_start_on_first_connect: "0",
+  new_user_connection_type: "vless",
+  // Early Data (ed=): پیش‌فرض خاموش. new_user_early_data_size بایت early data است (مقدار
+  // پیشنهادی 2560، حداکثر 8192 طبق مستندات xray/sing-box WS early data).
+  new_user_early_data_enabled: "0",
+  new_user_early_data_size: "2560"
 };
-// فقط این دو کلید مجازند خالی ذخیره شوند (خالی = فرگمنت خاموش)؛ برای بقیه، مقدار
-// خالی/نامعتبر یعنی «از NEW_USER_DEFAULTS_FALLBACK استفاده کن».
 const NEW_USER_DEFAULTS_EMPTY_OK = ["new_user_frag_len", "new_user_frag_int"];
 const NEW_USER_TLS_PORTS = ["443", "2053", "2083", "2087", "2096", "8443"];
-// Same list as the Fingerprint <select> of the panel (fingerprint-select / nud-fingerprint) — the only
-// values POST /api/settings/bulk accepts when it is asked to write a fingerprint onto existing users.
 const NEW_USER_FINGERPRINTS = ["chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized", "unsafe"];
-// Early Data (ed=): سقف مجاز سایز (بایت) برای new_user_early_data_size وقتی POST /api/settings/bulk قراره اون رو روی
-// کاربرهای *موجود* بنویسه؛ همون ۸۱۹۲ که توی مستندات xray/sing-box برای WS early data حداکثره.
 const EARLY_DATA_MAX_SIZE = 8192;
-// Early Data (ed=): سازنده‌های مشترک برای SubscriptionService.generateText (?ed= روی path) و generateSingbox
-// (فیلدهای transport). دو کپی کلاینت‌ساید (getvIeesLink پنل و صفحه‌ی Status) همین قاعده را دارند (بند ۱-۲ خلاصه).
-// خاموش/نبودن فیلد = خروجی دقیقاً مثل قبل؛ سایز نامعتبر (خارج از 1..EARLY_DATA_MAX_SIZE) = 2560.
 function getUserEarlyDataSize(user) {
-	if (!user || Number(user.early_data_enabled) !== 1) return 0;
-	const n = parseInt(user.early_data_size, 10);
-	return n >= 1 && n <= EARLY_DATA_MAX_SIZE ? n : 2560;
+  if (!user || Number(user.early_data_enabled) !== 1) return 0;
+  const n = parseInt(user.early_data_size, 10);
+  return n >= 1 && n <= EARLY_DATA_MAX_SIZE ? n : 2560;
 }
 function buildEarlyDataPathSuffix(user) {
-	const size = getUserEarlyDataSize(user);
-	return size ? "?ed=" + size : "";
+  const size = getUserEarlyDataSize(user);
+  return size ? "?ed=" + size : "";
 }
 function applySingboxEarlyData(transport, user) {
-	const size = getUserEarlyDataSize(user);
-	if (size && transport) {
-		transport.max_early_data = size;
-		transport.early_data_header_name = "Sec-WebSocket-Protocol";
-	}
+  const size = getUserEarlyDataSize(user);
+  if (size && transport) {
+    transport.max_early_data = size;
+    transport.early_data_header_name = "Sec-WebSocket-Protocol";
+  }
 }
-// Hard cap on how many location slots a single user can accumulate over time
-// via the additive per-user "locations" reset action (see below), which now
-// runs automatically for every user right after the admin saves the pinned
-// list in settings. Provisioning a
-// brand-new user is NOT capped by this (a new user always gets the full
-// current pinned list, even if that list itself has grown past this number).
 const MAX_LOCATIONS_PER_USER = 20;
-// /api/change-password was removed from this list: the mother panel's "Push to All Panels" now sets the
-// default admin password through it with X-Master-Key (see the handler below for the master-key branch).
 const MASTER_KEY_BLOCKED_PATHS = ["/api/auto-update-setup", "/api/update-panel", "/api/update-panel-github"];
-
-// Full ISO 3166-1 alpha-2 -> alpha-3 table (249 entries), used to compute a
-// permanent WS path segment for ANY country in the VIP proxy repository -
-// not just the ones currently pinned in settings. This is what makes "پین
-// بودن" purely a statement about which countries get auto-added to the
-// default sub/config list; it has no bearing on whether a country's path
-// works or whether it gets auto-healed - every country in proxy_vip/*.txt
-// gets a working path and healing from the moment it's ever assigned to a
-// user, pinned or not.
 const ISO_ALPHA3_MAP = {
-	AD: "AND", AE: "ARE", AF: "AFG", AG: "ATG", AI: "AIA", AL: "ALB",
-	AM: "ARM", AO: "AGO", AQ: "ATA", AR: "ARG", AS: "ASM", AT: "AUT",
-	AU: "AUS", AW: "ABW", AX: "ALA", AZ: "AZE", BA: "BIH", BB: "BRB",
-	BD: "BGD", BE: "BEL", BF: "BFA", BG: "BGR", BH: "BHR", BI: "BDI",
-	BJ: "BEN", BL: "BLM", BM: "BMU", BN: "BRN", BO: "BOL", BQ: "BES",
-	BR: "BRA", BS: "BHS", BT: "BTN", BV: "BVT", BW: "BWA", BY: "BLR",
-	BZ: "BLZ", CA: "CAN", CC: "CCK", CD: "COD", CF: "CAF", CG: "COG",
-	CH: "CHE", CI: "CIV", CK: "COK", CL: "CHL", CM: "CMR", CN: "CHN",
-	CO: "COL", CR: "CRI", CU: "CUB", CV: "CPV", CW: "CUW", CX: "CXR",
-	CY: "CYP", CZ: "CZE", DE: "DEU", DJ: "DJI", DK: "DNK", DM: "DMA",
-	DO: "DOM", DZ: "DZA", EC: "ECU", EE: "EST", EG: "EGY", EH: "ESH",
-	ER: "ERI", ES: "ESP", ET: "ETH", FI: "FIN", FJ: "FJI", FK: "FLK",
-	FM: "FSM", FO: "FRO", FR: "FRA", GA: "GAB", GB: "GBR", GD: "GRD",
-	GE: "GEO", GF: "GUF", GG: "GGY", GH: "GHA", GI: "GIB", GL: "GRL",
-	GM: "GMB", GN: "GIN", GP: "GLP", GQ: "GNQ", GR: "GRC", GS: "SGS",
-	GT: "GTM", GU: "GUM", GW: "GNB", GY: "GUY", HK: "HKG", HM: "HMD",
-	HN: "HND", HR: "HRV", HT: "HTI", HU: "HUN", ID: "IDN", IE: "IRL",
-	IL: "ISR", IM: "IMN", IN: "IND", IO: "IOT", IQ: "IRQ", IR: "IRN",
-	IS: "ISL", IT: "ITA", JE: "JEY", JM: "JAM", JO: "JOR", JP: "JPN",
-	KE: "KEN", KG: "KGZ", KH: "KHM", KI: "KIR", KM: "COM", KN: "KNA",
-	KP: "PRK", KR: "KOR", KW: "KWT", KY: "CYM", KZ: "KAZ", LA: "LAO",
-	LB: "LBN", LC: "LCA", LI: "LIE", LK: "LKA", LR: "LBR", LS: "LSO",
-	LT: "LTU", LU: "LUX", LV: "LVA", LY: "LBY", MA: "MAR", MC: "MCO",
-	MD: "MDA", ME: "MNE", MF: "MAF", MG: "MDG", MH: "MHL", MK: "MKD",
-	ML: "MLI", MM: "MMR", MN: "MNG", MO: "MAC", MP: "MNP", MQ: "MTQ",
-	MR: "MRT", MS: "MSR", MT: "MLT", MU: "MUS", MV: "MDV", MW: "MWI",
-	MX: "MEX", MY: "MYS", MZ: "MOZ", NA: "NAM", NC: "NCL", NE: "NER",
-	NF: "NFK", NG: "NGA", NI: "NIC", NL: "NLD", NO: "NOR", NP: "NPL",
-	NR: "NRU", NU: "NIU", NZ: "NZL", OM: "OMN", PA: "PAN", PE: "PER",
-	PF: "PYF", PG: "PNG", PH: "PHL", PK: "PAK", PL: "POL", PM: "SPM",
-	PN: "PCN", PR: "PRI", PS: "PSE", PT: "PRT", PW: "PLW", PY: "PRY",
-	QA: "QAT", RE: "REU", RO: "ROU", RS: "SRB", RU: "RUS", RW: "RWA",
-	SA: "SAU", SB: "SLB", SC: "SYC", SD: "SDN", SE: "SWE", SG: "SGP",
-	SH: "SHN", SI: "SVN", SJ: "SJM", SK: "SVK", SL: "SLE", SM: "SMR",
-	SN: "SEN", SO: "SOM", SR: "SUR", SS: "SSD", ST: "STP", SV: "SLV",
-	SX: "SXM", SY: "SYR", SZ: "SWZ", TC: "TCA", TD: "TCD", TF: "ATF",
-	TG: "TGO", TH: "THA", TJ: "TJK", TK: "TKL", TL: "TLS", TM: "TKM",
-	TN: "TUN", TO: "TON", TR: "TUR", TT: "TTO", TV: "TUV", TW: "TWN",
-	TZ: "TZA", UA: "UKR", UG: "UGA", UM: "UMI", US: "USA", UY: "URY",
-	UZ: "UZB", VA: "VAT", VC: "VCT", VE: "VEN", VG: "VGB", VI: "VIR",
-	VN: "VNM", VU: "VUT", WF: "WLF", WS: "WSM", YE: "YEM", YT: "MYT",
-	ZA: "ZAF", ZM: "ZMB", ZW: "ZWE",
+  AD: "AND",
+  AE: "ARE",
+  AF: "AFG",
+  AG: "ATG",
+  AI: "AIA",
+  AL: "ALB",
+  AM: "ARM",
+  AO: "AGO",
+  AQ: "ATA",
+  AR: "ARG",
+  AS: "ASM",
+  AT: "AUT",
+  AU: "AUS",
+  AW: "ABW",
+  AX: "ALA",
+  AZ: "AZE",
+  BA: "BIH",
+  BB: "BRB",
+  BD: "BGD",
+  BE: "BEL",
+  BF: "BFA",
+  BG: "BGR",
+  BH: "BHR",
+  BI: "BDI",
+  BJ: "BEN",
+  BL: "BLM",
+  BM: "BMU",
+  BN: "BRN",
+  BO: "BOL",
+  BQ: "BES",
+  BR: "BRA",
+  BS: "BHS",
+  BT: "BTN",
+  BV: "BVT",
+  BW: "BWA",
+  BY: "BLR",
+  BZ: "BLZ",
+  CA: "CAN",
+  CC: "CCK",
+  CD: "COD",
+  CF: "CAF",
+  CG: "COG",
+  CH: "CHE",
+  CI: "CIV",
+  CK: "COK",
+  CL: "CHL",
+  CM: "CMR",
+  CN: "CHN",
+  CO: "COL",
+  CR: "CRI",
+  CU: "CUB",
+  CV: "CPV",
+  CW: "CUW",
+  CX: "CXR",
+  CY: "CYP",
+  CZ: "CZE",
+  DE: "DEU",
+  DJ: "DJI",
+  DK: "DNK",
+  DM: "DMA",
+  DO: "DOM",
+  DZ: "DZA",
+  EC: "ECU",
+  EE: "EST",
+  EG: "EGY",
+  EH: "ESH",
+  ER: "ERI",
+  ES: "ESP",
+  ET: "ETH",
+  FI: "FIN",
+  FJ: "FJI",
+  FK: "FLK",
+  FM: "FSM",
+  FO: "FRO",
+  FR: "FRA",
+  GA: "GAB",
+  GB: "GBR",
+  GD: "GRD",
+  GE: "GEO",
+  GF: "GUF",
+  GG: "GGY",
+  GH: "GHA",
+  GI: "GIB",
+  GL: "GRL",
+  GM: "GMB",
+  GN: "GIN",
+  GP: "GLP",
+  GQ: "GNQ",
+  GR: "GRC",
+  GS: "SGS",
+  GT: "GTM",
+  GU: "GUM",
+  GW: "GNB",
+  GY: "GUY",
+  HK: "HKG",
+  HM: "HMD",
+  HN: "HND",
+  HR: "HRV",
+  HT: "HTI",
+  HU: "HUN",
+  ID: "IDN",
+  IE: "IRL",
+  IL: "ISR",
+  IM: "IMN",
+  IN: "IND",
+  IO: "IOT",
+  IQ: "IRQ",
+  IR: "IRN",
+  IS: "ISL",
+  IT: "ITA",
+  JE: "JEY",
+  JM: "JAM",
+  JO: "JOR",
+  JP: "JPN",
+  KE: "KEN",
+  KG: "KGZ",
+  KH: "KHM",
+  KI: "KIR",
+  KM: "COM",
+  KN: "KNA",
+  KP: "PRK",
+  KR: "KOR",
+  KW: "KWT",
+  KY: "CYM",
+  KZ: "KAZ",
+  LA: "LAO",
+  LB: "LBN",
+  LC: "LCA",
+  LI: "LIE",
+  LK: "LKA",
+  LR: "LBR",
+  LS: "LSO",
+  LT: "LTU",
+  LU: "LUX",
+  LV: "LVA",
+  LY: "LBY",
+  MA: "MAR",
+  MC: "MCO",
+  MD: "MDA",
+  ME: "MNE",
+  MF: "MAF",
+  MG: "MDG",
+  MH: "MHL",
+  MK: "MKD",
+  ML: "MLI",
+  MM: "MMR",
+  MN: "MNG",
+  MO: "MAC",
+  MP: "MNP",
+  MQ: "MTQ",
+  MR: "MRT",
+  MS: "MSR",
+  MT: "MLT",
+  MU: "MUS",
+  MV: "MDV",
+  MW: "MWI",
+  MX: "MEX",
+  MY: "MYS",
+  MZ: "MOZ",
+  NA: "NAM",
+  NC: "NCL",
+  NE: "NER",
+  NF: "NFK",
+  NG: "NGA",
+  NI: "NIC",
+  NL: "NLD",
+  NO: "NOR",
+  NP: "NPL",
+  NR: "NRU",
+  NU: "NIU",
+  NZ: "NZL",
+  OM: "OMN",
+  PA: "PAN",
+  PE: "PER",
+  PF: "PYF",
+  PG: "PNG",
+  PH: "PHL",
+  PK: "PAK",
+  PL: "POL",
+  PM: "SPM",
+  PN: "PCN",
+  PR: "PRI",
+  PS: "PSE",
+  PT: "PRT",
+  PW: "PLW",
+  PY: "PRY",
+  QA: "QAT",
+  RE: "REU",
+  RO: "ROU",
+  RS: "SRB",
+  RU: "RUS",
+  RW: "RWA",
+  SA: "SAU",
+  SB: "SLB",
+  SC: "SYC",
+  SD: "SDN",
+  SE: "SWE",
+  SG: "SGP",
+  SH: "SHN",
+  SI: "SVN",
+  SJ: "SJM",
+  SK: "SVK",
+  SL: "SLE",
+  SM: "SMR",
+  SN: "SEN",
+  SO: "SOM",
+  SR: "SUR",
+  SS: "SSD",
+  ST: "STP",
+  SV: "SLV",
+  SX: "SXM",
+  SY: "SYR",
+  SZ: "SWZ",
+  TC: "TCA",
+  TD: "TCD",
+  TF: "ATF",
+  TG: "TGO",
+  TH: "THA",
+  TJ: "TJK",
+  TK: "TKL",
+  TL: "TLS",
+  TM: "TKM",
+  TN: "TUN",
+  TO: "TON",
+  TR: "TUR",
+  TT: "TTO",
+  TV: "TUV",
+  TW: "TWN",
+  TZ: "TZA",
+  UA: "UKR",
+  UG: "UGA",
+  UM: "UMI",
+  US: "USA",
+  UY: "URY",
+  UZ: "UZB",
+  VA: "VAT",
+  VC: "VCT",
+  VE: "VEN",
+  VG: "VGB",
+  VI: "VIR",
+  VN: "VNM",
+  VU: "VUT",
+  WF: "WLF",
+  WS: "WSM",
+  YE: "YEM",
+  YT: "MYT",
+  ZA: "ZAF",
+  ZM: "ZMB",
+  ZW: "ZWE"
 };
-// Legacy path segments that must NEVER change because they're already baked
-// into links that were issued before this table existed (e.g. GB's segment
-// was "G-b", 2 letters, not the standard 3-letter "G-b-r" this table would
-// otherwise produce). Only add an entry here for a code whose already-issued
-// segment doesn't match the auto-generated one below.
 const LOCATION_PATH_CODE_OVERRIDES = { GB: "G-b" };
 function computePathSegmentFromAlpha3(alpha3) {
-	return alpha3
-		.split("")
-		.map((ch, i) => (i === 0 ? ch : ch.toLowerCase()))
-		.join("-");
+  return alpha3.split("").map((ch, i) => i === 0 ? ch : ch.toLowerCase()).join("-");
 }
-// Built once at module load: every possible path segment -> its country code,
-// so incoming requests can be matched in O(1) instead of scanning the table.
 const PATH_SEGMENT_TO_COUNTRY = (() => {
-	const map = {};
-	for (const cc in ISO_ALPHA3_MAP) map[computePathSegmentFromAlpha3(ISO_ALPHA3_MAP[cc])] = cc;
-	for (const cc in LOCATION_PATH_CODE_OVERRIDES) {
-		const autoSeg = computePathSegmentFromAlpha3(ISO_ALPHA3_MAP[cc]);
-		if (autoSeg !== LOCATION_PATH_CODE_OVERRIDES[cc]) delete map[autoSeg];
-		map[LOCATION_PATH_CODE_OVERRIDES[cc]] = cc;
-	}
-	return map;
+  const map = {};
+  for (const cc in ISO_ALPHA3_MAP) map[computePathSegmentFromAlpha3(ISO_ALPHA3_MAP[cc])] = cc;
+  for (const cc in LOCATION_PATH_CODE_OVERRIDES) {
+    const autoSeg = computePathSegmentFromAlpha3(ISO_ALPHA3_MAP[cc]);
+    if (autoSeg !== LOCATION_PATH_CODE_OVERRIDES[cc]) delete map[autoSeg];
+    map[LOCATION_PATH_CODE_OVERRIDES[cc]] = cc;
+  }
+  return map;
 })();
-// Display code shown in the WS path in place of the old sequential "loc-N"
-// suffix. Works for ANY ISO country code that has a VIP proxy list, not just
-// currently-pinned ones - keyed by country (not array index) so a slot keeps
-// the same path segment even after replaceBrokenProxy() heals it in place,
-// or if a slot's position in user_socks5 ever changes. Only a country code
-// this table has never heard of (not valid ISO 3166-1) falls back to the old
-// "loc-<index>" suffix.
 function getLocationPathSegment(countryCode, locIdx) {
-	if (countryCode) {
-		const cc = countryCode.toUpperCase();
-		if (LOCATION_PATH_CODE_OVERRIDES[cc]) return LOCATION_PATH_CODE_OVERRIDES[cc];
-		if (ISO_ALPHA3_MAP[cc]) return computePathSegmentFromAlpha3(ISO_ALPHA3_MAP[cc]);
-	}
-	return "loc-" + locIdx;
+  if (countryCode) {
+    const cc = countryCode.toUpperCase();
+    if (LOCATION_PATH_CODE_OVERRIDES[cc]) return LOCATION_PATH_CODE_OVERRIDES[cc];
+    if (ISO_ALPHA3_MAP[cc]) return computePathSegmentFromAlpha3(ISO_ALPHA3_MAP[cc]);
+  }
+  return "loc-" + locIdx;
 }
-// Reverse of getLocationPathSegment(): given the last path segment of an
-// incoming request, returns the country code it belongs to, or null.
 function getCountryForPathSegment(segment) {
-	return PATH_SEGMENT_TO_COUNTRY[segment] || null;
+  return PATH_SEGMENT_TO_COUNTRY[segment] || null;
 }
-// How many candidate proxy lines per country to live-test when provisioning a
-// new user. Kept low (unlike replaceBrokenProxy's 15) because this runs once
-// per new user across all countries in the current pinned_locations setting
-// (see getPinnedLocationsSetting()) in the same request/invocation, and
-// Cloudflare Workers cap subrequests per invocation - each candidate line can
-// cost up to 2 subrequests (socks5:// and http:// variants), plus 1 list
-// fetch per country. Raise it if you have subrequest budget to spare.
-// ⚠️ The pinned list is now admin-editable and can grow past 15: at N
-// countries, worst case is N * (1 list fetch + 3 * 2 candidate tests) =
-// 7N subrequests for a single invocation - e.g. 15 countries = 105, already
-// over the Workers Free plan's 50-subrequest-per-invocation cap (Paid plans
-// get far more headroom - 10,000/invocation). The additive "بروزرسانی
-// لوکیشن‌ها" update (mergePinnedLocationsForUser) only tests the countries a
-// user doesn't already have, so it's cheaper than this per-invocation worst
-// case in practice - but a brand-new user still tests the full current list
-// at once. testVipCountryProxy() fails gracefully per-country (falls back to
-// an untested line) rather than crashing, so going over the cap degrades
-// quality - some slots quietly skip live-testing - it won't break
-// provisioning outright. Still, if you're on the Free plan and the pinned
-// list has grown large, consider lowering this to 1 or testing countries in
-// smaller sequential batches instead of all-at-once.
 const PINNED_PROVISION_TEST_LIMIT = 3;
-
-// Fetch proxy_vip/<country>.txt, shuffle it, and live-test a handful of
-// candidates by actually opening a connection through each one. Returns
-// { proxy, country, tested } using a working proxy when one is found
-// (tested: true). If the file exists but nothing answers in time, it hands
-// over an UNTESTED (dead-or-unknown) line (tested: false) so the slot ALWAYS
-// keeps a real fixed-IP proxy and the right country tag.
-// ⚠️ ADMIN DECISION (do not change without asking): a pinned country whose
-// live test failed must still carry its (dead) proxy - the panel must never
-// decide on its own to give that country a slot WITHOUT a fixed IP
-// (proxy: "" = direct connection = no exit IP). replaceBrokenProxy()'s
-// same-country cooldown/heal logic swaps a dead proxy for a live one later.
-// Returns null only if the country's VIP list itself is missing or empty
-// even after one retry of the list fetch (the callers then retry the whole
-// country once more - see retryEmptyPinnedSlots() - and
-// mergePinnedLocationsForUser() re-fills such an empty slot on the next
-// "locations" call instead of leaving it empty forever).
 async function testVipCountryProxy(country, testLimit = PINNED_PROVISION_TEST_LIMIT) {
-	try {
-		let text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
-		if (!text) {
-			// One retry of a missed list fetch: a transient mirror/network hiccup used to turn
-			// straight into an empty (direct-only, no fixed IP) slot for the whole country.
-			await new Promise((r) => setTimeout(r, 400));
-			text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
-		}
-		if (!text) return null;
-		const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
-		if (lines.length === 0) return null;
-		for (let i = lines.length - 1; i > 0; i--) {
-			const j = Math.floor(Math.random() * (i + 1));
-			[lines[i], lines[j]] = [lines[j], lines[i]];
-		}
-		const testBatch = lines.slice(0, testLimit).flatMap((line) => {
-			if (line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks")) return [line];
-			return [`socks5://${line}`, `http://${line}`];
-		});
-		try {
-			const working = await Promise.any(
-				testBatch.map((p) => {
-					return new Promise(async (resolve, reject) => {
-						let sock = null;
-						const timeoutId = setTimeout(() => {
-							try { sock && sock.close(); } catch (e) { }
-							reject(new Error("timeout"));
-						}, 4000);
-						try {
-							const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-							sock = await connectProxy(p, "1.1.1.1", 80, payload);
-							const reader = sock.readable.getReader();
-							const readRes = await reader.read();
-							clearTimeout(timeoutId);
-							try { sock.close(); } catch (e) { }
-							if (readRes.done || !readRes.value) reject(new Error("empty"));
-							else resolve(p);
-						} catch (e) {
-							clearTimeout(timeoutId);
-							try { sock && sock.close(); } catch (err) { }
-							reject(e);
-						}
-					});
-				})
-			);
-			return { proxy: working, country, tested: true };
-		} catch (e) {
-			// Nothing answered in time - keep the country tag AND a real proxy: use an untested
-			// (dead-or-unknown) line, never an empty slot (see the ADMIN DECISION above).
-			return { proxy: lines[0], country, tested: false };
-		}
-	} catch (e) {
-		return null;
-	}
+  try {
+    let text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
+    if (!text) {
+      await new Promise((r) => setTimeout(r, 400));
+      text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
+    }
+    if (!text) return null;
+    const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+    if (lines.length === 0) return null;
+    for (let i = lines.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [lines[i], lines[j]] = [lines[j], lines[i]];
+    }
+    const testBatch = lines.slice(0, testLimit).flatMap((line) => {
+      if (line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks")) return [line];
+      return [`socks5://${line}`, `http://${line}`];
+    });
+    try {
+      const working = await Promise.any(
+        testBatch.map((p) => {
+          return new Promise(async (resolve, reject) => {
+            let sock = null;
+            const timeoutId = setTimeout(() => {
+              try {
+                sock && sock.close();
+              } catch (e) {
+              }
+              reject(new Error("timeout"));
+            }, 4e3);
+            try {
+              const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+              sock = await connectProxy(p, "1.1.1.1", 80, payload);
+              const reader = sock.readable.getReader();
+              const readRes = await reader.read();
+              clearTimeout(timeoutId);
+              try {
+                sock.close();
+              } catch (e) {
+              }
+              if (readRes.done || !readRes.value) reject(new Error("empty"));
+              else resolve(p);
+            } catch (e) {
+              clearTimeout(timeoutId);
+              try {
+                sock && sock.close();
+              } catch (err) {
+              }
+              reject(e);
+            }
+          });
+        })
+      );
+      return { proxy: working, country, tested: true };
+    } catch (e) {
+      return { proxy: lines[0], country, tested: false };
+    }
+  } catch (e) {
+    return null;
+  }
 }
-
-// ==================== «بررسی کشورهای سالم» (دکمه‌ی کنار «افزودن» در تنظیمات لوکیشن‌ها) ====================
-// هدف: برخلاف testVipCountryProxy (که فقط برای یک کشور از پیش شناخته‌شده صداست)، اینجا اول باید
-// خودِ کشورهای کاندید رو کشف کنیم - چون میرور ۴ (ریپوی شخصی hmditts/XYD-Panel) هیچ فایل vip-list
-// نداره، تنها راه دیدن proxy_vip/*.txt که فقط اونجاست (مثل FR که ادمین دستی اضافه کرد) یک فچ به
-// GitHub Contents API است. طبق تصمیم صریح ادمین (۲۰۲۶-۰۹-۳۰) این محدود به همین دکمه‌ست، نه
-// syncAllVipProxies/دراپ‌داون همیشگی.
-const HEALTHY_VIP_CACHE_TTL = 600000; // ۱۰ دقیقه - طبق خواسته‌ی صریح ادمین: کلیک‌های پشت‌سرهم دوباره کل تست connect را تکرار نکنند
-// وقتی کشف کشورهای ریپوی شخصی از GitHub API شکست بخورد (معمولاً ریت‌لیمیت ۶۰ ریکوئست/ساعت روی IP
-// مشترک Cloudflare)، نتیجه فقط ۶۰ ثانیه کش می‌شود - نه ۱۰ دقیقه - تا نتیجه‌ی ناقص مدت طولانی نچسبد.
-const HEALTHY_VIP_DEGRADED_TTL = 60000;
-// لیست پشتیبان برای وقتی GitHub API جواب نمی‌دهد: کشورهایی که فایلشون در proxy_vip ریپوی شخصی هست.
-// فقط «کاندید» است؛ اگه فایلی واقعاً وجود نداشته باشه یا پروکسی زنده نداشته باشه، توی دراپ‌داون نمی‌آید.
-// کشور جدیدی که فقط در ریپوی شخصی گذاشتید و GitHub API هم ریت‌لیمیت است را اینجا اضافه کنید
-// (یا برای رفع ریشه‌ای، Secret با نام GITHUB_TOKEN روی Worker بگذارید).
+const HEALTHY_VIP_CACHE_TTL = 6e5;
+const HEALTHY_VIP_DEGRADED_TTL = 6e4;
 const PERSONAL_REPO_FALLBACK_COUNTRIES = ["DE", "FR", "GB", "TH"];
-
-// خروجی: { codes, status } — status: "ok" (لیست واقعاً از GitHub API آمد) یا "fallback" (API ریت‌لیمیت/خطا
-// داد و از PERSONAL_REPO_FALLBACK_COUNTRIES استفاده شد). اگه env.GITHUB_TOKEN تنظیم شده باشه، سقف
-// ریکوئست از ۶۰/ساعت (IP مشترک) به ۵۰۰۰/ساعت می‌رسه.
 async function fetchPersonalRepoVipCountries(githubToken) {
-	const fallback = { codes: [...PERSONAL_REPO_FALLBACK_COUNTRIES], status: "fallback" };
-	try {
-		const headers = { "User-Agent": "ChildPanel-VIP-HealthCheck", "Accept": "application/vnd.github+json" };
-		if (githubToken) headers["Authorization"] = `Bearer ${githubToken}`;
-		const res = await fetch("https://api.github.com/repos/hmditts/XYD-Panel/contents/proxy_vip", { headers });
-		if (!res.ok) return fallback;
-		const files = await res.json();
-		if (!Array.isArray(files)) return fallback;
-		const codes = files
-			.map((f) => f && f.name)
-			.filter((name) => typeof name === "string" && name.toLowerCase().endsWith(".txt"))
-			.map((name) => name.slice(0, -4).trim().toUpperCase())
-			.filter((cc) => /^[A-Z]{2}$/.test(cc));
-		return { codes, status: "ok" };
-	} catch (e) {
-		return fallback;
-	}
+  const fallback = { codes: [...PERSONAL_REPO_FALLBACK_COUNTRIES], status: "fallback" };
+  try {
+    const headers = { "User-Agent": "ChildPanel-VIP-HealthCheck", "Accept": "application/vnd.github+json" };
+    if (githubToken) headers["Authorization"] = `Bearer ${githubToken}`;
+    const res = await fetch("https://api.github.com/repos/hmditts/XYD-Panel/contents/proxy_vip", { headers });
+    if (!res.ok) return fallback;
+    const files = await res.json();
+    if (!Array.isArray(files)) return fallback;
+    const codes = files.map((f) => f && f.name).filter((name) => typeof name === "string" && name.toLowerCase().endsWith(".txt")).map((name) => name.slice(0, -4).trim().toUpperCase()).filter((cc) => /^[A-Z]{2}$/.test(cc));
+    return { codes, status: "ok" };
+  } catch (e) {
+    return fallback;
+  }
 }
-
-// تست سبک «حداقل ۱ آی‌پی زنده دارد یا نه» - نه تست کامل مثل testVipCountryProxy. عمداً حداکثر ۲ خط
-// امتحان می‌شود و این ۲ خط پشت‌سرهم (نه هم‌زمان با Promise.any) تست می‌شوند تا هر کشور حداکثر یک
-// سوکت باز هم‌زمان داشته باشد - چون این تابع خودش در batch های ۵تایی صدا زده می‌شود (پایین‌تر) و
-// سقف واقعی Cloudflare «۶ اتصال هم‌زمان در هر invocation» مستقل از پلن Free/Paid است.
 async function quickCountryHasLiveIp(country) {
-	try {
-		const text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
-		if (!text) return false;
-		const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
-		if (lines.length === 0) return false;
-		for (let i = lines.length - 1; i > 0; i--) {
-			const j = Math.floor(Math.random() * (i + 1));
-			[lines[i], lines[j]] = [lines[j], lines[i]];
-		}
-		const candidates = lines.slice(0, 2).map((line) =>
-			line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks") ? line : `socks5://${line}`
-		);
-		for (const p of candidates) {
-			const ok = await new Promise((resolve) => {
-				let sock = null;
-				const timeoutId = setTimeout(() => {
-					try { sock && sock.close(); } catch (e) { }
-					resolve(false);
-				}, 4000);
-				(async () => {
-					try {
-						const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-						sock = await connectProxy(p, "1.1.1.1", 80, payload);
-						const reader = sock.readable.getReader();
-						const readRes = await reader.read();
-						clearTimeout(timeoutId);
-						try { sock.close(); } catch (e) { }
-						resolve(!readRes.done && !!readRes.value);
-					} catch (e) {
-						clearTimeout(timeoutId);
-						try { sock && sock.close(); } catch (err) { }
-						resolve(false);
-					}
-				})();
-			});
-			if (ok) return true; // اولین موفقیت کافیست - خط دوم اصلاً تست نمی‌شود
-		}
-		return false;
-	} catch (e) {
-		return false;
-	}
+  try {
+    const text = await getCachedRepoFile(`proxy_vip/${country}.txt`);
+    if (!text) return false;
+    const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+    if (lines.length === 0) return false;
+    for (let i = lines.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [lines[i], lines[j]] = [lines[j], lines[i]];
+    }
+    const candidates = lines.slice(0, 2).map(
+      (line) => line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks") ? line : `socks5://${line}`
+    );
+    for (const p of candidates) {
+      const ok = await new Promise((resolve) => {
+        let sock = null;
+        const timeoutId = setTimeout(() => {
+          try {
+            sock && sock.close();
+          } catch (e) {
+          }
+          resolve(false);
+        }, 4e3);
+        (async () => {
+          try {
+            const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+            sock = await connectProxy(p, "1.1.1.1", 80, payload);
+            const reader = sock.readable.getReader();
+            const readRes = await reader.read();
+            clearTimeout(timeoutId);
+            try {
+              sock.close();
+            } catch (e) {
+            }
+            resolve(!readRes.done && !!readRes.value);
+          } catch (e) {
+            clearTimeout(timeoutId);
+            try {
+              sock && sock.close();
+            } catch (err) {
+            }
+            resolve(false);
+          }
+        })();
+      });
+      if (ok) return true;
+    }
+    return false;
+  } catch (e) {
+    return false;
+  }
 }
-
-// ⚠️ سقف Workers Free = ۵۰ subrequest در هر invocation (و ۶ اتصال هم‌زمان). اگه کل کشورها در یک
-// invocation تست بشن، فقط فچ‌های فایل هر کشور (تا ۵ تا: ۴ میرور + ریپوی شخصی) به‌علاوه‌ی ۲ سوکت تست،
-// خیلی راحت از ۵۰ رد می‌شه. برای همین بررسی به دو مرحله‌ی جدا (دو نوع invocation) تقسیم شده و کلاینت
-// اون‌ها رو پشت‌سرهم صدا می‌زنه:
-//   step=candidates → فقط کشف کاندیدها (vip-list حداکثر ۴ فچ + GitHub API ۱ فچ = حداکثر ۵)
-//   step=check&codes=DE,FR,... → حداکثر HEALTHY_VIP_CHUNK_SIZE کشور؛ بدترین حالت هر کشور ۵ فچ + ۲ سوکت
-//                                = ۷ → برای ۵ کشور حداکثر ۳۵ (حتی اگه سوکت‌ها هم subrequest حساب بشن)
-// یعنی هر invocation مستقل با بودجه‌ی خودش زیر ۵۰ می‌مونه، مستقل از تعداد کل کشورها.
 const HEALTHY_VIP_CHUNK_SIZE = 5;
-const HEALTHY_VIP_COUNTRY_CACHE = new Map(); // cc -> { ok: boolean, at: number } - بهترین‌تلاش (حافظه‌ی isolate)
-
+const HEALTHY_VIP_COUNTRY_CACHE = /* @__PURE__ */ new Map();
 async function checkVipCountriesChunk(codes, force) {
-	const list = [...new Set((Array.isArray(codes) ? codes : []).map((c) => String(c).trim().toUpperCase()))]
-		.filter((cc) => /^[A-Z]{2}$/.test(cc))
-		.slice(0, HEALTHY_VIP_CHUNK_SIZE); // سقف سخت سمت سرور - حتی اگه کلاینت بیشتر بفرسته
-	const results = await Promise.all(list.map(async (cc) => {
-		const c = HEALTHY_VIP_COUNTRY_CACHE.get(cc);
-		if (!force && c && Date.now() - c.at < HEALTHY_VIP_CACHE_TTL) return c.ok;
-		const ok = await quickCountryHasLiveIp(cc);
-		HEALTHY_VIP_COUNTRY_CACHE.set(cc, { ok, at: Date.now() });
-		return ok;
-	}));
-	return { checked: list, healthy: list.filter((cc, i) => results[i]) };
+  const list = [...new Set((Array.isArray(codes) ? codes : []).map((c) => String(c).trim().toUpperCase()))].filter((cc) => /^[A-Z]{2}$/.test(cc)).slice(0, HEALTHY_VIP_CHUNK_SIZE);
+  const results = await Promise.all(list.map(async (cc) => {
+    const c = HEALTHY_VIP_COUNTRY_CACHE.get(cc);
+    if (!force && c && Date.now() - c.at < HEALTHY_VIP_CACHE_TTL) return c.ok;
+    const ok = await quickCountryHasLiveIp(cc);
+    HEALTHY_VIP_COUNTRY_CACHE.set(cc, { ok, at: Date.now() });
+    return ok;
+  }));
+  return { checked: list, healthy: list.filter((cc, i) => results[i]) };
 }
-
-// کاندیدها: vip-list رسمی (میرور ۱-۳) + فایل‌های proxy_vip ریپوی شخصی (میرور ۴، از GitHub API) +
-// کلیدهای MANUAL_VIP_PROXIES - یکتا. هیچ تست اتصالی اینجا انجام نمی‌شه.
 async function getVipHealthCandidates(githubToken) {
-	const [officialRes, personal] = await Promise.all([
-		fetchWithFallback("vip-list").catch(() => null),
-		fetchPersonalRepoVipCountries(githubToken),
-	]);
-	let officialCodes = [];
-	if (officialRes && officialRes.ok) {
-		try {
-			const files = await officialRes.json();
-			officialCodes = (Array.isArray(files) ? files : [])
-				.map((f) => f && f.name)
-				.filter((name) => typeof name === "string" && name.toLowerCase().endsWith(".txt"))
-				.map((name) => name.slice(0, -4).trim().toUpperCase())
-				.filter((cc) => /^[A-Z]{2}$/.test(cc));
-		} catch (e) { }
-	}
-	const manualCodes = Object.keys(MANUAL_VIP_PROXIES).map((c) => c.toUpperCase());
-	const candidates = [...new Set([...officialCodes, ...personal.codes, ...manualCodes])];
-	return { candidates, personalDiscovery: personal.status };
+  const [officialRes, personal] = await Promise.all([
+    fetchWithFallback("vip-list").catch(() => null),
+    fetchPersonalRepoVipCountries(githubToken)
+  ]);
+  let officialCodes = [];
+  if (officialRes && officialRes.ok) {
+    try {
+      const files = await officialRes.json();
+      officialCodes = (Array.isArray(files) ? files : []).map((f) => f && f.name).filter((name) => typeof name === "string" && name.toLowerCase().endsWith(".txt")).map((name) => name.slice(0, -4).trim().toUpperCase()).filter((cc) => /^[A-Z]{2}$/.test(cc));
+    } catch (e) {
+    }
+  }
+  const manualCodes = Object.keys(MANUAL_VIP_PROXIES).map((c) => c.toUpperCase());
+  const candidates = [.../* @__PURE__ */ new Set([...officialCodes, ...personal.codes, ...manualCodes])];
+  return { candidates, personalDiscovery: personal.status };
 }
-// ==================== پایان «بررسی کشورهای سالم» ====================
-
-// Builds the permanent proxy list for a BRAND-NEW user: one slot per country
-// in `locations` (the current pinned_locations setting - see
-// getPinnedLocationsSetting()), in that exact order, so loc-0..loc-N map to
-// them no matter what the VIP pool currently has. A country whose pool is
-// empty/unreachable still gets its slot (proxy: "", meaning that config
-// falls back to a direct connection until healed).
-// NOTE: this always builds the list from scratch and is only meant for a
-// user that doesn't have any locations yet. For updating an EXISTING user
-// without discarding what they already have, use mergePinnedLocationsForUser
-// below instead - it's what reset_action: "locations" calls, which now runs
-// automatically for every existing user right after the pinned list is saved.
 async function buildPinnedDefaultProxyList(locations) {
-	const results = await Promise.all(locations.map((cc) => testVipCountryProxy(cc)));
-	const list = locations.map((cc, i) => ({
-		proxy: (results[i] && results[i].proxy) || "",
-		country: cc,
-	}));
-	await retryEmptyPinnedSlots(list);
-	return list;
+  const results = await Promise.all(locations.map((cc) => testVipCountryProxy(cc)));
+  const list = locations.map((cc, i) => ({
+    proxy: results[i] && results[i].proxy || "",
+    country: cc
+  }));
+  await retryEmptyPinnedSlots(list);
+  return list;
 }
-
-// Second chance for slots that came back with NO proxy at all (the country's VIP list could not be
-// fetched during the parallel round - typically a mirror/network hiccup or the per-invocation
-// subrequest cap eating the later countries). Runs one country at a time, only for the empty slots,
-// and stops after PINNED_EMPTY_RETRY_BUDGET_MS so a real outage can never stall the request that
-// called it. Mutates `list` in place and returns it. A slot that is still empty afterwards is
-// repaired by mergePinnedLocationsForUser() on the next "locations" call (Push / Save).
-const PINNED_EMPTY_RETRY_BUDGET_MS = 15000;
+const PINNED_EMPTY_RETRY_BUDGET_MS = 15e3;
 async function retryEmptyPinnedSlots(list) {
-	const deadline = Date.now() + PINNED_EMPTY_RETRY_BUDGET_MS;
-	for (let i = 0; i < list.length; i++) {
-		const slot = list[i];
-		if (!slot || typeof slot !== "object" || !slot.country || String(slot.proxy || "").trim()) continue;
-		if (Date.now() > deadline) break;
-		try {
-			const r = await testVipCountryProxy(slot.country);
-			if (r && r.proxy) slot.proxy = r.proxy;
-		} catch (e) { }
-	}
-	return list;
+  const deadline = Date.now() + PINNED_EMPTY_RETRY_BUDGET_MS;
+  for (let i = 0; i < list.length; i++) {
+    const slot = list[i];
+    if (!slot || typeof slot !== "object" || !slot.country || String(slot.proxy || "").trim()) continue;
+    if (Date.now() > deadline) break;
+    try {
+      const r = await testVipCountryProxy(slot.country);
+      if (r && r.proxy) slot.proxy = r.proxy;
+    } catch (e) {
+    }
+  }
+  return list;
 }
-
-// Additive update for an EXISTING user: tests and appends only the pinned
-// countries this user doesn't already have (matched by the `country` tag on
-// each {proxy, country} slot); every slot already present - pinned or not -
-// is left completely untouched (not re-tested, not removed). This is what
-// makes changing the pinned_locations setting non-destructive: a country
-// that was never pinned (or was added by hand) is never removed by this
-// function. NOTE: un-pinning a country in settings DOES now remove it from
-// every existing user - see removeCountriesFromAllUsers() and POST
-// /api/settings/bulk - but that is a separate step, not part of this merge.
-// Never grows a user past MAX_LOCATIONS_PER_USER. If there isn't room for
-// every missing pinned country, as many as fit are added and the rest are
-// returned in `cappedOut` so the caller can warn the admin (nothing is
-// auto-deleted to make room - the admin removes something manually via the
-// "حذف کشور از کاربران" bulk action instead).
 async function mergePinnedLocationsForUser(existingProxyList, pinnedLocations) {
-	const list = Array.isArray(existingProxyList) ? existingProxyList.slice() : [];
-	// REPAIR (admin decision: never a fixed-IP-less country): a country-tagged slot that holds NO
-	// proxy (an earlier fill could not reach the VIP list) used to count as "already present" here
-	// and stayed empty forever - its config carried the country flag/path but connected directly
-	// (no fixed IP), and replaceBrokenProxy() never touches it because a direct connection never
-	// "fails". Such a slot is now re-filled in place (same position, same country tag). Only empty
-	// slots are touched; every slot that already has a proxy is left exactly as it is.
-	const emptyIdx = [];
-	list.forEach((p, i) => {
-		if (p && typeof p === "object" && p.country && !String(p.proxy || "").trim()) emptyIdx.push(i);
-	});
-	const repaired = [];
-	if (emptyIdx.length > 0) {
-		const fixes = await Promise.all(emptyIdx.map((i) => testVipCountryProxy(list[i].country)));
-		emptyIdx.forEach((i, k) => {
-			if (fixes[k] && fixes[k].proxy) {
-				list[i] = Object.assign({}, list[i], { proxy: fixes[k].proxy });
-				repaired.push(String(list[i].country).toUpperCase());
-			}
-		});
-	}
-	const haveCountries = new Set(
-		list
-			.map((p) => (typeof p === "object" && p !== null ? p.country : null))
-			.filter(Boolean)
-			.map((cc) => String(cc).toUpperCase())
-	);
-	const missing = pinnedLocations.filter((cc) => !haveCountries.has(cc));
-	const room = Math.max(0, MAX_LOCATIONS_PER_USER - list.length);
-	const toAdd = missing.slice(0, room);
-	const cappedOut = missing.slice(room);
-	if (toAdd.length > 0) {
-		const results = await Promise.all(toAdd.map((cc) => testVipCountryProxy(cc)));
-		toAdd.forEach((cc, i) => {
-			list.push({ proxy: (results[i] && results[i].proxy) || "", country: cc });
-		});
-		await retryEmptyPinnedSlots(list);
-	}
-	return { list, added: toAdd, cappedOut, repaired };
+  const list = Array.isArray(existingProxyList) ? existingProxyList.slice() : [];
+  const emptyIdx = [];
+  list.forEach((p, i) => {
+    if (p && typeof p === "object" && p.country && !String(p.proxy || "").trim()) emptyIdx.push(i);
+  });
+  const repaired = [];
+  if (emptyIdx.length > 0) {
+    const fixes = await Promise.all(emptyIdx.map((i) => testVipCountryProxy(list[i].country)));
+    emptyIdx.forEach((i, k) => {
+      if (fixes[k] && fixes[k].proxy) {
+        list[i] = Object.assign({}, list[i], { proxy: fixes[k].proxy });
+        repaired.push(String(list[i].country).toUpperCase());
+      }
+    });
+  }
+  const haveCountries = new Set(
+    list.map((p) => typeof p === "object" && p !== null ? p.country : null).filter(Boolean).map((cc) => String(cc).toUpperCase())
+  );
+  const missing = pinnedLocations.filter((cc) => !haveCountries.has(cc));
+  const room = Math.max(0, MAX_LOCATIONS_PER_USER - list.length);
+  const toAdd = missing.slice(0, room);
+  const cappedOut = missing.slice(room);
+  if (toAdd.length > 0) {
+    const results = await Promise.all(toAdd.map((cc) => testVipCountryProxy(cc)));
+    toAdd.forEach((cc, i) => {
+      list.push({ proxy: results[i] && results[i].proxy || "", country: cc });
+    });
+    await retryEmptyPinnedSlots(list);
+  }
+  return { list, added: toAdd, cappedOut, repaired };
 }
-
-// Re-attaches the {proxy, country} tag to slots the admin did NOT touch when the edit-user
-// modal is saved. The modal only keeps the bare proxy string of each slot (populateUserFormFields
-// drops the `country` tag) and posts user_socks5 back as a plain string / array of strings, so
-// without this every "save" - whatever field was changed - wiped every country tag, and
-// getSelectedUserProxy() (which matches /ZYX/<country-code> against slot.country) then found
-// nothing and the config silently fell back to a direct/Cloudflare connection.
-// Every incoming string that is identical to a tagged slot already stored for this user gets that
-// slot's country back (each stored slot is consumed once, so duplicated proxy strings can't steal
-// each other's tag). A slot the admin really added/changed by hand stays untagged, exactly as before.
-// Objects already carrying a tag are left alone. Returns the original value when nothing matched.
 function preserveProxyCountryTags(incomingRaw, existingRaw) {
-	if (incomingRaw === undefined || incomingRaw === null || incomingRaw === "") return incomingRaw;
-	let existingList = [];
-	try {
-		const es = String(existingRaw || "").trim();
-		if (es.startsWith("[")) {
-			const parsed = JSON.parse(es);
-			if (Array.isArray(parsed)) existingList = parsed;
-		}
-	} catch (e) {
-		return incomingRaw;
-	}
-	const tagPool = new Map();
-	for (const slot of existingList) {
-		if (typeof slot === "object" && slot !== null && slot.country && typeof slot.proxy === "string" && slot.proxy.trim()) {
-			const key = slot.proxy.trim();
-			if (!tagPool.has(key)) tagPool.set(key, []);
-			tagPool.get(key).push(String(slot.country));
-		}
-	}
-	if (tagPool.size === 0) return incomingRaw;
-	let incomingList;
-	if (Array.isArray(incomingRaw)) {
-		incomingList = incomingRaw;
-	} else {
-		const is = String(incomingRaw).trim();
-		if (is.startsWith("[")) {
-			try {
-				incomingList = JSON.parse(is);
-			} catch (e) {
-				return incomingRaw;
-			}
-			if (!Array.isArray(incomingList)) return incomingRaw;
-		} else {
-			incomingList = [is];
-		}
-	}
-	let changed = false;
-	const out = incomingList.map((item) => {
-		if (typeof item !== "string") return item;
-		const key = item.trim();
-		const queue = tagPool.get(key);
-		if (queue && queue.length > 0) {
-			changed = true;
-			return { proxy: key, country: queue.shift() };
-		}
-		return item;
-	});
-	return changed ? JSON.stringify(out) : incomingRaw;
+  if (incomingRaw === void 0 || incomingRaw === null || incomingRaw === "") return incomingRaw;
+  let existingList = [];
+  try {
+    const es = String(existingRaw || "").trim();
+    if (es.startsWith("[")) {
+      const parsed = JSON.parse(es);
+      if (Array.isArray(parsed)) existingList = parsed;
+    }
+  } catch (e) {
+    return incomingRaw;
+  }
+  const tagPool = /* @__PURE__ */ new Map();
+  for (const slot of existingList) {
+    if (typeof slot === "object" && slot !== null && slot.country && typeof slot.proxy === "string" && slot.proxy.trim()) {
+      const key = slot.proxy.trim();
+      if (!tagPool.has(key)) tagPool.set(key, []);
+      tagPool.get(key).push(String(slot.country));
+    }
+  }
+  if (tagPool.size === 0) return incomingRaw;
+  let incomingList;
+  if (Array.isArray(incomingRaw)) {
+    incomingList = incomingRaw;
+  } else {
+    const is = String(incomingRaw).trim();
+    if (is.startsWith("[")) {
+      try {
+        incomingList = JSON.parse(is);
+      } catch (e) {
+        return incomingRaw;
+      }
+      if (!Array.isArray(incomingList)) return incomingRaw;
+    } else {
+      incomingList = [is];
+    }
+  }
+  let changed = false;
+  const out = incomingList.map((item) => {
+    if (typeof item !== "string") return item;
+    const key = item.trim();
+    const queue = tagPool.get(key);
+    if (queue && queue.length > 0) {
+      changed = true;
+      return { proxy: key, country: queue.shift() };
+    }
+    return item;
+  });
+  return changed ? JSON.stringify(out) : incomingRaw;
 }
-
-// Removes every slot tagged with one of `countries` (ISO alpha-2) from EVERY user's
-// user_socks5 list. Called from POST /api/settings/bulk when countries were just
-// un-pinned (pinned_locations shrank), so an un-pinned country actually disappears
-// from the users' configs instead of lingering forever. Only countries that were in
-// the previous pinned list and are not in the new one are passed in - a country the
-// admin never pinned (or a legacy non-object slot without a country tag) is never
-// touched here. Returns { countries, usersUpdated }.
 async function removeCountriesFromAllUsers(env, ctx, countries) {
-	const targets = new Set((countries || []).map((c) => String(c).trim().toUpperCase()).filter(Boolean));
-	if (targets.size === 0) return { countries: [], usersUpdated: 0 };
-	const { results } = await env.DB.prepare("SELECT username, uuid, trojan_hash, user_socks5 FROM users WHERE user_socks5 IS NOT NULL AND user_socks5 != ''").all();
-	const stmts = [];
-	const changedUsers = [];
-	for (const row of results || []) {
-		const raw = String(row.user_socks5 || "").trim();
-		if (!raw.startsWith("[")) continue;
-		let list;
-		try {
-			list = JSON.parse(raw);
-		} catch (e) {
-			continue;
-		}
-		if (!Array.isArray(list)) continue;
-		const kept = list.filter((p) => !(typeof p === "object" && p !== null && targets.has(String(p.country || "").trim().toUpperCase())));
-		if (kept.length === list.length) continue;
-		stmts.push(env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(kept), row.username));
-		changedUsers.push(row);
-	}
-	for (let i = 0; i < stmts.length; i += 50) {
-		await env.DB.batch(stmts.slice(i, i + 50));
-	}
-	await Promise.all(changedUsers.map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
-	return { countries: Array.from(targets), usersUpdated: changedUsers.length };
+  const targets = new Set((countries || []).map((c) => String(c).trim().toUpperCase()).filter(Boolean));
+  if (targets.size === 0) return { countries: [], usersUpdated: 0 };
+  const { results } = await env.DB.prepare("SELECT username, uuid, trojan_hash, user_socks5 FROM users WHERE user_socks5 IS NOT NULL AND user_socks5 != ''").all();
+  const stmts = [];
+  const changedUsers = [];
+  for (const row of results || []) {
+    const raw = String(row.user_socks5 || "").trim();
+    if (!raw.startsWith("[")) continue;
+    let list;
+    try {
+      list = JSON.parse(raw);
+    } catch (e) {
+      continue;
+    }
+    if (!Array.isArray(list)) continue;
+    const kept = list.filter((p) => !(typeof p === "object" && p !== null && targets.has(String(p.country || "").trim().toUpperCase())));
+    if (kept.length === list.length) continue;
+    stmts.push(env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(kept), row.username));
+    changedUsers.push(row);
+  }
+  for (let i = 0; i < stmts.length; i += 50) {
+    await env.DB.batch(stmts.slice(i, i + 50));
+  }
+  await Promise.all(changedUsers.map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
+  return { countries: Array.from(targets), usersUpdated: changedUsers.length };
 }
-
-// "Mirror" variant of removeCountriesFromAllUsers(): instead of being told WHICH countries
-// to remove, it is told which to KEEP (`keepCountries` = the pinned list that was just
-// saved) and strips every country-tagged slot that is not in it from EVERY user's
-// user_socks5 list. Used by POST /api/settings/bulk when the caller (the mother panel's
-// "Push") sends prune_unpinned_locations: true. This is what actually cleans up panels
-// that already carry countries which are no longer pinned (e.g. the 15 built-in defaults
-// left over from before an empty list could be saved) - the "previous vs. now" comparison
-// alone can never find those. Slots WITHOUT a country tag (proxies added by hand as a raw
-// string, legacy non-object slots) are never touched. Returns { countries, usersUpdated }
-// where `countries` = the country codes that were really removed from at least one user.
 async function removeUnpinnedCountriesFromAllUsers(env, ctx, keepCountries) {
-	const keep = new Set((keepCountries || []).map((c) => String(c).trim().toUpperCase()).filter(Boolean));
-	const { results } = await env.DB.prepare("SELECT username, uuid, trojan_hash, user_socks5 FROM users WHERE user_socks5 IS NOT NULL AND user_socks5 != ''").all();
-	const stmts = [];
-	const changedUsers = [];
-	const removedCountries = new Set();
-	for (const row of results || []) {
-		const raw = String(row.user_socks5 || "").trim();
-		if (!raw.startsWith("[")) continue;
-		let list;
-		try {
-			list = JSON.parse(raw);
-		} catch (e) {
-			continue;
-		}
-		if (!Array.isArray(list)) continue;
-		const kept = list.filter((p) => {
-			if (typeof p !== "object" || p === null) return true;
-			const cc = String(p.country || "").trim().toUpperCase();
-			if (!cc || keep.has(cc)) return true;
-			removedCountries.add(cc);
-			return false;
-		});
-		if (kept.length === list.length) continue;
-		stmts.push(env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(kept), row.username));
-		changedUsers.push(row);
-	}
-	for (let i = 0; i < stmts.length; i += 50) {
-		await env.DB.batch(stmts.slice(i, i + 50));
-	}
-	await Promise.all(changedUsers.map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
-	return { countries: Array.from(removedCountries), usersUpdated: changedUsers.length };
+  const keep = new Set((keepCountries || []).map((c) => String(c).trim().toUpperCase()).filter(Boolean));
+  const { results } = await env.DB.prepare("SELECT username, uuid, trojan_hash, user_socks5 FROM users WHERE user_socks5 IS NOT NULL AND user_socks5 != ''").all();
+  const stmts = [];
+  const changedUsers = [];
+  const removedCountries = /* @__PURE__ */ new Set();
+  for (const row of results || []) {
+    const raw = String(row.user_socks5 || "").trim();
+    if (!raw.startsWith("[")) continue;
+    let list;
+    try {
+      list = JSON.parse(raw);
+    } catch (e) {
+      continue;
+    }
+    if (!Array.isArray(list)) continue;
+    const kept = list.filter((p) => {
+      if (typeof p !== "object" || p === null) return true;
+      const cc = String(p.country || "").trim().toUpperCase();
+      if (!cc || keep.has(cc)) return true;
+      removedCountries.add(cc);
+      return false;
+    });
+    if (kept.length === list.length) continue;
+    stmts.push(env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(kept), row.username));
+    changedUsers.push(row);
+  }
+  for (let i = 0; i < stmts.length; i += 50) {
+    await env.DB.batch(stmts.slice(i, i + 50));
+  }
+  await Promise.all(changedUsers.map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
+  return { countries: Array.from(removedCountries), usersUpdated: changedUsers.length };
 }
-
 async function replaceBrokenProxy(username, env, oldProxy) {
-	try {
-		if (GLOBAL_WRITE_LOCK.get(username + "_proxy_rotate")) return;
-		GLOBAL_WRITE_LOCK.set(username + "_proxy_rotate", true);
-		
-		const user = await env.DB.prepare("SELECT id, uuid, user_socks5, auto_rotate_user_proxy, proxy_rotate_cooldowns FROM users WHERE username = ?").bind(username).first();
-		if (!user || user.auto_rotate_user_proxy !== 1 || !user.user_socks5) {
-			GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
-			return;
-		}
-		
-		let proxyList = [];
-		let isArrayMode = false;
-		try {
-			if (user.user_socks5.trim().startsWith("[")) {
-				proxyList = JSON.parse(user.user_socks5);
-				isArrayMode = true;
-			} else {
-				proxyList = [user.user_socks5];
-			}
-		} catch (e) {
-			proxyList = [user.user_socks5];
-		}
-		
-		let matchIndex = -1;
-		for (let i = 0; i < proxyList.length; i++) {
-			let itemStr = typeof proxyList[i] === "object" && proxyList[i] !== null ? proxyList[i].proxy : proxyList[i];
-			if (itemStr === oldProxy) {
-				matchIndex = i;
-				break;
-			}
-		}
-		if (matchIndex === -1) {
-			GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
-			return;
-		}
-		
-		let cooldowns = {};
-		try {
-			cooldowns = user.proxy_rotate_cooldowns ? JSON.parse(user.proxy_rotate_cooldowns) : {};
-		} catch (e) {
-			cooldowns = {};
-		}
-		const COOLDOWN_MS = 3600000; // 1h per (user, country) - avoids hammering the VIP list with repeated failed attempts
-		const isOnCooldown = (cc) => {
-			const last = cooldowns[cc];
-			return typeof last === "number" && (Date.now() - last) < COOLDOWN_MS;
-		};
-		const markAttempt = async (cc) => {
-			cooldowns[cc] = Date.now();
-			try {
-				await env.DB.prepare("UPDATE users SET proxy_rotate_cooldowns = ? WHERE id = ?").bind(JSON.stringify(cooldowns), user.id).run();
-			} catch (e) { }
-		};
-		
-		let countryCode = typeof proxyList[matchIndex] === "object" && proxyList[matchIndex] !== null && proxyList[matchIndex].country ? proxyList[matchIndex].country : "all";
-		
-		if (countryCode === "all" || countryCode === "UN") {
-			try {
-				const payload = new TextEncoder().encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
-				const s = await connectProxy(oldProxy, "ip-api.com", 80, payload);
-				const reader = s.readable.getReader();
-				let resStr = "";
-				const dec = new TextDecoder();
-				const timeoutId = setTimeout(() => {
-					try { s.close(); } catch (e) { }
-				}, 2000);
-				try {
-					while (true) {
-						const res = await reader.read();
-						if (res.done || !res.value) break;
-						resStr += dec.decode(res.value, { stream: true });
-						if (resStr.includes("countryCode")) break;
-					}
-				} finally {
-					clearTimeout(timeoutId);
-					try { s.close(); } catch (e) { }
-				}
-				const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
-				if (jsonMatch && jsonMatch[1]) countryCode = jsonMatch[1];
-			} catch (e) { }
-			
-			if (countryCode === "all" || countryCode === "UN") {
-				try {
-					let remain = oldProxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-					if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
-					if (remain.startsWith("[")) remain = remain.substring(1, remain.indexOf("]"));
-					else if (remain.includes(":")) remain = remain.substring(0, remain.lastIndexOf(":"));
-					const geoRes = await fetch(`http://ip-api.com/json/${remain}?fields=countryCode`);
-					const geoData = await geoRes.json();
-					if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
-				} catch (e) { }
-			}
-		}
-		
-		let newProxy = null;
-		let finalCountry = null;
-		const upperCountry = (countryCode || "ALL").toUpperCase();
-		
-		// Same-country-only policy: never switch the user to a different country.
-		// If we couldn't determine a specific country for this proxy, there's nothing
-		// to restrict the search to, so we skip replacement entirely rather than guessing.
-		if (upperCountry === "ALL" || upperCountry === "UN") {
-			GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
-			return;
-		}
-		
-		// Per-(user, country) 1h cooldown: if we already tried this country recently
-		// (success or failure), don't hammer the VIP list again until it expires.
-		if (isOnCooldown(upperCountry)) {
-			GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
-			return;
-		}
-		await markAttempt(upperCountry);
-		
-		const sources = [{ url: `proxy_vip/${upperCountry}.txt`, type: "repo", country: upperCountry }];
-		
-		for (const src of sources) {
-			try {
-				const text = await getCachedRepoFile(src.url);
-				if (!text) continue;
-				const lines = text
-					.split("\n")
-					.map((l) => l.trim())
-					.filter((l) => l.length > 5);
-					
-				if (lines.length > 0) {
-					for (let i = lines.length - 1; i > 0; i--) {
-						const j = Math.floor(Math.random() * (i + 1));
-						[lines[i], lines[j]] = [lines[j], lines[i]];
-					}
-					
-					const testLimit = (src.country === upperCountry) ? 15 : 3;
-					
-					const testBatch = lines.slice(0, testLimit).flatMap((line) => {
-						if (line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks")) {
-							return [line];
-						}
-						if (src.type === "socks5") return [`socks5://${line}`];
-						if (src.type === "http") return [`http://${line}`];
-						return [`socks5://${line}`, `http://${line}`];
-					});
-					
-					try {
-						newProxy = await Promise.any(
-							testBatch.map((p) => {
-								return new Promise(async (resolve, reject) => {
-									let sock = null;
-									const timeoutId = setTimeout(() => {
-										try { sock && sock.close(); } catch (e) { }
-										reject(new Error("timeout"));
-									}, 4000); 
-									try {
-										const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-										sock = await connectProxy(p, "1.1.1.1", 80, payload);
-										const reader = sock.readable.getReader();
-										const res = await reader.read();
-										clearTimeout(timeoutId);
-										try { sock.close(); } catch (e) { }
-										if (res.done || !res.value) reject(new Error("empty"));
-										else resolve(p);
-									} catch (e) {
-										clearTimeout(timeoutId);
-										try { sock && sock.close(); } catch (err) { }
-										reject(e);
-									}
-								});
-							})
-						);
-					} catch (e) {
-						continue;
-					}
-					
-					if (newProxy) {
-						finalCountry = src.country; 
-						break;
-					}
-				}
-			} catch (e) { }
-		}
-		
-		if (newProxy) {
-			let finalProxyVal = newProxy;
-			if (isArrayMode) {
-				if (typeof proxyList[matchIndex] === "object" && proxyList[matchIndex] !== null) {
-					proxyList[matchIndex].proxy = newProxy;
-					if (finalCountry && finalCountry !== "ALL" && finalCountry !== "UN") {
-						proxyList[matchIndex].country = finalCountry;
-					}
-				} else {
-					if (finalCountry && finalCountry !== "ALL" && finalCountry !== "UN") {
-						proxyList[matchIndex] = { proxy: newProxy, country: finalCountry };
-					} else {
-						proxyList[matchIndex] = newProxy;
-					}
-				}
-				finalProxyVal = JSON.stringify(proxyList);
-			} else {
-				if (finalCountry && finalCountry !== "ALL" && finalCountry !== "UN") {
-					finalProxyVal = JSON.stringify([{ proxy: newProxy, country: finalCountry }]);
-				}
-			}
-			await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE id = ?").bind(finalProxyVal, user.id).run();
-			await invalidateUserAuthCache(null, user.uuid); // the auth cache holds this same row, incl. the now-stale user_socks5
-		}
-	} catch (e) {
-	} finally {
-		GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
-	}
+  try {
+    if (GLOBAL_WRITE_LOCK.get(username + "_proxy_rotate")) return;
+    GLOBAL_WRITE_LOCK.set(username + "_proxy_rotate", true);
+    const user = await env.DB.prepare("SELECT id, uuid, user_socks5, auto_rotate_user_proxy, proxy_rotate_cooldowns FROM users WHERE username = ?").bind(username).first();
+    if (!user || user.auto_rotate_user_proxy !== 1 || !user.user_socks5) {
+      GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
+      return;
+    }
+    let proxyList = [];
+    let isArrayMode = false;
+    try {
+      if (user.user_socks5.trim().startsWith("[")) {
+        proxyList = JSON.parse(user.user_socks5);
+        isArrayMode = true;
+      } else {
+        proxyList = [user.user_socks5];
+      }
+    } catch (e) {
+      proxyList = [user.user_socks5];
+    }
+    let matchIndex = -1;
+    for (let i = 0; i < proxyList.length; i++) {
+      let itemStr = typeof proxyList[i] === "object" && proxyList[i] !== null ? proxyList[i].proxy : proxyList[i];
+      if (itemStr === oldProxy) {
+        matchIndex = i;
+        break;
+      }
+    }
+    if (matchIndex === -1) {
+      GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
+      return;
+    }
+    let cooldowns = {};
+    try {
+      cooldowns = user.proxy_rotate_cooldowns ? JSON.parse(user.proxy_rotate_cooldowns) : {};
+    } catch (e) {
+      cooldowns = {};
+    }
+    const COOLDOWN_MS = 36e5;
+    const isOnCooldown = (cc) => {
+      const last = cooldowns[cc];
+      return typeof last === "number" && Date.now() - last < COOLDOWN_MS;
+    };
+    const markAttempt = async (cc) => {
+      cooldowns[cc] = Date.now();
+      try {
+        await env.DB.prepare("UPDATE users SET proxy_rotate_cooldowns = ? WHERE id = ?").bind(JSON.stringify(cooldowns), user.id).run();
+      } catch (e) {
+      }
+    };
+    let countryCode = typeof proxyList[matchIndex] === "object" && proxyList[matchIndex] !== null && proxyList[matchIndex].country ? proxyList[matchIndex].country : "all";
+    if (countryCode === "all" || countryCode === "UN") {
+      try {
+        const payload = new TextEncoder().encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
+        const s = await connectProxy(oldProxy, "ip-api.com", 80, payload);
+        const reader = s.readable.getReader();
+        let resStr = "";
+        const dec = new TextDecoder();
+        const timeoutId = setTimeout(() => {
+          try {
+            s.close();
+          } catch (e) {
+          }
+        }, 2e3);
+        try {
+          while (true) {
+            const res = await reader.read();
+            if (res.done || !res.value) break;
+            resStr += dec.decode(res.value, { stream: true });
+            if (resStr.includes("countryCode")) break;
+          }
+        } finally {
+          clearTimeout(timeoutId);
+          try {
+            s.close();
+          } catch (e) {
+          }
+        }
+        const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
+        if (jsonMatch && jsonMatch[1]) countryCode = jsonMatch[1];
+      } catch (e) {
+      }
+      if (countryCode === "all" || countryCode === "UN") {
+        try {
+          let remain = oldProxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+          if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
+          if (remain.startsWith("[")) remain = remain.substring(1, remain.indexOf("]"));
+          else if (remain.includes(":")) remain = remain.substring(0, remain.lastIndexOf(":"));
+          const geoRes = await fetch(`http://ip-api.com/json/${remain}?fields=countryCode`);
+          const geoData = await geoRes.json();
+          if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
+        } catch (e) {
+        }
+      }
+    }
+    let newProxy = null;
+    let finalCountry = null;
+    const upperCountry = (countryCode || "ALL").toUpperCase();
+    if (upperCountry === "ALL" || upperCountry === "UN") {
+      GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
+      return;
+    }
+    if (isOnCooldown(upperCountry)) {
+      GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
+      return;
+    }
+    await markAttempt(upperCountry);
+    const sources = [{ url: `proxy_vip/${upperCountry}.txt`, type: "repo", country: upperCountry }];
+    for (const src of sources) {
+      try {
+        const text = await getCachedRepoFile(src.url);
+        if (!text) continue;
+        const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+        if (lines.length > 0) {
+          for (let i = lines.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [lines[i], lines[j]] = [lines[j], lines[i]];
+          }
+          const testLimit = src.country === upperCountry ? 15 : 3;
+          const testBatch = lines.slice(0, testLimit).flatMap((line) => {
+            if (line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks")) {
+              return [line];
+            }
+            if (src.type === "socks5") return [`socks5://${line}`];
+            if (src.type === "http") return [`http://${line}`];
+            return [`socks5://${line}`, `http://${line}`];
+          });
+          try {
+            newProxy = await Promise.any(
+              testBatch.map((p) => {
+                return new Promise(async (resolve, reject) => {
+                  let sock = null;
+                  const timeoutId = setTimeout(() => {
+                    try {
+                      sock && sock.close();
+                    } catch (e) {
+                    }
+                    reject(new Error("timeout"));
+                  }, 4e3);
+                  try {
+                    const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+                    sock = await connectProxy(p, "1.1.1.1", 80, payload);
+                    const reader = sock.readable.getReader();
+                    const res = await reader.read();
+                    clearTimeout(timeoutId);
+                    try {
+                      sock.close();
+                    } catch (e) {
+                    }
+                    if (res.done || !res.value) reject(new Error("empty"));
+                    else resolve(p);
+                  } catch (e) {
+                    clearTimeout(timeoutId);
+                    try {
+                      sock && sock.close();
+                    } catch (err) {
+                    }
+                    reject(e);
+                  }
+                });
+              })
+            );
+          } catch (e) {
+            continue;
+          }
+          if (newProxy) {
+            finalCountry = src.country;
+            break;
+          }
+        }
+      } catch (e) {
+      }
+    }
+    if (newProxy) {
+      let finalProxyVal = newProxy;
+      if (isArrayMode) {
+        if (typeof proxyList[matchIndex] === "object" && proxyList[matchIndex] !== null) {
+          proxyList[matchIndex].proxy = newProxy;
+          if (finalCountry && finalCountry !== "ALL" && finalCountry !== "UN") {
+            proxyList[matchIndex].country = finalCountry;
+          }
+        } else {
+          if (finalCountry && finalCountry !== "ALL" && finalCountry !== "UN") {
+            proxyList[matchIndex] = { proxy: newProxy, country: finalCountry };
+          } else {
+            proxyList[matchIndex] = newProxy;
+          }
+        }
+        finalProxyVal = JSON.stringify(proxyList);
+      } else {
+        if (finalCountry && finalCountry !== "ALL" && finalCountry !== "UN") {
+          finalProxyVal = JSON.stringify([{ proxy: newProxy, country: finalCountry }]);
+        }
+      }
+      await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE id = ?").bind(finalProxyVal, user.id).run();
+      await invalidateUserAuthCache(null, user.uuid);
+    }
+  } catch (e) {
+  } finally {
+    GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
+  }
 }
 const __WORKER_EXPORT__ = {
-	async fetch(request, env, ctx) {
-		if (!env.DB) {
-			return new Response("Database binding 'DB' is missing in Cloudflare Workers settings.", { status: 500 });
-		}
-		try {
-			try {
-				await DbService.ensureSchema(env.DB);
-			} catch (e) { }
-			trackRequest(env, ctx);
-			if (schemaEnsured) {
-				ctx.waitUntil(checkAutoResets(env, ctx));
-				ctx.waitUntil(checkAutoRotates(env, ctx));
-			}
-			const url = new URL(request.url);
-			if (Router.isWebSocketUpgrade(request)) {
-				return await Router.handleWebSocket(request, env, ctx);
-			}
-			if (Router.isSubscriptionPath(url.pathname)) {
-				return await Router.handleSubscription(url, env);
-			}
-			if (url.pathname === "/icon.svg" || url.pathname === "/favicon.ico" || url.pathname === "/icon.png" || url.pathname === "/apple-touch-icon.png") {
-				return new Response(ICON_SVG, {
-					headers: {
-						"Content-Type": "image/svg+xml; charset=utf-8",
-						"Cache-Control": "public, max-age=604800, immutable",
-					},
-				});
-			}
-			if (url.pathname === "/manifest.json") {
-				// این فایل، بدون هیچ نشانه‌ای از پنل، فقط برای کاربر واردشده (کوکی سشن معتبر) سرو می‌شود؛
-				// در غیر این صورت 404 برمی‌گردد تا با درخواست مستقیم این آدرس هم چیزی لو نرود.
-				const manifestAuthorized = await DbService.verifyApiAuth(request, env);
-				if (!manifestAuthorized) {
-					return new Response("Not Found", { status: 404 });
-				}
-				return new Response(PWA_MANIFEST, {
-					headers: {
-						"Content-Type": "application/manifest+json; charset=utf-8",
-						"Cache-Control": "no-store",
-					},
-				});
-			}
-			if (url.pathname === "/sw.js") {
-				const swAuthorized = await DbService.verifyApiAuth(request, env);
-				if (!swAuthorized) {
-					return new Response("Not Found", { status: 404 });
-				}
-				return new Response(PWA_SERVICE_WORKER, {
-					headers: {
-						"Content-Type": "application/javascript; charset=utf-8",
-						"Cache-Control": "no-store",
-					},
-				});
-			}
-			if (url.pathname.startsWith("/api/")) {
-				return await Router.handleApi(request, url, env, ctx);
-			}
-			if (url.pathname === "/ppannell") {
-				return await Router.handlePanel(request, env);
-			}
-			if (url.pathname.startsWith("/profile/")) {
-				return await Router.handleUserStatus(url, env);
-			}
-			return new Response(HTML_TEMPLATES.nginx, {
-				headers: { "Content-Type": "text/html; charset=utf-8" },
-			});
-		} catch (err) {
-			let msg = err.message || "";
-			if (msg.toLowerCase().includes("d1") && (msg.toLowerCase().includes("limit") || msg.toLowerCase().includes("exceeded") || msg.toLowerCase().includes("daily row"))) {
-				return new Response(JSON.stringify({ error: "سهمیه دیتابیس شما تمام شده و ساعت 3:30 درست میشه" }), { 
-					status: 500, 
-					headers: { "Content-Type": "application/json; charset=utf-8" } 
-				});
-			}
-			return new Response("Internal Server Error", { status: 500 });
-		}
-	},
+  async fetch(request2, env, ctx) {
+    if (!env.DB) {
+      return new Response("Database binding 'DB' is missing in Cloudflare Workers settings.", { status: 500 });
+    }
+    try {
+      try {
+        await DbService.ensureSchema(env.DB);
+      } catch (e) {
+      }
+      trackRequest(env, ctx);
+      if (schemaEnsured) {
+        ctx.waitUntil(checkAutoResets(env, ctx));
+        ctx.waitUntil(checkAutoRotates(env, ctx));
+      }
+      const url = new URL(request2.url);
+      if (Router.isWebSocketUpgrade(request2)) {
+        return await Router.handleWebSocket(request2, env, ctx);
+      }
+      if (Router.isSubscriptionPath(url.pathname)) {
+        return await Router.handleSubscription(url, env);
+      }
+      if (url.pathname === "/icon.svg" || url.pathname === "/favicon.ico" || url.pathname === "/icon.png" || url.pathname === "/apple-touch-icon.png") {
+        return new Response(ICON_SVG, {
+          headers: {
+            "Content-Type": "image/svg+xml; charset=utf-8",
+            "Cache-Control": "public, max-age=604800, immutable"
+          }
+        });
+      }
+      if (url.pathname === "/manifest.json") {
+        const manifestAuthorized = await DbService.verifyApiAuth(request2, env);
+        if (!manifestAuthorized) {
+          return new Response("Not Found", { status: 404 });
+        }
+        return new Response(PWA_MANIFEST, {
+          headers: {
+            "Content-Type": "application/manifest+json; charset=utf-8",
+            "Cache-Control": "no-store"
+          }
+        });
+      }
+      if (url.pathname === "/sw.js") {
+        const swAuthorized = await DbService.verifyApiAuth(request2, env);
+        if (!swAuthorized) {
+          return new Response("Not Found", { status: 404 });
+        }
+        return new Response(PWA_SERVICE_WORKER, {
+          headers: {
+            "Content-Type": "application/javascript; charset=utf-8",
+            "Cache-Control": "no-store"
+          }
+        });
+      }
+      if (url.pathname.startsWith("/api/")) {
+        return await Router.handleApi(request2, url, env, ctx);
+      }
+      if (url.pathname === "/ppannell") {
+        return await Router.handlePanel(request2, env);
+      }
+      if (url.pathname.startsWith("/profile/")) {
+        return await Router.handleUserStatus(url, env);
+      }
+      return new Response(HTML_TEMPLATES.nginx, {
+        headers: { "Content-Type": "text/html; charset=utf-8" }
+      });
+    } catch (err) {
+      let msg = err.message || "";
+      if (msg.toLowerCase().includes("d1") && (msg.toLowerCase().includes("limit") || msg.toLowerCase().includes("exceeded") || msg.toLowerCase().includes("daily row"))) {
+        return new Response(JSON.stringify({ error: "سهمیه دیتابیس شما تمام شده و ساعت 3:30 درست میشه" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+      return new Response("Internal Server Error", { status: 500 });
+    }
+  }
 };
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
@@ -1450,32 +1608,32 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" 
   </g>
 </svg>`;
 const PWA_MANIFEST = JSON.stringify({
-	name: "Admin Panel",
-	short_name: "Admin Panel",
-	description: "پنل مدیریت پیشرفته کانفیگ",
-	start_url: "/ppannell",
-	scope: "/",
-	display: "standalone",
-	background_color: "#000000",
-	theme_color: "#000000",
-	dir: "rtl",
-	lang: "fa-IR",
-	orientation: "any",
-	icons: [
-		{
-			src: "/icon.svg",
-			sizes: "192x192 512x512",
-			type: "image/svg+xml",
-			purpose: "any maskable"
-		},
-		{
-			src: "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20512%20512%22%20width%3D%22512%22%20height%3D%22512%22%3E%0A%20%20%3Cdefs%3E%0A%20%20%20%20%3CradialGradient%20id%3D%22ZYXBg%22%20cx%3D%2250%25%22%20cy%3D%2250%25%22%20r%3D%2250%25%22%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%230e2348%22%2F%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%23020617%22%2F%3E%0A%20%20%20%20%3C%2FradialGradient%3E%0A%20%20%20%20%3Cfilter%20id%3D%22ZYXGlow%22%20x%3D%22-20%25%22%20y%3D%22-20%25%22%20width%3D%22140%25%22%20height%3D%22140%25%22%3E%0A%20%20%20%20%20%20%3CfeDropShadow%20dx%3D%220%22%20dy%3D%220%22%20stdDeviation%3D%2216%22%20flood-color%3D%22%233b82f6%22%20flood-opacity%3D%220.6%22%2F%3E%0A%20%20%20%20%3C%2Ffilter%3E%0A%20%20%3C%2Fdefs%3E%0A%20%20%3Crect%20width%3D%22512%22%20height%3D%22512%22%20rx%3D%22128%22%20fill%3D%22%23000000%22%2F%3E%0A%20%20%3Crect%20x%3D%2248%22%20y%3D%2248%22%20width%3D%22416%22%20height%3D%22416%22%20rx%3D%2296%22%20fill%3D%22url(%23ZYXBg)%22%20stroke%3D%22%233b82f6%22%20stroke-width%3D%2216%22%20filter%3D%22url(%23ZYXGlow)%22%2F%3E%0A%20%20%3Crect%20x%3D%2256%22%20y%3D%2256%22%20width%3D%22400%22%20height%3D%22400%22%20rx%3D%2288%22%20fill%3D%22none%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%224%22%20stroke-opacity%3D%220.4%22%2F%3E%0A%20%20%3Cg%20transform%3D%22translate(128%2C%20128)%20scale(10.666)%22%20filter%3D%22url(%23ZYXGlow)%22%3E%0A%20%20%20%20%3Cpath%20d%3D%22M13%2010V3L4%2014h7v7l9-11h-7z%22%20fill%3D%22%2338bdf8%22%20fill-opacity%3D%220.3%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%221.6%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%20%20%3C%2Fg%3E%0A%3C%2Fsvg%3E",
-			sizes: "192x192 512x512",
-			type: "image/svg+xml",
-			purpose: "any maskable"
-		}
-	],
-	categories: ["utilities", "productivity"]
+  name: "Admin Panel",
+  short_name: "Admin Panel",
+  description: "پنل مدیریت پیشرفته کانفیگ",
+  start_url: "/ppannell",
+  scope: "/",
+  display: "standalone",
+  background_color: "#000000",
+  theme_color: "#000000",
+  dir: "rtl",
+  lang: "fa-IR",
+  orientation: "any",
+  icons: [
+    {
+      src: "/icon.svg",
+      sizes: "192x192 512x512",
+      type: "image/svg+xml",
+      purpose: "any maskable"
+    },
+    {
+      src: "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20512%20512%22%20width%3D%22512%22%20height%3D%22512%22%3E%0A%20%20%3Cdefs%3E%0A%20%20%20%20%3CradialGradient%20id%3D%22ZYXBg%22%20cx%3D%2250%25%22%20cy%3D%2250%25%22%20r%3D%2250%25%22%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%230e2348%22%2F%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%23020617%22%2F%3E%0A%20%20%20%20%3C%2FradialGradient%3E%0A%20%20%20%20%3Cfilter%20id%3D%22ZYXGlow%22%20x%3D%22-20%25%22%20y%3D%22-20%25%22%20width%3D%22140%25%22%20height%3D%22140%25%22%3E%0A%20%20%20%20%20%20%3CfeDropShadow%20dx%3D%220%22%20dy%3D%220%22%20stdDeviation%3D%2216%22%20flood-color%3D%22%233b82f6%22%20flood-opacity%3D%220.6%22%2F%3E%0A%20%20%20%20%3C%2Ffilter%3E%0A%20%20%3C%2Fdefs%3E%0A%20%20%3Crect%20width%3D%22512%22%20height%3D%22512%22%20rx%3D%22128%22%20fill%3D%22%23000000%22%2F%3E%0A%20%20%3Crect%20x%3D%2248%22%20y%3D%2248%22%20width%3D%22416%22%20height%3D%22416%22%20rx%3D%2296%22%20fill%3D%22url(%23ZYXBg)%22%20stroke%3D%22%233b82f6%22%20stroke-width%3D%2216%22%20filter%3D%22url(%23ZYXGlow)%22%2F%3E%0A%20%20%3Crect%20x%3D%2256%22%20y%3D%2256%22%20width%3D%22400%22%20height%3D%22400%22%20rx%3D%2288%22%20fill%3D%22none%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%224%22%20stroke-opacity%3D%220.4%22%2F%3E%0A%20%20%3Cg%20transform%3D%22translate(128%2C%20128)%20scale(10.666)%22%20filter%3D%22url(%23ZYXGlow)%22%3E%0A%20%20%20%20%3Cpath%20d%3D%22M13%2010V3L4%2014h7v7l9-11h-7z%22%20fill%3D%22%2338bdf8%22%20fill-opacity%3D%220.3%22%20stroke%3D%22%2360a5fa%22%20stroke-width%3D%221.6%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%20%20%3C%2Fg%3E%0A%3C%2Fsvg%3E",
+      sizes: "192x192 512x512",
+      type: "image/svg+xml",
+      purpose: "any maskable"
+    }
+  ],
+  categories: ["utilities", "productivity"]
 });
 const PWA_SERVICE_WORKER = `
 const CACHE_NAME = "ZYX-pwa-cache-v1";
@@ -1522,3410 +1680,2896 @@ self.addEventListener("fetch", (e) => {
 });
 `;
 const Router = {
-	isWebSocketUpgrade(request) {
-	const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase();
-	return upgradeHeader === "websocket";
-	},
-	isSubscriptionPath(pathname) {
-		return pathname.startsWith("/notes/") || pathname.startsWith("/bundle/");
-	},
-	async handleWebSocket(request, env, ctx) {
-		try {
-			return handlevIees(env, null, ctx, request);
-		} catch (e) {
-			return new Response("Internal Server Error", { status: 500 });
-		}
-	},
-	async handleSubscription(url, env) {
-		const isSingbox = url.pathname.startsWith("/bundle/");
-		const offset = isSingbox ? 8 : 7;
-		let subUser = safeDecodeURI(url.pathname.slice(offset));
-		const host = url.hostname;
-		try {
-			const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE OR uuid = ?").bind(subUser, subUser).first();
-			if (!user) {
-				return new Response("Not Found", { status: 404 });
-			}
-			try {
-				USER_REQ_CACHE.set(user.username, (USER_REQ_CACHE.get(user.username) || 0) + 1);
-			} catch (e) { }
-			if (isSingbox) {
-				return await SubscriptionService.generateSingbox(user, host, env);
-			}
-			return await SubscriptionService.generateText(user, host, env);
-		} catch (err) {
-			return new Response("Error building config: " + err.message, { status: 500 });
-		}
-	},
-	async handlePanel(request, env) {
-		const hasPassword = await DbService.getPanelPassword(env.DB);
-		if (!hasPassword) {
-			return new Response(HTML_TEMPLATES.setup, {
-				headers: { "Content-Type": "text/html; charset=utf-8" },
-			});
-		}
-		const authorized = await DbService.verifyApiAuth(request, env);
-		if (!authorized) {
-			return new Response(HTML_TEMPLATES.login, {
-				headers: { "Content-Type": "text/html; charset=utf-8" },
-			});
-		}
-		return new Response(HTML_TEMPLATES.panel, {
-			headers: {
-				"Content-Type": "text/html; charset=utf-8",
-				"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-				Pragma: "no-cache",
-				Expires: "0",
-			},
-		});
-	},
-	async handleUserStatus(url, env) {
-		const username = safeDecodeURI(url.pathname.slice(9));
-		if (!username) {
-			return new Response("Username is required", { status: 400 });
-		}
-		try {
-			const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE OR uuid = ?").bind(username, username).first();
-			if (!user) {
-				return new Response("User not found", { status: 404 });
-			}
-			const subResponse = await SubscriptionService.generateText(user, url.hostname, env);
-			const subBase64 = await subResponse.text();
-			let plainLinks = "";
-			try {
-				plainLinks = decodeURIComponent(escape(atob(subBase64)));
-			} catch (e) {
-				plainLinks = atob(subBase64);
-			}
-			if (user.auto_rotate_ip === 1) {
-				const cachedIpsData = await getCachedIps();
-				const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
-				if (randomIps.length > 0) user.ips = randomIps.join("\n");
-			}
-			const statusPageIpSettings = await getSubscriptionIpSettings(env);
-			const inlineProxyIpForStatusPage = statusPageIpSettings.inlineProxyIp;
-			const otherCleanIpsForStatusPage = statusPageIpSettings.otherCleanIps;
-			const userJson = JSON.stringify({
-				username: user.username,
-				uuid: user.uuid,
-				limit_gb: user.limit_gb,
-				expiry_days: user.expiry_days,
-				used_gb: (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)),
-				limit_req: user.limit_req,
-				used_req: (user.used_req || 0) + (USER_REQ_CACHE.get(user.username) || 0),
-				is_active: user.is_active,
-				online_count: getActiveIpCount(user.active_ips),
-				ip_limit: user.ip_limit,
-				created_at: user.created_at,
-				tls: user.tls,
-				port: user.port,
-				ips: user.ips,
-				fingerprint: user.fingerprint || "chrome",
-				connection_type: user.connection_type || "vless",
-				user_proxy_iata: user.user_proxy_iata,
-				user_socks5: user.user_socks5,
-				user_proxy_ip: user.user_proxy_ip,
-				start_on_first_connect: user.start_on_first_connect,
-				first_connection_time: user.first_connection_time,
-				enable_direct: user.enable_direct !== 0 ? 1 : 0,
-				early_data_enabled: Number(user.early_data_enabled) === 1 ? 1 : 0,
-				early_data_size: user.early_data_size,
-			});
-			const html = HTML_TEMPLATES.status.replace("/* {{USER_DATA_PLACEHOLDER}} */", `window.statusUser = ${userJson}; window.INLINE_PROXY_IP = ${JSON.stringify(inlineProxyIpForStatusPage)}; window.OTHER_CLEAN_IPS = ${JSON.stringify(otherCleanIpsForStatusPage)};`);
-			const finalHtml = html + "\n<!-- HIDDEN_CONFIGS -->\n<div style='display:none; white-space:pre-wrap;'>\n" + plainLinks + "\n</div>";
-			try {
-				const ua = (request.headers.get("User-Agent") || "").toLowerCase();
-				if (!ua.includes("mozilla") && !ua.includes("chrome") && !ua.includes("safari")) {
-					USER_REQ_CACHE.set(user.username, (USER_REQ_CACHE.get(user.username) || 0) + 1);
-				}
-			} catch (e) { }
-			return new Response(finalHtml, {
-				headers: { "Content-Type": "text/html; charset=utf-8" },
-			});
-		} catch (err) {
-			return new Response("Error: " + err.message, { status: 500 });
-		}
-	},
-	async handleApi(request, url, env, ctx) {
-		const hasPassword = await DbService.getPanelPassword(env.DB);
-		if (url.pathname === "/api/setup-password" && request.method === "POST") {
-			if (hasPassword) {
-				return new Response(JSON.stringify({ error: "رمز عبور از قبل تعریف شده است" }), {
-					status: 400,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			const { password } = await readJsonBody(request);
-			const cleanPassword = (password || "").trim();
-			if (!cleanPassword || cleanPassword.length < 4) {
-				return new Response(JSON.stringify({ error: "رمز عبور باید حداقل ۴ کاراکتر باشد" }), {
-					status: 400,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			const hashed = await DbService.sha256(cleanPassword);
-			await DbService.setPanelPassword(env.DB, hashed);
-			LOGIN_ATTEMPTS.clear();
-			return new Response(JSON.stringify({ success: true }), {
-				headers: {
-					"Content-Type": "application/json; charset=utf-8",
-					"Set-Cookie": "panel_session=" + hashed + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
-				},
-			});
-		}
-		if (url.pathname === "/api/login" && request.method === "POST") {
-			const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
-			const now = Date.now();
-			if (LOGIN_ATTEMPTS.size > 256) {
-				for (const [ip, rec] of LOGIN_ATTEMPTS) {
-					if (now - rec.lastAttempt > 900000) LOGIN_ATTEMPTS.delete(ip);
-				}
-			}
-			const attemptRecord = LOGIN_ATTEMPTS.get(clientIP) || { count: 0, lastAttempt: 0 };
-			if (attemptRecord.count >= 15 && now - attemptRecord.lastAttempt < 900000) {
-				const remaining = Math.ceil((900000 - (now - attemptRecord.lastAttempt)) / 60000);
-				return new Response(JSON.stringify({ error: `دسترسی شما مسدود شد. لطفاً ${remaining} دقیقه دیگر تلاش کنید.` }), {
-					status: 429,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			const { password } = await readJsonBody(request);
-			const cleanPassword = (password || "").trim();
-			const hashedInput = await DbService.sha256(cleanPassword);
-			const storedHash = await DbService.getPanelPassword(env.DB, true);
-			let isValid = false;
-			if (storedHash === hashedInput) {
-				isValid = true;
-			} else {
-				const oldHashedInput = await DbService.oldSha256(cleanPassword);
-				if (storedHash === oldHashedInput) {
-					isValid = true;
-					await DbService.setPanelPassword(env.DB, hashedInput);
-				}
-			}
-			if (isValid) {
-				LOGIN_ATTEMPTS.delete(clientIP);
-				return new Response(JSON.stringify({ success: true }), {
-					headers: {
-						"Content-Type": "application/json; charset=utf-8",
-						"Set-Cookie": "panel_session=" + hashedInput + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
-					},
-				});
-			} else {
-				attemptRecord.count = now - attemptRecord.lastAttempt > 900000 ? 1 : attemptRecord.count + 1;
-				attemptRecord.lastAttempt = now;
-				LOGIN_ATTEMPTS.set(clientIP, attemptRecord);
-				return new Response(JSON.stringify({ error: `رمز عبور اشتباه است (تلاش‌های باقی‌مانده: ${15 - attemptRecord.count})` }), {
-					status: 401,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-		}
-		if (url.pathname === "/api/logout" && request.method === "POST") {
-			return new Response(JSON.stringify({ success: true }), {
-				headers: {
-					"Content-Type": "application/json; charset=utf-8",
-					"Set-Cookie": "panel_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax",
-				},
-			});
-		}
-		if (url.pathname === "/api/recover" && request.method === "POST") {
-			const { api_token } = await readJsonBody(request);
-			if (!api_token) {
-				return new Response(JSON.stringify({ error: "Token is required" }), {
-					status: 400,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			try {
-				const cfRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
-					headers: { Authorization: "Bearer " + api_token },
-				});
-				const cfData = await cfRes.json();
-				if (!cfRes.ok || !cfData.success) {
-					return new Response(JSON.stringify({ error: "Invalid or expired Cloudflare token" }), {
-						status: 401,
-						headers: { "Content-Type": "application/json; charset=utf-8" },
-					});
-				}
-				const host = url.hostname;
-				let isAuthorized = false;
-				if (host.endsWith(".workers.dev")) {
-					const parts = host.split(".");
-					const targetSubdomain = parts[parts.length - 3];
-					const accountsRes = await fetch("https://api.cloudflare.com/client/v4/accounts", {
-						headers: { Authorization: "Bearer " + api_token },
-					});
-					const accountsData = await accountsRes.json();
-					if (accountsData.success && accountsData.result) {
-						for (const acc of accountsData.result) {
-							const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.id}/workers/subdomain`, {
-								headers: { Authorization: "Bearer " + api_token },
-							});
-							const subData = await subRes.json();
-							if (subData.success && subData.result && subData.result.subdomain === targetSubdomain) {
-								isAuthorized = true;
-								break;
-							}
-						}
-					}
-				} else {
-					const zonesRes = await fetch("https://api.cloudflare.com/client/v4/zones", {
-						headers: { Authorization: "Bearer " + api_token },
-					});
-					const zonesData = await zonesRes.json();
-					if (zonesData.success && zonesData.result) {
-						for (const zone of zonesData.result) {
-							if (host === zone.name || host.endsWith("." + zone.name)) {
-								isAuthorized = true;
-								break;
-							}
-						}
-					}
-				}
-				if (!isAuthorized) {
-					return new Response(JSON.stringify({ error: "این توکن متعلق به صاحب پـنـل نیست (ای کــثـــکـــش)" }), {
-						status: 403,
-						headers: { "Content-Type": "application/json; charset=utf-8" },
-					});
-				}
-				await env.DB.prepare("DELETE FROM settings WHERE key = 'panel_password'").run();
-				cachedPanelPassword = null;
-				LOGIN_ATTEMPTS.clear();
-				return new Response(JSON.stringify({ success: true }), {
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			} catch (err) {
-				return new Response(JSON.stringify({ error: "Cloudflare API connection error" }), {
-					status: 500,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-		}
-		const authorized = await DbService.verifyApiAuth(request, env);
-		if (!authorized && url.pathname !== "/api/test-proxy") {
-			return new Response(JSON.stringify({ error: "Unauthorized" }), {
-				status: 401,
-				headers: { "Content-Type": "application/json; charset=utf-8" },
-			});
-		}
-		if (url.pathname === "/api/auto-update-setup" && request.method === "POST") {
-			const body = await readJsonBody(request);
-			if (body.action === "check") {
-				const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
-				const hasToken = !!env.CF_API_TOKEN || !!(dbTokenRow && dbTokenRow.value);
-				const autoUpdateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'auto_update'").first();
-				const isAutoUpdateEnabled = autoUpdateRow ? autoUpdateRow.value === "1" : true;
-				return new Response(JSON.stringify({ has_token: hasToken, auto_update: isAutoUpdateEnabled }), { headers: { "Content-Type": "application/json" } });
-			}
-			if (body.action === "enable") {
-				const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
-				let token = body.token || env.CF_API_TOKEN || (dbTokenRow ? dbTokenRow.value : null);
-				if (!token) return new Response(JSON.stringify({ error: "TOKEN_MISSING" }), { status: 400, headers: { "Content-Type": "application/json" } });
-				try {
-					const cfRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
-						headers: { Authorization: "Bearer " + token },
-					});
-					const cfData = await cfRes.json();
-					if (!cfRes.ok || !cfData.success) {
-						return new Response(JSON.stringify({ error: "INVALID_TOKEN" }), { status: 400, headers: { "Content-Type": "application/json" } });
-					}
-					await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_token', ?)").bind(token).run();
-					await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_update', '1')").run();
-					return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-				} catch (e) {
-					return new Response(JSON.stringify({ error: "خطا در بررسی توکن با کلودفلر" }), { status: 500, headers: { "Content-Type": "application/json" } });
-				}
-			}
-			if (body.action === "disable") {
-				await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_update', '0')").run();
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-			}
-		}
-		if (url.pathname === "/api/restart-core" && request.method === "POST") {
-			try {
-				GLOBAL_TRAFFIC_CACHE.clear();
-				ACTIVE_CONNECTIONS_COUNT.clear();
-				GLOBAL_LAST_ACTIVE_WRITE.clear();
-				GLOBAL_LAST_DB_WRITE.clear();
-				GLOBAL_WRITE_LOCK.clear();
-				DNS_CACHE.clear();
-				USER_REQ_CACHE.clear();
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-			} catch (err) {
-				return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
-			}
-		}
-		if (url.pathname === "/api/update-panel" && request.method === "POST") {
-			const body = await request.json().catch(() => ({}));
-			const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
-			let currentToken = env.CF_API_TOKEN || (dbTokenRow ? dbTokenRow.value : null) || body.cf_token || null;
-			let currentAccountId = env.CF_ACCOUNT_ID;
-			if (!currentToken) {
-				return new Response(JSON.stringify({ error: "TOKEN_REQUIRED" }), { status: 400, headers: { "Content-Type": "application/json" } });
-			}
-			try {
-				const cfHeaders = {
-					Authorization: "Bearer " + currentToken,
-					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZYXPanel/1.0",
-				};
-				if (!currentAccountId) {
-					const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: cfHeaders });
-					if (!accRes.ok) throw new Error("کلودفلر درخواست اکانت را رد کرد (وضعیت: " + accRes.status + ")");
-					const accData = await accRes.json().catch(() => ({}));
-					if (!accData.success || !accData.result || accData.result.length === 0) throw new Error("توکن نامعتبر است یا اکانتی یافت نشد.");
-					currentAccountId = accData.result[0].id;
-				}
-				const githubRes = await fetchWithFallback("zeus.obfuscated.js?t=" + Date.now(), {
-					headers: {
-						"User-Agent": "Mozilla/5.0",
-						"Cache-Control": "no-cache",
-					},
-				});
-				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
-				const newCode = await githubRes.text();
-				assertDeployableWorkerModule(newCode, "zeus.obfuscated.js");
-				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
-				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
-					headers: cfHeaders,
-				});
-				if (!bindingsRes.ok) {
-					const bindingsErr = await bindingsRes.json().catch(() => ({}));
-					const bindingsErrMsg = bindingsErr && bindingsErr.errors && bindingsErr.errors[0] ? bindingsErr.errors[0].message : "";
-					throw new Error("عدم دسترسی به تنظیمات ورکر «" + scriptName + "». کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")" + (bindingsErrMsg ? ": " + bindingsErrMsg : ""));
-				}
-				const bindingsData = await bindingsRes.json().catch(() => ({}));
-				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
-				const newBindings = [];
-				for (const b of bindingsData.result || []) {
-					if (b.name === "CF_API_TOKEN" || b.name === "CF_ACCOUNT_ID") continue;
-					if (b.type === "d1") {
-						newBindings.push({ type: "d1", name: b.name, id: b.database_id || b.id });
-					} else if (b.type === "kv_namespace") {
-						newBindings.push({ type: "kv_namespace", name: b.name, namespace_id: b.namespace_id || b.id });
-					} else if (b.type === "plain_text") {
-						newBindings.push({ type: "plain_text", name: b.name, text: b.text || "" });
-					} else if (b.type !== "secret_text") {
-						newBindings.push(b);
-					}
-				}
-				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
-				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
-				const metadata = {
-					main_module: "ZYX.js",
-					compatibility_date: "2026-07-10",
-					compatibility_flags: ["nodejs_compat"],
-					bindings: newBindings,
-				};
-				const formData = new FormData();
-				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
-				formData.append("ZYX.js", new Blob([newCode], { type: "application/javascript+module" }), "ZYX.js");
-				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
-					method: "PUT",
-					headers: cfHeaders,
-					body: formData,
-				});
-				if (!deployRes.ok) {
-					const errText = await deployRes.text().catch(() => "");
-					throw new Error("خطای کلودفلر هنگام دیپلوی (" + deployRes.status + "): " + errText.substring(0, 150));
-				}
-				const deployData = await deployRes.json().catch(() => ({}));
-				if (!deployData.success) {
-					const cfError = deployData.errors && deployData.errors.length > 0 ? deployData.errors[0].message : "خطا در اعمال آپدیت.";
-					throw new Error(cfError);
-				}
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-			} catch (err) {
-				return new Response(JSON.stringify({ error: err.message }), { status: 400, headers: { "Content-Type": "application/json" } });
-			}
-		}
-		if (url.pathname === "/api/update-panel-github" && request.method === "POST") {
-			// آپدیت مستقیم از روی سورس شخصی کاربر در گیت‌هاب (به‌جای مخزن رسمی زئوس)
-			// دقیقاً همان مکانیزم /api/update-panel: خواندن توکن/اکانت، حفظ بایندینگ‌های فعلی، دیپلوی روی کلودفلر
-			const body = await request.json().catch(() => ({}));
-			const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
-			let currentToken = env.CF_API_TOKEN || (dbTokenRow ? dbTokenRow.value : null) || body.cf_token || null;
-			let currentAccountId = env.CF_ACCOUNT_ID;
-			if (!currentToken) {
-				return new Response(JSON.stringify({ error: "TOKEN_REQUIRED" }), { status: 400, headers: { "Content-Type": "application/json" } });
-			}
-			try {
-				const cfHeaders = {
-					Authorization: "Bearer " + currentToken,
-					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZYXPanel/1.0",
-				};
-				if (!currentAccountId) {
-					const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: cfHeaders });
-					if (!accRes.ok) throw new Error("کلودفلر درخواست اکانت را رد کرد (وضعیت: " + accRes.status + ")");
-					const accData = await accRes.json().catch(() => ({}));
-					if (!accData.success || !accData.result || accData.result.length === 0) throw new Error("توکن نامعتبر است یا اکانتی یافت نشد.");
-					currentAccountId = accData.result[0].id;
-				}
-				const githubUrl = "https://raw.githubusercontent.com/hmditts/XYD-Panel/refs/heads/main/worker.js?t=" + Date.now();
-				const githubRes = await fetch(githubUrl, {
-					headers: {
-						"User-Agent": "Mozilla/5.0",
-						"Cache-Control": "no-cache",
-					},
-				});
-				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
-				const newCode = await githubRes.text();
-				if (!newCode || newCode.trim().length < 100) throw new Error("فایل دریافتی از گیت‌هاب خالی یا نامعتبر است.");
-				assertDeployableWorkerModule(newCode, "worker.js");
-				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
-				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
-					headers: cfHeaders,
-				});
-				if (!bindingsRes.ok) {
-					const bindingsErr = await bindingsRes.json().catch(() => ({}));
-					const bindingsErrMsg = bindingsErr && bindingsErr.errors && bindingsErr.errors[0] ? bindingsErr.errors[0].message : "";
-					throw new Error("عدم دسترسی به تنظیمات ورکر «" + scriptName + "». کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")" + (bindingsErrMsg ? ": " + bindingsErrMsg : ""));
-				}
-				const bindingsData = await bindingsRes.json().catch(() => ({}));
-				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
-				const newBindings = [];
-				for (const b of bindingsData.result || []) {
-					if (b.name === "CF_API_TOKEN" || b.name === "CF_ACCOUNT_ID") continue;
-					if (b.type === "d1") {
-						newBindings.push({ type: "d1", name: b.name, id: b.database_id || b.id });
-					} else if (b.type === "kv_namespace") {
-						newBindings.push({ type: "kv_namespace", name: b.name, namespace_id: b.namespace_id || b.id });
-					} else if (b.type === "plain_text") {
-						newBindings.push({ type: "plain_text", name: b.name, text: b.text || "" });
-					} else if (b.type !== "secret_text") {
-						newBindings.push(b);
-					}
-				}
-				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
-				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
-				const metadata = {
-					main_module: "ZYX.js",
-					compatibility_date: "2026-07-10",
-					compatibility_flags: ["nodejs_compat"],
-					bindings: newBindings,
-				};
-				const formData = new FormData();
-				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
-				formData.append("ZYX.js", new Blob([newCode], { type: "application/javascript+module" }), "ZYX.js");
-				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
-					method: "PUT",
-					headers: cfHeaders,
-					body: formData,
-				});
-				if (!deployRes.ok) {
-					const errText = await deployRes.text().catch(() => "");
-					throw new Error("خطای کلودفلر هنگام دیپلوی (" + deployRes.status + "): " + errText.substring(0, 150));
-				}
-				const deployData = await deployRes.json().catch(() => ({}));
-				if (!deployData.success) {
-					const cfError = deployData.errors && deployData.errors.length > 0 ? deployData.errors[0].message : "خطا در اعمال آپدیت.";
-					throw new Error(cfError);
-				}
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-			} catch (err) {
-				return new Response(JSON.stringify({ error: err.message }), { status: 400, headers: { "Content-Type": "application/json" } });
-			}
-		}
-		if (url.pathname === "/api/change-password" && request.method === "POST") {
-			const { current_password, new_password, password } = await readJsonBody(request);
-			// Master-key call (mother panel): the gate above already validated X-Master-Key against
-			// settings.master_api_key (verifyApiAuth uses ONLY the header when it is present), so the
-			// current password is not required. The mother sends the new password as `password`;
-			// the panel's own UI keeps sending current_password + new_password, unchanged.
-			const viaMasterKey = !!request.headers.get("X-Master-Key");
-			const cleanCurrent = (current_password || "").trim();
-			const cleanNew = (new_password || password || "").trim();
-			if (!cleanNew || (!viaMasterKey && !cleanCurrent)) {
-				return new Response(JSON.stringify({ error: viaMasterKey ? "رمز عبور جدید الزامی است" : "رمز عبور فعلی و جدید الزامی هستند" }), {
-					status: 400,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			if (!viaMasterKey) {
-				const currentHash = await DbService.sha256(cleanCurrent);
-				const oldCurrentHash = await DbService.oldSha256(cleanCurrent);
-				const storedHash = await DbService.getPanelPassword(env.DB, true);
-				if (storedHash && storedHash !== currentHash && storedHash !== oldCurrentHash) {
-					return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), {
-						status: 401,
-						headers: { "Content-Type": "application/json; charset=utf-8" },
-					});
-				}
-			}
-			if (cleanNew.length < 4) {
-				return new Response(JSON.stringify({ error: "رمز عبور جدید باید حداقل ۴ کاراکتر باشد" }), {
-					status: 400,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			const newHash = await DbService.sha256(cleanNew);
-			await DbService.setPanelPassword(env.DB, newHash);
-			return new Response(JSON.stringify({ success: true }), {
-				headers: {
-					"Content-Type": "application/json; charset=utf-8",
-					"Set-Cookie": "panel_session=" + newHash + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
-				},
-			});
-		}
-		if (url.pathname === "/api/settings/bulk") {
-			if (request.method === "GET") {
-				try {
-					const { results } = await env.DB.prepare("SELECT * FROM settings").all();
-					const settingsObj = {};
-					if (results) {
-						results.forEach((r) => {
-							if (r.key !== "cf_token" && r.key !== "panel_password" && r.key !== "master_api_key") settingsObj[r.key] = r.value;
-						});
-					}
-					return new Response(JSON.stringify(settingsObj), { headers: { "Content-Type": "application/json" } });
-				} catch (e) {
-					return new Response(JSON.stringify({}), { headers: { "Content-Type": "application/json" } });
-				}
-			}
-			if (request.method === "POST") {
-				const body = await readJsonBody(request);
-				let unpinRemoval = { countries: [], usersUpdated: 0 };
-				let fragApplied = false;
-				let earlyDataApplied = false;
-				let userLimitApplied = false;
-				let fingerprintApplied = false;
-				let connTypeApplied = false;
-				let cleanIpApplied = false;
-				let portApplied = false;
-				if (body.settings && typeof body.settings === "object") {
-					// «محدودیت کاربر» (user_limit): برخلاف بقیه‌ی تنظیمات global، این یکی روی ستون
-					// ip_limit/max_connections همه‌ی کاربرهای *موجود* هم override می‌شه (نه فقط پیش‌فرض
-					// کاربر تازه‌ساز - نگاه کنید به POST /api/users). هم «ذخیره‌ی تنظیمات» همین پنل و
-					// هم «Push to Panels» پنل مادر از همین مسیر می‌رن. (تنظیم «هشدار تعداد دستگاه» -
-					// device_warning_threshold - فقط ذخیره می‌شه و آستانه‌ی هشدار رو تعیین می‌کنه؛
-					// دیگه روی ip_limit/max_connections کاربرها اثری نداره.)
-					let overrideUserLimit = undefined;
-					if (Object.prototype.hasOwnProperty.call(body.settings, "user_limit")) {
-						const parsedUserLimit = parseInt(body.settings.user_limit);
-						if (!isNaN(parsedUserLimit) && parsedUserLimit >= 0) overrideUserLimit = parsedUserLimit;
-					}
-					// «پورت»: مثل بالا، این یکی هم - برخلاف بقیه‌ی تنظیمات global - روی ستون
-					// port همه‌ی کاربرهای *موجود* بازنویسی کامل می‌شه (نه فقط پیش‌فرض کاربر
-					// تازه‌ساز؛ نگاه کنید به getDefaultPortSetting() برای اون بخش). پورت(های)
-					// قبلی هر کاربر پاک و با همین یکی جایگزین می‌شه. مثل user_limit/global_clean_ip
-					// بالا و پایین، موفقیتش با port_applied: true توی جواب گزارش می‌شه تا پنل
-					// مادر هم بتونه پنل‌های آپدیت‌نشده رو (که این کلید رو نادیده می‌گیرن) تشخیص بده.
-					let overrideDefaultPort = undefined;
-					if (Object.prototype.hasOwnProperty.call(body.settings, "default_port")) {
-						const parsedPort = parseInt(body.settings.default_port);
-						if (!isNaN(parsedPort) && parsedPort > 0 && parsedPort <= 65535) overrideDefaultPort = String(parsedPort);
-					}
-					// «آی‌پی تمیز سراسری» (global_clean_ip): مثل «پورت» و «محدودیت کاربر» بالا -
-					// برخلاف بقیه‌ی تنظیمات global - این یکی هم روی ستون ips همه‌ی کاربرهای
-					// *موجود* بازنویسی کامل می‌شود (نه فقط پیش‌فرض کاربر تازه‌ساز؛ نگاه کنید به
-					// POST /api/users که nud.global_clean_ip را فقط وقتی می‌خواند که خودِ کاربر
-					// در لحظه‌ی ساخت مقدار ips جدا نداشته باشد). قبل از این تغییر این کلید فقط
-					// در جدول settings ذخیره می‌شد و هیچ‌وقت به کارت‌های موجود نمی‌رسید — همین
-					// نبود override باعث می‌شد تغییر «Global Clean IP» در پنل مادر روی کارت
-					// کاربرهایی که از قبل ساخته شده بودند اثر نکند.
-					let overrideGlobalCleanIp = undefined;
-					if (Object.prototype.hasOwnProperty.call(body.settings, "global_clean_ip")) {
-						const cleanIpVal = String(body.settings.global_clean_ip == null ? "" : body.settings.global_clean_ip).trim();
-						if (cleanIpVal) overrideGlobalCleanIp = cleanIpVal;
-					}
-					// «فرگمنت» (new_user_frag_len / new_user_frag_int): کلیدهای new_user_* فقط
-					// پیش‌فرضِ کاربر *تازه‌ساز*ند. لینک‌ها از ستون‌های frag_len/frag_int خودِ هر
-					// کاربر ساخته می‌شوند (SubscriptionService.generateText)، نه از settings؛ پس
-					// ذخیره‌ی این دو کلید به‌تنهایی روی کانفیگ کاربرهای موجود هیچ اثری ندارد.
-					// فقط وقتی فراخواننده (Push پنل مادر) صریحاً apply_frag_to_existing_users: true
-					// بفرستد (فلگ بیرون از body.settings، مثل prune_unpinned_locations)، همین دو
-					// مقدار روی ستون frag_len/frag_int همه‌ی کاربرهای *موجود* هم نوشته می‌شود؛
-					// مقدار خالی = فرگمنتیشن خاموش. «ذخیره‌ی تنظیمات» خودِ همین پنل این فلگ را
-					// نمی‌فرستد، پس فقط برای کاربر بعدی اثر دارد. هر دو کلید باید در درخواست باشند.
-					let overrideFrag = undefined;
-					if (
-						body.apply_frag_to_existing_users === true &&
-						Object.prototype.hasOwnProperty.call(body.settings, "new_user_frag_len") &&
-						Object.prototype.hasOwnProperty.call(body.settings, "new_user_frag_int")
-					) {
-						overrideFrag = {
-							len: String(body.settings.new_user_frag_len == null ? "" : body.settings.new_user_frag_len).trim(),
-							int: String(body.settings.new_user_frag_int == null ? "" : body.settings.new_user_frag_int).trim(),
-						};
-					}
-					// «فینگرپرینت» (new_user_fingerprint) و «پروتکل» (new_user_connection_type): مثل فرگمنت،
-					// این دو کلید هم فقط پیش‌فرضِ کاربر *تازه‌ساز*ند؛ لینک‌ها از ستون‌های fingerprint/
-					// connection_type خودِ هر کاربر ساخته می‌شوند (SubscriptionService.generateText و
-					// چک پروتکل هنگام اتصال)، نه از settings؛ پس ذخیره‌ی کلید به‌تنهایی روی کانفیگ
-					// کاربرهای موجود اثری نداشت. فقط وقتی فراخواننده (Push پنل مادر) صریحاً
-					// apply_fingerprint_to_existing_users / apply_connection_type_to_existing_users: true
-					// بفرستد (فلگ بیرون از body.settings، مثل apply_frag_to_existing_users)، مقدار روی
-					// ستون همه‌ی کاربرهای *موجود* هم نوشته می‌شود. «ذخیره‌ی تنظیمات» خودِ همین پنل این
-					// فلگ‌ها را نمی‌فرستد، پس فقط برای کاربر بعدی اثر دارد. مقدار نامعتبر = نادیده گرفته
-					// می‌شود (و چون *_applied برنمی‌گردد، مادر آن را به‌عنوان خطا گزارش می‌کند).
-					let overrideFingerprint = undefined;
-					if (body.apply_fingerprint_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_fingerprint")) {
-						const fpVal = String(body.settings.new_user_fingerprint == null ? "" : body.settings.new_user_fingerprint).trim();
-						if (NEW_USER_FINGERPRINTS.includes(fpVal)) overrideFingerprint = fpVal;
-					}
-					let overrideConnType = undefined;
-					if (body.apply_connection_type_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_connection_type")) {
-						const ctParts = String(body.settings.new_user_connection_type == null ? "" : body.settings.new_user_connection_type)
-							.split(",")
-							.map((x) => x.trim().toLowerCase());
-						const ctFinal = ["vless", "trojan"].filter((x) => ctParts.includes(x));
-						if (ctFinal.length > 0) overrideConnType = ctFinal.join(",");
-					}
-					// «Early Data» (new_user_early_data_enabled / new_user_early_data_size): مثل فرگمنت،
-					// این دو کلید هم فقط پیش‌فرضِ کاربر *تازه‌ساز*ند؛ لینک‌ها از ستون‌های
-					// early_data_enabled/early_data_size خودِ هر کاربر ساخته می‌شوند، نه از settings. فقط وقتی
-					// فراخواننده صریحاً apply_early_data_to_existing_users: true بفرستد (فلگ بیرون از
-					// body.settings، مثل apply_frag_to_existing_users) هر دو مقدار روی ستون‌های همه‌ی کاربرهای
-					// *موجود* هم نوشته می‌شود. «ذخیره‌ی تنظیمات» همین پنل این فلگ را فقط وقتی می‌فرستد که
-					// چک‌باکس «اعمال روی کاربرهای موجود» تیک خورده باشد. هر دو کلید باید در درخواست باشند؛
-					// enabled فقط "0"/"1" و size فقط عدد صحیح 1..EARLY_DATA_MAX_SIZE؛ مقدار نامعتبر = نادیده
-					// گرفته می‌شود (و چون early_data_applied برنمی‌گردد، فراخواننده آن را به‌عنوان خطا می‌بیند).
-					let overrideEarlyData = undefined;
-					if (
-						body.apply_early_data_to_existing_users === true &&
-						Object.prototype.hasOwnProperty.call(body.settings, "new_user_early_data_enabled") &&
-						Object.prototype.hasOwnProperty.call(body.settings, "new_user_early_data_size")
-					) {
-						const edEnabledRaw = String(body.settings.new_user_early_data_enabled == null ? "" : body.settings.new_user_early_data_enabled).trim();
-						const edSizeRaw = String(body.settings.new_user_early_data_size == null ? "" : body.settings.new_user_early_data_size).trim();
-						const edSize = /^[0-9]+$/.test(edSizeRaw) ? parseInt(edSizeRaw, 10) : NaN;
-						if ((edEnabledRaw === "0" || edEnabledRaw === "1") && edSize >= 1 && edSize <= EARLY_DATA_MAX_SIZE) {
-							overrideEarlyData = { enabled: edEnabledRaw === "1" ? 1 : 0, size: edSize };
-						}
-					}
-					// همه‌ی کلیدها در یک db.batch() (یک رفت‌وبرگشت D1 به‌جای یکی به ازای هر کلید).
-					// «ذخیره‌ی تنظیمات» پنل معمولاً ۵ تا ۱۰ کلید را با هم می‌فرستد.
-					// «لیست لوکیشن‌های پین‌شده»: اگه این کلید توی همین درخواست هست، لیست قبلی رو
-					// قبل از نوشتن نگه می‌داریم تا بعدش بفهمیم کدوم کشورها آن‌پین شدن (چه از
-					// تنظیمات همین پنل، چه از «Push to All Panels» پنل مادر).
-					let previousPinnedLocations = null;
-					if (Object.prototype.hasOwnProperty.call(body.settings, "pinned_locations")) {
-						previousPinnedLocations = await getPinnedLocationsSetting(env);
-					}
-					const settingsStmts = Object.entries(body.settings).map(([k, v]) =>
-						env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v))
-					);
-					if (settingsStmts.length > 0) await env.DB.batch(settingsStmts);
-					// کشوری که از لیست پین‌شده‌ها حذف شده، از کانفیگ همه‌ی کاربرهای موجود هم
-					// پاک می‌شه (فقط کشورهایی که همین الان آن‌پین شدن - نه هر کشوری که پین نبوده).
-					// اگه فراخواننده (Push پنل مادر) فلگ prune_unpinned_locations رو هم فرستاده
-					// باشه، حالت «آینه‌ای» اجرا می‌شه: هر کشور تگ‌دار که توی لیست جدید نیست از
-					// همه‌ی کاربرها پاک می‌شه (نه فقط اونایی که همین الان آن‌پین شدن). فلگ باید
-					// بیرون از body.settings باشه، چون settings بدون whitelist ذخیره می‌شه.
-					if (previousPinnedLocations) {
-						const nowPinnedLocations = await getPinnedLocationsSetting(env);
-						if (body.prune_unpinned_locations === true) {
-							unpinRemoval = await removeUnpinnedCountriesFromAllUsers(env, ctx, nowPinnedLocations);
-						} else {
-							const unpinned = previousPinnedLocations.filter((cc) => !nowPinnedLocations.includes(cc));
-							if (unpinned.length > 0) {
-								unpinRemoval = await removeCountriesFromAllUsers(env, ctx, unpinned);
-							}
-						}
-					}
-					if (overrideUserLimit !== undefined) {
-						await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ?").bind(overrideUserLimit, overrideUserLimit).run();
-						userLimitApplied = true;
-					}
-					if (overrideDefaultPort !== undefined) {
-						await env.DB.prepare("UPDATE users SET port = ?").bind(overrideDefaultPort).run();
-						portApplied = true;
-					}
-					if (overrideGlobalCleanIp !== undefined) {
-						await env.DB.prepare("UPDATE users SET ips = ?").bind(overrideGlobalCleanIp).run();
-						cleanIpApplied = true;
-					}
-					if (overrideFrag !== undefined) {
-						await env.DB.prepare("UPDATE users SET frag_len = ?, frag_int = ?").bind(overrideFrag.len, overrideFrag.int).run();
-						fragApplied = true;
-					}
-					if (overrideEarlyData !== undefined) {
-						await env.DB.prepare("UPDATE users SET early_data_enabled = ?, early_data_size = ?").bind(overrideEarlyData.enabled, overrideEarlyData.size).run();
-						earlyDataApplied = true;
-					}
-					if (overrideFingerprint !== undefined) {
-						await env.DB.prepare("UPDATE users SET fingerprint = ?").bind(overrideFingerprint).run();
-						fingerprintApplied = true;
-					}
-					if (overrideConnType !== undefined) {
-						await env.DB.prepare("UPDATE users SET connection_type = ?").bind(overrideConnType).run();
-						connTypeApplied = true;
-						// connection_type is also checked on every incoming connection (VLESS/Trojan), and that
-						// lookup is cached for a few seconds — drop the cached entries so the new protocol
-						// takes effect immediately instead of after the TTL.
-						try {
-							const { results: ctUsers } = await env.DB.prepare("SELECT uuid, trojan_hash FROM users").all();
-							await Promise.all((ctUsers || []).map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
-						} catch (e) { /* best-effort: the cache expires by itself within seconds */ }
-					}
-				}
-				return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, early_data_applied: earlyDataApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
-			}
-		}
-		if (url.pathname === "/api/settings/sync-vip-proxies") {
-			if (request.method === "POST") {
-				try {
-					const result = await syncAllVipProxies();
-					return new Response(JSON.stringify({ success: true, ...result }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-				} catch (e) {
-					return new Response(JSON.stringify({ error: e.message || "خطا در دریافت مخزن VIP" }), { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } });
-				}
-			}
-			// GET: بدون فچ تازه، همون چیزی که الان توی REPO_FILE_CACHE هست را (فقط کلیدهای proxy_vip/*)
-			// به تفکیک کشور برمی‌گرداند — برای پاپ‌آپ «مشاهده لیست کش‌شده» در Settings.
-			if (request.method === "GET") {
-				const perCountry = {};
-				let fetchedAt = null;
-				for (const [key, entry] of REPO_FILE_CACHE) {
-					const m = key.match(/^proxy_vip\/([A-Za-z0-9]+)\.txt$/);
-					if (!m) continue;
-					const cc = m[1].toUpperCase();
-					const lines = (entry.data || "").split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
-					if (lines.length === 0) continue;
-					perCountry[cc] = lines;
-					if (fetchedAt === null || entry.timestamp > fetchedAt) fetchedAt = entry.timestamp;
-				}
-				return new Response(JSON.stringify({ success: true, perCountry, totalCountries: Object.keys(perCountry).length, fetchedAt }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-			}
-		}
-		// دکمه‌ی «بررسی کشورهای سالم» کنار «افزودن» در تنظیمات لوکیشن‌ها - کشف کاندیدها از میرور ۱-۳
-		// (vip-list) + میرور ۴ (ریپوی شخصی، GitHub API) + MANUAL_VIP_PROXIES، تست سبک زنده‌بودن، کش ۱۰ دقیقه‌ای.
-		if (url.pathname === "/api/settings/vip-healthy-countries" && request.method === "GET") {
-			try {
-				const jsonHeaders = { "Content-Type": "application/json; charset=utf-8" };
-				if (url.searchParams.get("step") === "check") {
-					const codes = (url.searchParams.get("codes") || "").split(",");
-					const r = await checkVipCountriesChunk(codes, url.searchParams.get("force") === "1");
-					return new Response(JSON.stringify({ success: true, checked: r.checked, healthy: r.healthy }), { headers: jsonHeaders });
-				}
-				const r = await getVipHealthCandidates(env.GITHUB_TOKEN);
-				return new Response(JSON.stringify({ success: true, candidates: r.candidates, personalDiscovery: r.personalDiscovery, chunkSize: HEALTHY_VIP_CHUNK_SIZE }), { headers: jsonHeaders });
-			} catch (e) {
-				return new Response(JSON.stringify({ error: e.message || "خطا در بررسی کشورهای سالم" }), {
-					status: 502,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-		}
-		if (url.pathname === "/api/proxy-ip") {
-			if (request.method === "POST") {
-				const { proxy_ip, iata, socks5 } = await readJsonBody(request);
-				if (proxy_ip) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_ip', ?)").bind(proxy_ip).run();
-				if (iata !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_location_iata', ?)").bind(iata).run();
-				if (socks5 !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('socks5', ?)").bind(socks5).run();
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-			}
-			if (request.method === "GET") {
-				// سه کلید در یک کوئری (یک رفت‌وبرگشت D1 به‌جای سه‌تا) - خروجی بدون تغییر.
-				const proxyIpRows = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('proxy_ip','proxy_location_iata','socks5')").all();
-				const proxyIpMap = {};
-				(proxyIpRows.results || []).forEach((r) => { proxyIpMap[r.key] = r.value; });
-				const rowIp = proxyIpMap.proxy_ip !== undefined ? { value: proxyIpMap.proxy_ip } : null;
-				const rowIata = proxyIpMap.proxy_location_iata !== undefined ? { value: proxyIpMap.proxy_location_iata } : null;
-				const rowSocks = proxyIpMap.socks5 !== undefined ? { value: proxyIpMap.socks5 } : null;
-				return new Response(
-					JSON.stringify({
-						proxy_ip: rowIp ? rowIp.value : "",
-						iata: rowIata ? rowIata.value : "",
-						socks5: rowSocks ? rowSocks.value : "",
-					}),
-					{ headers: { "Content-Type": "application/json" } },
-				);
-			}
-		}
-		if (url.pathname === "/api/test-proxy" && request.method === "POST") {
-			const { proxy, skip_country, username, replace_on_fail } = await readJsonBody(request);
-			if (!proxy) return new Response(JSON.stringify({ error: "پـروکـسـی وارد نشده است" }), { status: 400, headers: { "Content-Type": "application/json" } });
-			
-			if (proxy === "direct") {
-				const startT = Date.now();
-				try {
-					const controller = new AbortController();
-					const tid = setTimeout(() => controller.abort(), 3000);
-					await fetch("https://cp.cloudflare.com/generate_204", { method: "HEAD", signal: controller.signal });
-					clearTimeout(tid);
-					return new Response(JSON.stringify({ success: true, ping: (Date.now() - startT), country: "UN" }), { headers: { "Content-Type": "application/json" } });
-				} catch (e) {
-					return new Response(JSON.stringify({ error: "نت آزاد قطع است" }), { status: 200, headers: { "Content-Type": "application/json" } });
-				}
-			}
-			try {
-				let ip = "";
-				let workingProxy = proxy;
-				if (proxy.includes("t.me/socks") || proxy.includes("tg://socks")) {
-					ip = proxy.match(/server=([^&]+)/)?.[1] || "";
-				} else {
-					let cleanProxy = proxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-					let remain = cleanProxy;
-					if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
-					if (remain.startsWith("[")) {
-						ip = remain.substring(1, remain.indexOf("]"));
-					} else {
-						const lastColon = remain.lastIndexOf(":");
-						if (lastColon !== -1 && remain.indexOf(":") === lastColon) ip = remain.substring(0, lastColon);
-						else ip = remain;
-					}
-				}
-				let country = "UN";
-				const startTime = Date.now();
-				let targetHost = skip_country ? "1.1.1.1" : "ip-api.com";
-				let reqPath = skip_country ? "/" : "/json/?fields=countryCode";
-				const payload = new TextEncoder().encode("GET " + reqPath + " HTTP/1.1\r\nHost: " + targetHost + "\r\nConnection: close\r\n\r\n");
-				
-				const s = await connectProxy(proxy, targetHost, 80, payload);
-				
-				const reader = s.readable.getReader();
-				let resStr = "";
-				const dec = new TextDecoder();
-				const timeoutId = setTimeout(() => {
-					try {
-						s.close();
-					} catch (e) { }
-				}, 7000);
-				try {
-					while (true) {
-						const res = await reader.read();
-						if (res.done || !res.value) break;
-						resStr += dec.decode(res.value, { stream: true });
-						if (skip_country) {
-							if (resStr.includes("HTTP/1.")) break;
-						} else {
-							if (resStr.includes("countryCode")) break;
-						}
-					}
-				} finally {
-					clearTimeout(timeoutId);
-					try {
-						s.close();
-					} catch (e) { }
-				}
-				if (!resStr) {
-					throw new Error("تایم‌اوت در دریافت دیتا");
-				}
-				const ping = Date.now() - startTime;
-				if (!skip_country) {
-					try {
-						const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
-						if (jsonMatch && jsonMatch[1]) country = jsonMatch[1];
-					} catch (e) { }
-					if (country === "UN" && ip) {
-						try {
-							const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
-							const geoData = await geoRes.json();
-							if (geoData && geoData.countryCode) country = geoData.countryCode;
-						} catch (e) { }
-					}
-				}
-				return new Response(JSON.stringify({ success: true, ping, country }), { headers: { "Content-Type": "application/json" } });
-			} catch (e) {
-				if (username && replace_on_fail) {
-					const replaceTask = replaceBrokenProxy(username, env, proxy);
-					if (ctx) ctx.waitUntil(replaceTask);
-					else replaceTask.catch(() => { });
-				}
-				let msg = e.message;
-				if (msg.includes("Stream was cancelled") || msg.includes("network")) msg = "ارتباط با سرور قطع شد (احتمالاً پـروکـسـی مسدود یا خاموش است)";
-				else if (msg.includes("timeout") || msg.includes("timed out") || msg.includes("تایم‌اوت")) msg = "تایم‌اوت در اتصال (پـروکـسـی در دسترس نیست)";
-				else if (msg.includes("Invalid URL") || msg.includes("Invalid format")) msg = "فرمت وارد شده برای پـروکـسـی اشتباه است";
-				else if (msg === "err") msg = "خطای نامشخص (ارتباط برقرار نشد)";
-				return new Response(JSON.stringify({ error: msg }), { status: 200, headers: { "Content-Type": "application/json" } });
-			}
-		}
-		// GET /api/stats-history: 30-day daily history for the Request and Traffic
-		// dashboard cards, used to draw the click-to-expand line charts. Reuses the
-		// same daily_requests / daily_traffic tables (and utcDateKey helper) as the
-		// existing 7d/30d aggregate stats above. Today's entry additionally folds in
-		// the not-yet-flushed in-memory counters (GLOBAL_REQ_COUNT / GLOBAL_TRAFFIC_CACHE)
-		// so the last (today) point on the chart reflects live, not-yet-persisted usage.
-		// NOTE: storage rows are now hourly (utcHourKey), but this chart still wants one
-		// point per calendar day, so we let SQLite roll the hourly rows up with
-		// substr(date,1,10)+GROUP BY (works transparently on both old day-only rows and
-		// new hour-keyed rows, since both share the same 10-char YYYY-MM-DD prefix).
-		if (url.pathname === "/api/stats-history" && request.method === "GET") {
-			try {
-				const now = Date.now();
-				const days = [];
-				for (let i = 29; i >= 0; i--) days.push(utcDateKey(now - i * 86400000));
-				const startKey = days[0];
-				const todayKey = days[days.length - 1];
-				const [reqRows, trafficRows] = await Promise.all([
-					env.DB.prepare("SELECT substr(date,1,10) as date, SUM(count) as count FROM daily_requests WHERE date >= ? GROUP BY substr(date,1,10)").bind(startKey).all(),
-					env.DB.prepare("SELECT substr(date,1,10) as date, SUM(gb) as gb FROM daily_traffic WHERE date >= ? GROUP BY substr(date,1,10)").bind(startKey).all(),
-				]);
-				const reqMap = new Map((reqRows.results || []).map((r) => [r.date, r.count || 0]));
-				const trafficMap = new Map((trafficRows.results || []).map((r) => [r.date, r.gb || 0]));
-				let pendingGb = 0;
-				for (const v of GLOBAL_TRAFFIC_CACHE.values()) pendingGb += v || 0;
-				pendingGb = pendingGb / (1024 * 1024 * 1024);
-				const pendingReq = GLOBAL_REQ_COUNT || 0;
-				const requests = days.map((d) => ({ date: d, value: (reqMap.get(d) || 0) + (d === todayKey ? pendingReq : 0) }));
-				const traffic = days.map((d) => ({ date: d, value: (trafficMap.get(d) || 0) + (d === todayKey ? pendingGb : 0) }));
-				return new Response(JSON.stringify({ requests, traffic }), {
-					headers: { "Content-Type": "application/json", "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0" },
-				});
-			} catch (e) {
-				return new Response(JSON.stringify({ requests: [], traffic: [], error: e.message }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				});
-			}
-		}
-		if (url.pathname.startsWith("/api/users")) {
-			const pathParts = url.pathname.split("/");
-			const isUserAction = pathParts.length > 3;
-			if (isUserAction) {
-				const username = safeDecodeURI(pathParts.pop());
-				if (request.method === "PUT") {
-					const body = await readJsonBody(request);
-					if (Object.keys(body).length === 0) {
-						return new Response(JSON.stringify({ error: "Invalid request body" }), { status: 400, headers: { "Content-Type": "application/json" } });
-					}
-					if (body.toggle_only !== undefined) {
-						await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
-						const toggledUser = await env.DB.prepare("SELECT uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
-						if (toggledUser) await invalidateUserAuthCache(ctx, toggledUser.uuid, toggledUser.trojan_hash);
-						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-					} else if (body.reset_action !== undefined) {
-						if (body.reset_action === "volume") {
-							await env.DB.prepare("UPDATE users SET used_gb = 0, is_active = 1 WHERE username = ?").bind(username).run();
-							GLOBAL_TRAFFIC_CACHE.set(username, 0);
-						} else if (body.reset_action === "req") {
-							await env.DB.prepare("UPDATE users SET used_req = 0, is_active = 1 WHERE username = ?").bind(username).run();
-							USER_REQ_CACHE.set(username, 0);
-						} else if (body.reset_action === "time") {
-							await env.DB.prepare("UPDATE users SET created_at = CURRENT_TIMESTAMP, first_connection_time = NULL, is_active = 1 WHERE username = ?").bind(username).run();
-							for (const [lockK] of GLOBAL_WRITE_LOCK.entries()) { if (lockK.endsWith("_first_conn")) GLOBAL_WRITE_LOCK.delete(lockK); }
-						} else if (body.reset_action === "locations") {
-							// Additive retrofit for an existing user: adds any currently-pinned
-							// country (getPinnedLocationsSetting()) this user doesn't already
-							// have. Everything already on the user - pinned or not - is left
-							// untouched (see mergePinnedLocationsForUser() for why: an unpinned
-							// country must keep working for anyone who already has it).
-							const pinnedLocations = await getPinnedLocationsSetting(env);
-							const existingRow = await env.DB.prepare("SELECT user_socks5 FROM users WHERE username = ?").bind(username).first();
-							let existingList = [];
-							try {
-								if (existingRow && existingRow.user_socks5 && existingRow.user_socks5.trim().startsWith("[")) {
-									existingList = JSON.parse(existingRow.user_socks5);
-								}
-							} catch (e) {
-								existingList = [];
-							}
-							const { list: mergedList, cappedOut } = await mergePinnedLocationsForUser(existingList, pinnedLocations);
-							await env.DB.prepare("UPDATE users SET user_socks5 = ?, auto_rotate_user_proxy = 1 WHERE username = ?").bind(JSON.stringify(mergedList), username).run();
-							const locUser = await env.DB.prepare("SELECT uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
-							if (locUser) await invalidateUserAuthCache(ctx, locUser.uuid, locUser.trojan_hash);
-							// cappedOut: pinned countries this user hit MAX_LOCATIONS_PER_USER
-							// before receiving (nothing is auto-deleted to make room - see the
-							// comment on MAX_LOCATIONS_PER_USER). The panel surfaces this per
-							// username so the admin can manually free up a slot if they want them.
-							return new Response(JSON.stringify({ success: true, username, capped: cappedOut.length > 0, cappedCountries: cappedOut }), { headers: { "Content-Type": "application/json" } });
-						} else if (body.reset_action === "remove_location") {
-							// Manual cleanup: strips one specific country (body.country, e.g.
-							// "TR") out of this user's proxy list, if present. Independent of
-							// the additive "locations" action above - un-pinning a country in
-							// settings now removes the country from all users automatically (see
-							// removeCountriesFromAllUsers()); this action is for removing a country
-							// from one specific user by hand.
-							const targetCountry = String(body.country || "").trim().toUpperCase();
-							if (!targetCountry) {
-								return new Response(JSON.stringify({ error: "Missing country" }), { status: 400, headers: { "Content-Type": "application/json" } });
-							}
-							const rmRow = await env.DB.prepare("SELECT user_socks5 FROM users WHERE username = ?").bind(username).first();
-							let rmList = [];
-							try {
-								if (rmRow && rmRow.user_socks5 && rmRow.user_socks5.trim().startsWith("[")) {
-									rmList = JSON.parse(rmRow.user_socks5);
-								}
-							} catch (e) {
-								rmList = [];
-							}
-							const beforeLen = rmList.length;
-							rmList = rmList.filter((p) => !(typeof p === "object" && p !== null && (p.country || "").toUpperCase() === targetCountry));
-							const removed = rmList.length < beforeLen;
-							if (removed) {
-								await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(rmList), username).run();
-								const rmUser = await env.DB.prepare("SELECT uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
-								if (rmUser) await invalidateUserAuthCache(ctx, rmUser.uuid, rmUser.trojan_hash);
-							}
-							return new Response(JSON.stringify({ success: true, username, removed }), { headers: { "Content-Type": "application/json" } });
-						}
-						const resetUser = await env.DB.prepare("SELECT uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
-						if (resetUser) await invalidateUserAuthCache(ctx, resetUser.uuid, resetUser.trojan_hash);
-						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-					} else {
-						const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = body;
-						if (new_username && new_username !== username) {
-							if (!/^[a-zA-Z0-9_-]+$/.test(new_username)) {
-								return new Response(JSON.stringify({ error: "نام کاربری جدید غیرمجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-							}
-							const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ? COLLATE NOCASE").bind(new_username).first();
-							if (existing) {
-								return new Response(JSON.stringify({ error: "این نام کاربری از قبل وجود دارد" }), { status: 400, headers: { "Content-Type": "application/json" } });
-							}
-							if (GLOBAL_TRAFFIC_CACHE.has(username)) {
-								GLOBAL_TRAFFIC_CACHE.set(new_username, GLOBAL_TRAFFIC_CACHE.get(username));
-								GLOBAL_TRAFFIC_CACHE.delete(username);
-							}
-							if (USER_REQ_CACHE.has(username)) {
-								USER_REQ_CACHE.set(new_username, USER_REQ_CACHE.get(username));
-								USER_REQ_CACHE.delete(username);
-							}
-							if (ACTIVE_CONNECTIONS_COUNT.has(username)) {
-								ACTIVE_CONNECTIONS_COUNT.set(new_username, ACTIVE_CONNECTIONS_COUNT.get(username));
-								ACTIVE_CONNECTIONS_COUNT.delete(username);
-							}
-							if (GLOBAL_LAST_ACTIVE_WRITE.has(username)) {
-								GLOBAL_LAST_ACTIVE_WRITE.set(new_username, GLOBAL_LAST_ACTIVE_WRITE.get(username));
-								GLOBAL_LAST_ACTIVE_WRITE.delete(username);
-							}
-						}
-						let finalConnType = undefined;
-						if (protocols && Array.isArray(protocols) && protocols.length > 0) {
-							finalConnType = protocols.join(",");
-						} else if (connection_type) {
-							finalConnType = connection_type;
-						}
-						const existingUser = await env.DB.prepare("SELECT id, uuid, trojan_hash, user_socks5 FROM users WHERE username = ?").bind(username).first();
-						let finalUuid = existingUser ? existingUser.uuid : null;
-						if (new_uuid !== undefined && new_uuid !== null && String(new_uuid).trim() !== "") {
-							const trimmedUuid = String(new_uuid).trim().toLowerCase();
-							if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(trimmedUuid)) {
-								return new Response(JSON.stringify({ error: "فرمت UUID نامعتبر است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-							}
-							if (trimmedUuid !== (existingUser && existingUser.uuid ? String(existingUser.uuid).toLowerCase() : null)) {
-								const existingUuidUser = await env.DB.prepare("SELECT id FROM users WHERE uuid = ? COLLATE NOCASE AND id != ?").bind(trimmedUuid, existingUser ? existingUser.id : -1).first();
-								if (existingUuidUser) {
-									return new Response(JSON.stringify({ error: "این UUID قبلاً برای کاربر دیگری استفاده شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-								}
-							}
-							finalUuid = trimmedUuid;
-						}
-						const trojanHash = finalUuid ? sha224Pure(finalUuid) : null;
-						// "Reset to Default" (edit-user modal): the form already carries every other field at its
-						// new-user default (the client did that), so the rest of this PUT just saves them; usage
-						// counters (used_gb, used_req, lifetime_used_gb, created_at, first_connection_time ...) are
-						// not in the UPDATE below and stay untouched. What only the server can do is throw the
-						// user's proxy list away and rebuild it from the pinned locations in Settings - the same
-						// list a brand-new user gets. Otherwise keep the country tag of every slot the admin left
-						// unchanged (see preserveProxyCountryTags() for why the form alone can't do it).
-						const resetProxyToDefault = body.reset_user_to_default === true;
-						let finalUserSocks5 = user_socks5;
-						if (resetProxyToDefault) {
-							const pinnedForReset = await getPinnedLocationsSetting(env);
-							const rebuiltList = await buildPinnedDefaultProxyList(pinnedForReset);
-							// Every VIP list unreachable/empty (e.g. the source is down right now) would turn a
-							// working-but-mistagged user into a direct-only one - refuse and leave the user untouched.
-							if (rebuiltList.length > 0 && rebuiltList.every((slot) => !slot.proxy)) {
-								return new Response(JSON.stringify({ error: "لیست پروکسی‌های VIP در حال حاضر در دسترس نیست؛ هیچ تغییری اعمال نشد. کمی بعد دوباره تلاش کنید." }), { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } });
-							}
-							finalUserSocks5 = JSON.stringify(rebuiltList);
-						} else {
-							finalUserSocks5 = preserveProxyCountryTags(user_socks5, existingUser ? existingUser.user_socks5 : null);
-						}
-						try {
-							await env.DB.prepare("UPDATE users SET username = ?, uuid = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, advanced_frag = ?, cipher_suites = ?, tls_mask = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ?, start_on_first_connect = ?, enable_direct = ?, connection_type = CASE WHEN ? IS NOT NULL THEN ? ELSE connection_type END, trojan_hash = ? WHERE username = ?")
-								.bind(new_username || username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, finalUserSocks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 999999, (resetProxyToDefault || auto_rotate_user_proxy) ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
-								.run();
-						} catch (err) {
-							// اگه این خطا دقیقاً برخورد با ایندکس UNIQUE جدید uuid باشه (فقط در یک ریس-کاندیشن واقعی ممکنه، چون بالاتر همین uuid چک شده)، همون پیام دوستانه‌ی همیشگی رو برگردون؛ برای هر خطای دیگه‌ی دیتابیس هم به‌جای کرش کردن، خطای تمیز JSON برگردون
-							const msg = String((err && err.message) || "");
-							if (msg.toLowerCase().includes("unique")) {
-								return new Response(JSON.stringify({ error: "این UUID قبلاً برای کاربر دیگری استفاده شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-							}
-							return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
-						}
-						// Early Data: فقط اگر بدنه هرکدام را فرستاده باشد نوشته می‌شود (فرستنده‌ی قدیمی مثل بک‌آپ/پنل مادر
-						// قدیمی مقدار فعلی کاربر را دست‌نخورده می‌گذارد)؛ سایز نامعتبر نادیده گرفته می‌شود.
-						try {
-							const edEnabledPut = early_data_enabled !== undefined && early_data_enabled !== null ? (early_data_enabled && early_data_enabled !== "0" && early_data_enabled !== "false" ? 1 : 0) : null;
-							const edSizePutRaw = early_data_size !== undefined && early_data_size !== null ? parseInt(early_data_size, 10) : NaN;
-							const edSizePut = edSizePutRaw >= 1 && edSizePutRaw <= EARLY_DATA_MAX_SIZE ? edSizePutRaw : null;
-							if (edEnabledPut !== null || edSizePut !== null) {
-								await env.DB.prepare("UPDATE users SET early_data_enabled = COALESCE(?, early_data_enabled), early_data_size = COALESCE(?, early_data_size) WHERE username = ?").bind(edEnabledPut, edSizePut, new_username || username).run();
-							}
-						} catch (e) { }
-						if (resetProxyToDefault) {
-							// fresh list => old per-country auto-heal cooldowns no longer apply. The auto-reset timers
-							// are restarted from today exactly like POST /api/users does for a new user: last_reset_*_time
-							// defaults to 0 for old rows, so once the defaults switch auto-reset on, checkAutoResets()
-							// would otherwise see a "period long overdue" and zero used_gb / used_req at its next run.
-							const resetTodayUtc = Math.floor(Date.now() / 86400000) * 86400000;
-							try { await env.DB.prepare("UPDATE users SET proxy_rotate_cooldowns = '{}', last_reset_vol_time = ?, last_reset_req_time = ? WHERE username = ?").bind(resetTodayUtc, resetTodayUtc, new_username || username).run(); } catch (e) { }
-						}
-						// Invalidate the old identity's cache entries (covers the common case where
-						// uuid didn't change too). If the admin also assigned a new uuid, invalidate
-						// that as well in case a stale negative-cache ("no such user") entry exists
-						// for it from an earlier probe/connection attempt.
-						if (existingUser) await invalidateUserAuthCache(ctx, existingUser.uuid, existingUser.trojan_hash);
-						if (finalUuid && (!existingUser || finalUuid !== existingUser.uuid)) await invalidateUserAuthCache(ctx, finalUuid, trojanHash);
-						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-					}
-				}
-				if (request.method === "DELETE") {
-					let userToDelete = null;
-					try {
-						userToDelete = await env.DB.prepare("SELECT uuid, trojan_hash, lifetime_used_gb, used_gb FROM users WHERE username = ?").bind(username).first();
-						if (userToDelete) {
-							const gbToKeep = userToDelete.lifetime_used_gb || userToDelete.used_gb || 0;
-							if (gbToKeep > 0) {
-								await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('deleted_users_gb', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS REAL) + ?").bind(String(gbToKeep), String(gbToKeep)).run();
-							}
-						}
-					} catch(e) {}
-					await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(username).run();
-					if (userToDelete) await invalidateUserAuthCache(ctx, userToDelete.uuid, userToDelete.trojan_hash);
-					return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-				}
-			} else {
-				if (request.method === "GET") {
-					try {
-						await flushExpiredTraffic(env);
-					} catch (e) { }
-					try {
-						const { results } = await env.DB.prepare("SELECT * FROM users ORDER BY id DESC").all();
-						const now = Date.now();
-						const cachedIpsData = await getCachedIps();
-						const enrichedUsers = (results || []).map((user) => {
-							let finalIps = user.ips;
-							if (user.auto_rotate_ip === 1) {
-								const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
-								if (randomIps.length > 0) finalIps = randomIps.join("\n");
-							}
-							const currentOnlineCount = Math.max((ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0), getActiveIpCount(user.active_ips));
-							// «هشدار تعداد دستگاه»: تا ۲۴ ساعت بعد از آخرین باری که تعداد دستگاه فعال
-							// این کاربر از ip_limit‌ش بیشتر شده (device_warning_at - ست‌شده توسط
-							// persistActiveIp)، این پرچم true می‌مونه تا پنل روی کارت کاربر نشونش بده.
-							const deviceWarning = !!(user.device_warning_at && now - user.device_warning_at < 24 * 60 * 60 * 1000);
-							return {
-								...user,
-								ips: finalIps,
-								used_gb: (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)),
-								used_req: (user.used_req || 0) + (USER_REQ_CACHE.get(user.username) || 0),
-								is_online: currentOnlineCount > 0 ? 1 : 0,
-								online_count: currentOnlineCount,
-								device_warning: deviceWarning,
-							};
-						});
-						// چهار کلیدی که این endpoint از جدول settings لازم داره، به‌جای چهار SELECT جدا
-						// (چهار رفت‌وبرگشت D1 روی هر بار رفرش پنل) با یک کوئری IN (...) خونده می‌شن -
-						// همون الگوی isGlobalReqLimitReached. نتیجه دقیقاً یکیه، فقط ارزون‌تر.
-						const panelSettings = {};
-						try {
-							const settingsRes = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('req_last_date','req_total','req_today','deleted_users_gb')").all();
-							(settingsRes.results || []).forEach((r) => { panelSettings[r.key] = r.value; });
-						} catch (e) { }
-						let cfReqs = { today: 0, total: 0, d1Reads: 0, d1Writes: 0 };
-						try {
-							const liveCf = await getCfUsage(env);
-							const todayStr = new Date().toISOString().split("T")[0];
-							let dbTotal = parseInt(panelSettings.req_total) || 0;
-							let dbToday = panelSettings.req_last_date === todayStr ? parseInt(panelSettings.req_today) || 0 : 0;
-							if (liveCf.today > dbToday) {
-								dbToday = liveCf.today;
-								await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbToday), String(dbToday)).run();
-								await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(todayStr, todayStr).run();
-							}
-							if (liveCf.total > dbTotal) {
-								dbTotal = liveCf.total;
-								await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTotal), String(dbTotal)).run();
-							}
-							cfReqs.today = dbToday + GLOBAL_REQ_COUNT;
-							cfReqs.total = dbTotal + GLOBAL_REQ_COUNT;
-							cfReqs.d1Reads = liveCf.d1Reads;
-							cfReqs.d1Writes = liveCf.d1Writes;
-						} catch (e) { }
-						// از همون panelSettings بالا (بدون SELECT جداگانه).
-						const deletedGb = parseFloat(panelSettings.deleted_users_gb) || 0;
-						// آمار ترافیک روزانه / 7 روز گذشته / 30 روز گذشته از جدول daily_traffic - حالا که ذخیره‌سازی
-						// ساعتی‌ست، این‌ها بازه‌ی رولینگ واقعی‌اند (دقیقاً 24/7×24/30×24 ساعت گذشته از همین لحظه،
-						// با دقت ~۱ ساعت)، نه از نیمه‌شب UTC. حداکثر 24/168/720 ردیف اسکن می‌شه، هنوز ارزان.
-						// + مقدار هنوز-flush-نشده‌ی حافظه (GLOBAL_TRAFFIC_CACHE) برای اینکه عدد لحظه‌ای باشد
-						let trafficDaily = 0, traffic7d = 0, traffic30d = 0;
-						try {
-							const dailyCutoffKey = utcHourKey(now - 24 * 3600000);
-							const sevenAgoKey = utcHourKey(now - 7 * 86400000);
-							const thirtyAgoKey = utcHourKey(now - 30 * 86400000);
-							const [dailyRow, sevenRow, thirtyRow] = await Promise.all([
-								env.DB.prepare("SELECT SUM(gb) as s FROM daily_traffic WHERE date >= ?").bind(dailyCutoffKey).first(),
-								env.DB.prepare("SELECT SUM(gb) as s FROM daily_traffic WHERE date >= ?").bind(sevenAgoKey).first(),
-								env.DB.prepare("SELECT SUM(gb) as s FROM daily_traffic WHERE date >= ?").bind(thirtyAgoKey).first(),
-							]);
-							let pendingGb = 0;
-							for (const v of GLOBAL_TRAFFIC_CACHE.values()) pendingGb += v || 0;
-							pendingGb = pendingGb / (1024 * 1024 * 1024);
-							trafficDaily = (dailyRow?.s || 0) + pendingGb;
-							traffic7d = (sevenRow?.s || 0) + pendingGb;
-							traffic30d = (thirtyRow?.s || 0) + pendingGb;
-						} catch (e) { }
-						// آمار تعداد ریکوئست‌های 7 روز گذشته / 30 روز گذشته از جدول daily_requests - همون منطق رولینگ بالا
-						// + مقدار هنوز-flush-نشده‌ی حافظه (GLOBAL_REQ_COUNT) برای اینکه عدد لحظه‌ای باشد
-						let cfRequests7d = 0, cfRequests30d = 0;
-						try {
-							const sevenAgoKey = utcHourKey(now - 7 * 86400000);
-							const thirtyAgoKey = utcHourKey(now - 30 * 86400000);
-							const [sevenReqRow, thirtyReqRow] = await Promise.all([
-								env.DB.prepare("SELECT SUM(count) as s FROM daily_requests WHERE date >= ?").bind(sevenAgoKey).first(),
-								env.DB.prepare("SELECT SUM(count) as s FROM daily_requests WHERE date >= ?").bind(thirtyAgoKey).first(),
-							]);
-							cfRequests7d = (sevenReqRow?.s || 0) + GLOBAL_REQ_COUNT;
-							cfRequests30d = (thirtyReqRow?.s || 0) + GLOBAL_REQ_COUNT;
-						} catch (e) { }
-						return new Response(
-							JSON.stringify({
-								users: enrichedUsers,
-								serverTime: now,
-								cfRequestsToday: cfReqs.today,
-								cfRequestsTotal: cfReqs.total,
-								cfRequests7d: cfRequests7d,
-								cfRequests30d: cfRequests30d,
-								d1Reads: cfReqs.d1Reads,
-								d1Writes: cfReqs.d1Writes,
-								deletedGb: deletedGb,
-								trafficDaily: trafficDaily,
-								traffic7d: traffic7d,
-								traffic30d: traffic30d,
-							}),
-							{
-								headers: {
-									"Content-Type": "application/json",
-									"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-								},
-							},
-						);
-					} catch (dbErr) {
-						return new Response(
-							JSON.stringify({
-								users: [],
-								serverTime: Date.now(),
-								cfRequestsToday: 0,
-								cfRequestsTotal: 0,
-								cfRequests7d: 0,
-								cfRequests30d: 0,
-								error: dbErr.message,
-							}),
-							{
-								status: 200,
-								headers: {
-									"Content-Type": "application/json",
-									"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-								},
-							},
-						);
-					}
-				}
-				if (request.method === "POST") {
-					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = await readJsonBody(request);
-					if (!username) {
-						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
-					}
-					if (username.length > 32) {
-						return new Response(JSON.stringify({ error: "نام کاربری نمی‌تواند بیشتر از ۳۲ کاراکتر باشد" }), { status: 400, headers: { "Content-Type": "application/json" } });
-					}
-					if (!/^[a-zA-Z0-9_-]+$/.test(username)) {
-						return new Response(JSON.stringify({ error: "نام کاربری غیرمجاز است (فقط حروف، اعداد، خط تیره و آندرلاین)" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-					}
-					let finalUuid = uuid ? String(uuid).trim().toLowerCase() : "";
-					if (finalUuid) {
-						if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(finalUuid)) {
-							return new Response(JSON.stringify({ error: "فرمت UUID نامعتبر است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-						}
-						const existingUuidUser = await env.DB.prepare("SELECT id FROM users WHERE uuid = ? COLLATE NOCASE").bind(finalUuid).first();
-						if (existingUuidUser) {
-							return new Response(JSON.stringify({ error: "این UUID قبلاً برای کاربر دیگری استفاده شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-						}
-					} else {
-						finalUuid = crypto.randomUUID();
-					}
-					const parsedUsedGb = parseFloat(used_gb);
-					const finalUsedGb = !isNaN(parsedUsedGb) ? parsedUsedGb : 0;
-					const parsedUsedReq = parseInt(used_req);
-					const finalUsedReq = !isNaN(parsedUsedReq) ? parsedUsedReq : 0;
-					const finalCreatedAt = created_at || new Date().toISOString();
-					const parsedIsActive = parseInt(is_active);
-					const finalIsActive = !isNaN(parsedIsActive) ? parsedIsActive : 1;
-					const existingUser = await env.DB.prepare("SELECT id FROM users WHERE username = ? COLLATE NOCASE").bind(username).first();
-					if (existingUser) {
-						return new Response(JSON.stringify({ error: "این نام کاربری از قبل وجود دارد" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-					}
-					try {
-						const todayUtc = Math.floor(Date.now() / 86400000) * 86400000;
-						const nowTime = Date.now();
-						let finalConnType = "vless";
-						if (protocols && Array.isArray(protocols) && protocols.length > 0) {
-							finalConnType = protocols.join(",");
-						} else if (connection_type) {
-							finalConnType = connection_type;
-						}
-						const trojanHash = sha224Pure(finalUuid);
-						// «محدودیت کاربر»: اگه ادمین/فرم/API چیزی توی این فیلد نفرستاده باشه (ip_limit
-						// خالی/نال)، به‌جای نال، عدد سراسریِ تنظیم‌شده (user_limit - پیش‌فرض ۲) روی
-						// ip_limit و max_connections این کاربر جدید ست می‌شه. اگه عدد دیگه‌ای (حتی ۰)
-						// فرستاده شده باشه، همون عدد برنده‌ست، نه پیش‌فرض سراسری. (تنظیم جدای «هشدار
-						// تعداد دستگاه» - device_warning_threshold - دیگه اینجا هیچ نقشی نداره.)
-						const finalIpLimit = ip_limit !== undefined && ip_limit !== null && String(ip_limit).trim() !== "" ? parseInt(ip_limit) : await getUserLimitSetting(env);
-						// «پورت»: اگه ادمین/فرم چیزی برای port نفرستاده باشه (خالی/نال)، به‌جای
-						// نال، پورت پیش‌فرض سراسری تنظیم‌شده (default_port - پیش‌فرض ۲۰۸۳) روی
-						// این کاربر تازه ست می‌شه. اگه مقداری فرستاده شده باشه (مثلاً از چک‌باکس‌های
-						// فرم افزودن کاربر)، همون مقدار برنده‌ست.
-						const finalPort = port !== undefined && port !== null && String(port).trim() !== "" ? port : await getDefaultPortSetting(env);
-						// «پیش‌فرض‌های کاربر جدید» (Settings → new_user_*): هر فیلدی که درخواست
-						// اصلاً نفرستاده باشد (undefined/null) از این‌جا پر می‌شود، تا کاربری که با API
-						// ساخته می‌شود (مثلاً از پنل مادر) دقیقاً همان مقادیری را بگیرد که فرم دستی
-						// «ایجاد کاربر جدید» پیش‌فرض می‌کند. فرم دستی همه‌ی این فیلدها را صریح
-						// می‌فرستد، پس رفتار آن عوض نمی‌شود - مقدار صریح همیشه برنده است.
-						const nud = await getNewUserDefaults(env);
-						const given = (v) => v !== undefined && v !== null;
-						const flagOf = (v, dfltStr) => (given(v) ? (v && v !== "0" && v !== "false" ? 1 : 0) : dfltStr === "1" ? 1 : 0);
-						const intOf = (v, dfltStr) => (given(v) ? parseInt(v) || 0 : parseInt(dfltStr) || 0);
-						const finalFingerprint = fingerprint || nud.new_user_fingerprint;
-						const finalIps = ips !== undefined ? ips : nud.global_clean_ip;
-						// Early Data: مقدار صریح برنده است؛ نیامده = پیش‌فرض Settings (new_user_early_data_*)؛ سایز نامعتبر = 2560.
-						const finalEarlyDataEnabled = flagOf(early_data_enabled, nud.new_user_early_data_enabled);
-						const edSizeParsed = parseInt(given(early_data_size) ? early_data_size : nud.new_user_early_data_size, 10);
-						const finalEarlyDataSize = edSizeParsed >= 1 && edSizeParsed <= EARLY_DATA_MAX_SIZE ? edSizeParsed : 2560;
-						const finalTls = given(tls) && String(tls).trim() !== "" ? tls : String(finalPort).split(",").some((p) => NEW_USER_TLS_PORTS.includes(p.trim())) ? "on" : "off";
-						if (!(protocols && Array.isArray(protocols) && protocols.length > 0) && !connection_type) finalConnType = nud.new_user_connection_type;
-						// Every new user is always pinned to whatever the current
-						// pinned_locations setting holds (see getPinnedLocationsSetting();
-						// falls back to the built-in 15-country default if that setting
-						// was never saved) - whatever was submitted for user_socks5 is
-						// ignored on create. The actual VIP proxies are fetched/tested in
-						// the background right after insert (see ctx.waitUntil below) so
-						// this request doesn't have to wait on a full round of live
-						// proxy testing.
-						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, early_data_enabled, early_data_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct), finalEarlyDataEnabled, finalEarlyDataSize)
-							.run();
-						// Clears any stale negative-cache ("no such user") entry that might exist for
-						// this uuid/hash from an earlier probe or connection attempt with this UUID.
-						await invalidateUserAuthCache(ctx, finalUuid, trojanHash);
-						// ⚠️⚠️ باگ مهم (چندبار تکرار شده — «کاربر تازه فقط کانفیگ مستقیم کلودفلر دارد، کانفیگ‌های VIP/آیپی ثابت
-						// در SUB نیست، ولی بعد از Save در Configure ZYX Panel پنل مادر ظاهر می‌شوند»): پرکردن لیست لوکیشن‌ها اینجا فقط
-						// یک کار پس‌زمینه‌ی بدون تضمین است (ctx.waitUntil) و قبلاً هر خطایش با catch خالی بلعیده می‌شد؛ اگر کنسل می‌شد
-						// (سقف زمان/subrequest همین invocation) user_socks5 برای همیشه NULL می‌ماند و SUB فقط کانفیگ مستقیم می‌ساخت.
-						// مسیری که واقعاً کار می‌کند PUT همگام { reset_action: "locations" } است (همان چیزی که Save/Push پنل مادر می‌زند).
-						// حالا: (۱) این کار پس‌زمینه تا ۲ بار تلاش می‌کند و خطا را لاگ می‌کند، (۲) فقط لیستِ «هنوز خالی» را می‌نویسد تا
-						// لیستی که PUT همگام همان لحظه نوشته را پایمال نکند، (۳) پنل مادر بعد از ساخت هر کاربر خودش همان PUT همگام را
-						// می‌زند (zyxEnsureUserLocations در MainPanel.js) — پس درستی نتیجه دیگر به این کار پس‌زمینه وابسته نیست.
-						if (ctx) {
-							ctx.waitUntil((async () => {
-								for (let fillAttempt = 1; fillAttempt <= 2; fillAttempt++) {
-									try {
-										const pinnedLocations = await getPinnedLocationsSetting(env);
-										const pinnedList = await buildPinnedDefaultProxyList(pinnedLocations);
-										// Only while the list is STILL empty: a concurrent PUT { reset_action: "locations" } (the mother panel's
-										// zyxEnsureUserLocations) may already have written a fully tested list, and this slower fill must not clobber it.
-										await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ? AND (user_socks5 IS NULL OR TRIM(user_socks5) = '' OR TRIM(user_socks5) = '[]')").bind(JSON.stringify(pinnedList), username).run();
-										break;
-									} catch (e) {
-										console.error("pinned-locations fill failed for", username, "(attempt " + fillAttempt + "):", e && e.message);
-										if (fillAttempt < 2) await new Promise((r) => setTimeout(r, 2000));
-									}
-								}
-								// The row above may already have been cached (with a null user_socks5)
-								// by a connection that landed in the gap between insert and this
-								// background update finishing - invalidate again so the next
-								// connection picks up the real pinned proxy list instead of a stale copy.
-								await invalidateUserAuthCache(ctx, finalUuid, trojanHash);
-							})());
-						}
-						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-					} catch (err) {
-						return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
-					}
-				}
-			}
-		}
-		return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: { "Content-Type": "application/json" } });
-	},
+  isWebSocketUpgrade(request2) {
+    const upgradeHeader = (request2.headers.get("Upgrade") || "").toLowerCase();
+    return upgradeHeader === "websocket";
+  },
+  isSubscriptionPath(pathname) {
+    return pathname.startsWith("/notes/") || pathname.startsWith("/bundle/");
+  },
+  async handleWebSocket(request2, env, ctx) {
+    try {
+      return handlevIees(env, null, ctx, request2);
+    } catch (e) {
+      return new Response("Internal Server Error", { status: 500 });
+    }
+  },
+  async handleSubscription(url, env) {
+    const isSingbox = url.pathname.startsWith("/bundle/");
+    const offset = isSingbox ? 8 : 7;
+    let subUser = safeDecodeURI(url.pathname.slice(offset));
+    const host = url.hostname;
+    try {
+      const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE OR uuid = ?").bind(subUser, subUser).first();
+      if (!user) {
+        return new Response("Not Found", { status: 404 });
+      }
+      try {
+        USER_REQ_CACHE.set(user.username, (USER_REQ_CACHE.get(user.username) || 0) + 1);
+      } catch (e) {
+      }
+      if (isSingbox) {
+        return await SubscriptionService.generateSingbox(user, host, env);
+      }
+      return await SubscriptionService.generateText(user, host, env);
+    } catch (err) {
+      return new Response("Error building config: " + err.message, { status: 500 });
+    }
+  },
+  async handlePanel(request2, env) {
+    const hasPassword = await DbService.getPanelPassword(env.DB);
+    if (!hasPassword) {
+      return new Response(HTML_TEMPLATES.setup, {
+        headers: { "Content-Type": "text/html; charset=utf-8" }
+      });
+    }
+    const authorized = await DbService.verifyApiAuth(request2, env);
+    if (!authorized) {
+      return new Response(HTML_TEMPLATES.login, {
+        headers: { "Content-Type": "text/html; charset=utf-8" }
+      });
+    }
+    return new Response(HTML_TEMPLATES.panel, {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        Pragma: "no-cache",
+        Expires: "0"
+      }
+    });
+  },
+  async handleUserStatus(url, env) {
+    const username = safeDecodeURI(url.pathname.slice(9));
+    if (!username) {
+      return new Response("Username is required", { status: 400 });
+    }
+    try {
+      const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE OR uuid = ?").bind(username, username).first();
+      if (!user) {
+        return new Response("User not found", { status: 404 });
+      }
+      const subResponse = await SubscriptionService.generateText(user, url.hostname, env);
+      const subBase64 = await subResponse.text();
+      let plainLinks = "";
+      try {
+        plainLinks = decodeURIComponent(escape(atob(subBase64)));
+      } catch (e) {
+        plainLinks = atob(subBase64);
+      }
+      if (user.auto_rotate_ip === 1) {
+        const cachedIpsData = await getCachedIps();
+        const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
+        if (randomIps.length > 0) user.ips = randomIps.join("\n");
+      }
+      const statusPageIpSettings = await getSubscriptionIpSettings(env);
+      const inlineProxyIpForStatusPage = statusPageIpSettings.inlineProxyIp;
+      const otherCleanIpsForStatusPage = statusPageIpSettings.otherCleanIps;
+      const userJson = JSON.stringify({
+        username: user.username,
+        uuid: user.uuid,
+        limit_gb: user.limit_gb,
+        expiry_days: user.expiry_days,
+        used_gb: (user.used_gb || 0) + (GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024),
+        limit_req: user.limit_req,
+        used_req: (user.used_req || 0) + (USER_REQ_CACHE.get(user.username) || 0),
+        is_active: user.is_active,
+        online_count: getActiveIpCount(user.active_ips),
+        ip_limit: user.ip_limit,
+        created_at: user.created_at,
+        tls: user.tls,
+        port: user.port,
+        ips: user.ips,
+        fingerprint: user.fingerprint || "chrome",
+        connection_type: user.connection_type || "vless",
+        user_proxy_iata: user.user_proxy_iata,
+        user_socks5: user.user_socks5,
+        user_proxy_ip: user.user_proxy_ip,
+        start_on_first_connect: user.start_on_first_connect,
+        first_connection_time: user.first_connection_time,
+        enable_direct: user.enable_direct !== 0 ? 1 : 0,
+        early_data_enabled: Number(user.early_data_enabled) === 1 ? 1 : 0,
+        early_data_size: user.early_data_size
+      });
+      const html = HTML_TEMPLATES.status.replace("/* {{USER_DATA_PLACEHOLDER}} */", `window.statusUser = ${userJson}; window.INLINE_PROXY_IP = ${JSON.stringify(inlineProxyIpForStatusPage)}; window.OTHER_CLEAN_IPS = ${JSON.stringify(otherCleanIpsForStatusPage)};`);
+      const finalHtml = html + "\n<!-- HIDDEN_CONFIGS -->\n<div style='display:none; white-space:pre-wrap;'>\n" + plainLinks + "\n</div>";
+      try {
+        const ua = (request.headers.get("User-Agent") || "").toLowerCase();
+        if (!ua.includes("mozilla") && !ua.includes("chrome") && !ua.includes("safari")) {
+          USER_REQ_CACHE.set(user.username, (USER_REQ_CACHE.get(user.username) || 0) + 1);
+        }
+      } catch (e) {
+      }
+      return new Response(finalHtml, {
+        headers: { "Content-Type": "text/html; charset=utf-8" }
+      });
+    } catch (err) {
+      return new Response("Error: " + err.message, { status: 500 });
+    }
+  },
+  async handleApi(request2, url, env, ctx) {
+    const hasPassword = await DbService.getPanelPassword(env.DB);
+    if (url.pathname === "/api/setup-password" && request2.method === "POST") {
+      if (hasPassword) {
+        return new Response(JSON.stringify({ error: "رمز عبور از قبل تعریف شده است" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+      const { password } = await readJsonBody(request2);
+      const cleanPassword = (password || "").trim();
+      if (!cleanPassword || cleanPassword.length < 4) {
+        return new Response(JSON.stringify({ error: "رمز عبور باید حداقل ۴ کاراکتر باشد" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+      const hashed = await DbService.sha256(cleanPassword);
+      await DbService.setPanelPassword(env.DB, hashed);
+      LOGIN_ATTEMPTS.clear();
+      return new Response(JSON.stringify({ success: true }), {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Set-Cookie": "panel_session=" + hashed + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000"
+        }
+      });
+    }
+    if (url.pathname === "/api/login" && request2.method === "POST") {
+      const clientIP = request2.headers.get("CF-Connecting-IP") || "unknown";
+      const now = Date.now();
+      if (LOGIN_ATTEMPTS.size > 256) {
+        for (const [ip, rec] of LOGIN_ATTEMPTS) {
+          if (now - rec.lastAttempt > 9e5) LOGIN_ATTEMPTS.delete(ip);
+        }
+      }
+      const attemptRecord = LOGIN_ATTEMPTS.get(clientIP) || { count: 0, lastAttempt: 0 };
+      if (attemptRecord.count >= 15 && now - attemptRecord.lastAttempt < 9e5) {
+        const remaining = Math.ceil((9e5 - (now - attemptRecord.lastAttempt)) / 6e4);
+        return new Response(JSON.stringify({ error: `دسترسی شما مسدود شد. لطفاً ${remaining} دقیقه دیگر تلاش کنید.` }), {
+          status: 429,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+      const { password } = await readJsonBody(request2);
+      const cleanPassword = (password || "").trim();
+      const hashedInput = await DbService.sha256(cleanPassword);
+      const storedHash = await DbService.getPanelPassword(env.DB, true);
+      let isValid = false;
+      if (storedHash === hashedInput) {
+        isValid = true;
+      } else {
+        const oldHashedInput = await DbService.oldSha256(cleanPassword);
+        if (storedHash === oldHashedInput) {
+          isValid = true;
+          await DbService.setPanelPassword(env.DB, hashedInput);
+        }
+      }
+      if (isValid) {
+        LOGIN_ATTEMPTS.delete(clientIP);
+        return new Response(JSON.stringify({ success: true }), {
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Set-Cookie": "panel_session=" + hashedInput + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000"
+          }
+        });
+      } else {
+        attemptRecord.count = now - attemptRecord.lastAttempt > 9e5 ? 1 : attemptRecord.count + 1;
+        attemptRecord.lastAttempt = now;
+        LOGIN_ATTEMPTS.set(clientIP, attemptRecord);
+        return new Response(JSON.stringify({ error: `رمز عبور اشتباه است (تلاش‌های باقی‌مانده: ${15 - attemptRecord.count})` }), {
+          status: 401,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+    }
+    if (url.pathname === "/api/logout" && request2.method === "POST") {
+      return new Response(JSON.stringify({ success: true }), {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Set-Cookie": "panel_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax"
+        }
+      });
+    }
+    if (url.pathname === "/api/recover" && request2.method === "POST") {
+      const { api_token } = await readJsonBody(request2);
+      if (!api_token) {
+        return new Response(JSON.stringify({ error: "Token is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+      try {
+        const cfRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+          headers: { Authorization: "Bearer " + api_token }
+        });
+        const cfData = await cfRes.json();
+        if (!cfRes.ok || !cfData.success) {
+          return new Response(JSON.stringify({ error: "Invalid or expired Cloudflare token" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json; charset=utf-8" }
+          });
+        }
+        const host = url.hostname;
+        let isAuthorized = false;
+        if (host.endsWith(".workers.dev")) {
+          const parts = host.split(".");
+          const targetSubdomain = parts[parts.length - 3];
+          const accountsRes = await fetch("https://api.cloudflare.com/client/v4/accounts", {
+            headers: { Authorization: "Bearer " + api_token }
+          });
+          const accountsData = await accountsRes.json();
+          if (accountsData.success && accountsData.result) {
+            for (const acc of accountsData.result) {
+              const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.id}/workers/subdomain`, {
+                headers: { Authorization: "Bearer " + api_token }
+              });
+              const subData = await subRes.json();
+              if (subData.success && subData.result && subData.result.subdomain === targetSubdomain) {
+                isAuthorized = true;
+                break;
+              }
+            }
+          }
+        } else {
+          const zonesRes = await fetch("https://api.cloudflare.com/client/v4/zones", {
+            headers: { Authorization: "Bearer " + api_token }
+          });
+          const zonesData = await zonesRes.json();
+          if (zonesData.success && zonesData.result) {
+            for (const zone of zonesData.result) {
+              if (host === zone.name || host.endsWith("." + zone.name)) {
+                isAuthorized = true;
+                break;
+              }
+            }
+          }
+        }
+        if (!isAuthorized) {
+          return new Response(JSON.stringify({ error: "این توکن متعلق به صاحب پـنـل نیست (ای کــثـــکـــش)" }), {
+            status: 403,
+            headers: { "Content-Type": "application/json; charset=utf-8" }
+          });
+        }
+        await env.DB.prepare("DELETE FROM settings WHERE key = 'panel_password'").run();
+        cachedPanelPassword = null;
+        LOGIN_ATTEMPTS.clear();
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "Cloudflare API connection error" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+    }
+    const authorized = await DbService.verifyApiAuth(request2, env);
+    if (!authorized && url.pathname !== "/api/test-proxy") {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json; charset=utf-8" }
+      });
+    }
+    if (url.pathname === "/api/auto-update-setup" && request2.method === "POST") {
+      const body = await readJsonBody(request2);
+      if (body.action === "check") {
+        const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
+        const hasToken = !!env.CF_API_TOKEN || !!(dbTokenRow && dbTokenRow.value);
+        const autoUpdateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'auto_update'").first();
+        const isAutoUpdateEnabled = autoUpdateRow ? autoUpdateRow.value === "1" : true;
+        return new Response(JSON.stringify({ has_token: hasToken, auto_update: isAutoUpdateEnabled }), { headers: { "Content-Type": "application/json" } });
+      }
+      if (body.action === "enable") {
+        const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
+        let token = body.token || env.CF_API_TOKEN || (dbTokenRow ? dbTokenRow.value : null);
+        if (!token) return new Response(JSON.stringify({ error: "TOKEN_MISSING" }), { status: 400, headers: { "Content-Type": "application/json" } });
+        try {
+          const cfRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+            headers: { Authorization: "Bearer " + token }
+          });
+          const cfData = await cfRes.json();
+          if (!cfRes.ok || !cfData.success) {
+            return new Response(JSON.stringify({ error: "INVALID_TOKEN" }), { status: 400, headers: { "Content-Type": "application/json" } });
+          }
+          await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_token', ?)").bind(token).run();
+          await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_update', '1')").run();
+          return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+        } catch (e) {
+          return new Response(JSON.stringify({ error: "خطا در بررسی توکن با کلودفلر" }), { status: 500, headers: { "Content-Type": "application/json" } });
+        }
+      }
+      if (body.action === "disable") {
+        await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_update', '0')").run();
+        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+      }
+    }
+    if (url.pathname === "/api/restart-core" && request2.method === "POST") {
+      try {
+        GLOBAL_TRAFFIC_CACHE.clear();
+        ACTIVE_CONNECTIONS_COUNT.clear();
+        GLOBAL_LAST_ACTIVE_WRITE.clear();
+        GLOBAL_LAST_DB_WRITE.clear();
+        GLOBAL_WRITE_LOCK.clear();
+        DNS_CACHE.clear();
+        USER_REQ_CACHE.clear();
+        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+      }
+    }
+    if (url.pathname === "/api/update-panel" && request2.method === "POST") {
+      return await performChildSelfUpdate(request2, env, url);
+    }
+    if (url.pathname === "/api/update-panel-github" && request2.method === "POST") {
+      return await performChildSelfUpdate(request2, env, url);
+    }
+    if (url.pathname === "/api/change-password" && request2.method === "POST") {
+      const { current_password, new_password, password } = await readJsonBody(request2);
+      const viaMasterKey = !!request2.headers.get("X-Master-Key");
+      const cleanCurrent = (current_password || "").trim();
+      const cleanNew = (new_password || password || "").trim();
+      if (!cleanNew || !viaMasterKey && !cleanCurrent) {
+        return new Response(JSON.stringify({ error: viaMasterKey ? "رمز عبور جدید الزامی است" : "رمز عبور فعلی و جدید الزامی هستند" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+      if (!viaMasterKey) {
+        const currentHash = await DbService.sha256(cleanCurrent);
+        const oldCurrentHash = await DbService.oldSha256(cleanCurrent);
+        const storedHash = await DbService.getPanelPassword(env.DB, true);
+        if (storedHash && storedHash !== currentHash && storedHash !== oldCurrentHash) {
+          return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json; charset=utf-8" }
+          });
+        }
+      }
+      if (cleanNew.length < 4) {
+        return new Response(JSON.stringify({ error: "رمز عبور جدید باید حداقل ۴ کاراکتر باشد" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+      const newHash = await DbService.sha256(cleanNew);
+      await DbService.setPanelPassword(env.DB, newHash);
+      return new Response(JSON.stringify({ success: true }), {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Set-Cookie": "panel_session=" + newHash + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000"
+        }
+      });
+    }
+    if (url.pathname === "/api/settings/bulk") {
+      if (request2.method === "GET") {
+        try {
+          const { results } = await env.DB.prepare("SELECT * FROM settings").all();
+          const settingsObj = {};
+          if (results) {
+            results.forEach((r) => {
+              if (r.key !== "cf_token" && r.key !== "panel_password" && r.key !== "master_api_key") settingsObj[r.key] = r.value;
+            });
+          }
+          return new Response(JSON.stringify(settingsObj), { headers: { "Content-Type": "application/json" } });
+        } catch (e) {
+          return new Response(JSON.stringify({}), { headers: { "Content-Type": "application/json" } });
+        }
+      }
+      if (request2.method === "POST") {
+        const body = await readJsonBody(request2);
+        let unpinRemoval = { countries: [], usersUpdated: 0 };
+        let fragApplied = false;
+        let earlyDataApplied = false;
+        let userLimitApplied = false;
+        let fingerprintApplied = false;
+        let connTypeApplied = false;
+        let cleanIpApplied = false;
+        let portApplied = false;
+        if (body.settings && typeof body.settings === "object") {
+          let overrideUserLimit = void 0;
+          if (Object.prototype.hasOwnProperty.call(body.settings, "user_limit")) {
+            const parsedUserLimit = parseInt(body.settings.user_limit);
+            if (!isNaN(parsedUserLimit) && parsedUserLimit >= 0) overrideUserLimit = parsedUserLimit;
+          }
+          let overrideDefaultPort = void 0;
+          if (Object.prototype.hasOwnProperty.call(body.settings, "default_port")) {
+            const parsedPort = parseInt(body.settings.default_port);
+            if (!isNaN(parsedPort) && parsedPort > 0 && parsedPort <= 65535) overrideDefaultPort = String(parsedPort);
+          }
+          let overrideGlobalCleanIp = void 0;
+          if (Object.prototype.hasOwnProperty.call(body.settings, "global_clean_ip")) {
+            const cleanIpVal = String(body.settings.global_clean_ip == null ? "" : body.settings.global_clean_ip).trim();
+            if (cleanIpVal) overrideGlobalCleanIp = cleanIpVal;
+          }
+          let overrideFrag = void 0;
+          if (body.apply_frag_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_frag_len") && Object.prototype.hasOwnProperty.call(body.settings, "new_user_frag_int")) {
+            overrideFrag = {
+              len: String(body.settings.new_user_frag_len == null ? "" : body.settings.new_user_frag_len).trim(),
+              int: String(body.settings.new_user_frag_int == null ? "" : body.settings.new_user_frag_int).trim()
+            };
+          }
+          let overrideFingerprint = void 0;
+          if (body.apply_fingerprint_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_fingerprint")) {
+            const fpVal = String(body.settings.new_user_fingerprint == null ? "" : body.settings.new_user_fingerprint).trim();
+            if (NEW_USER_FINGERPRINTS.includes(fpVal)) overrideFingerprint = fpVal;
+          }
+          let overrideConnType = void 0;
+          if (body.apply_connection_type_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_connection_type")) {
+            const ctParts = String(body.settings.new_user_connection_type == null ? "" : body.settings.new_user_connection_type).split(",").map((x) => x.trim().toLowerCase());
+            const ctFinal = ["vless", "trojan"].filter((x) => ctParts.includes(x));
+            if (ctFinal.length > 0) overrideConnType = ctFinal.join(",");
+          }
+          let overrideEarlyData = void 0;
+          if (body.apply_early_data_to_existing_users === true && Object.prototype.hasOwnProperty.call(body.settings, "new_user_early_data_enabled") && Object.prototype.hasOwnProperty.call(body.settings, "new_user_early_data_size")) {
+            const edEnabledRaw = String(body.settings.new_user_early_data_enabled == null ? "" : body.settings.new_user_early_data_enabled).trim();
+            const edSizeRaw = String(body.settings.new_user_early_data_size == null ? "" : body.settings.new_user_early_data_size).trim();
+            const edSize = /^[0-9]+$/.test(edSizeRaw) ? parseInt(edSizeRaw, 10) : NaN;
+            if ((edEnabledRaw === "0" || edEnabledRaw === "1") && edSize >= 1 && edSize <= EARLY_DATA_MAX_SIZE) {
+              overrideEarlyData = { enabled: edEnabledRaw === "1" ? 1 : 0, size: edSize };
+            }
+          }
+          let previousPinnedLocations = null;
+          if (Object.prototype.hasOwnProperty.call(body.settings, "pinned_locations")) {
+            previousPinnedLocations = await getPinnedLocationsSetting(env);
+          }
+          const settingsStmts = Object.entries(body.settings).map(
+            ([k, v]) => env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v))
+          );
+          if (settingsStmts.length > 0) await env.DB.batch(settingsStmts);
+          if (previousPinnedLocations) {
+            const nowPinnedLocations = await getPinnedLocationsSetting(env);
+            if (body.prune_unpinned_locations === true) {
+              unpinRemoval = await removeUnpinnedCountriesFromAllUsers(env, ctx, nowPinnedLocations);
+            } else {
+              const unpinned = previousPinnedLocations.filter((cc) => !nowPinnedLocations.includes(cc));
+              if (unpinned.length > 0) {
+                unpinRemoval = await removeCountriesFromAllUsers(env, ctx, unpinned);
+              }
+            }
+          }
+          if (overrideUserLimit !== void 0) {
+            await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ?").bind(overrideUserLimit, overrideUserLimit).run();
+            userLimitApplied = true;
+          }
+          if (overrideDefaultPort !== void 0) {
+            await env.DB.prepare("UPDATE users SET port = ?").bind(overrideDefaultPort).run();
+            portApplied = true;
+          }
+          if (overrideGlobalCleanIp !== void 0) {
+            await env.DB.prepare("UPDATE users SET ips = ?").bind(overrideGlobalCleanIp).run();
+            cleanIpApplied = true;
+          }
+          if (overrideFrag !== void 0) {
+            await env.DB.prepare("UPDATE users SET frag_len = ?, frag_int = ?").bind(overrideFrag.len, overrideFrag.int).run();
+            fragApplied = true;
+          }
+          if (overrideEarlyData !== void 0) {
+            await env.DB.prepare("UPDATE users SET early_data_enabled = ?, early_data_size = ?").bind(overrideEarlyData.enabled, overrideEarlyData.size).run();
+            earlyDataApplied = true;
+          }
+          if (overrideFingerprint !== void 0) {
+            await env.DB.prepare("UPDATE users SET fingerprint = ?").bind(overrideFingerprint).run();
+            fingerprintApplied = true;
+          }
+          if (overrideConnType !== void 0) {
+            await env.DB.prepare("UPDATE users SET connection_type = ?").bind(overrideConnType).run();
+            connTypeApplied = true;
+            try {
+              const { results: ctUsers } = await env.DB.prepare("SELECT uuid, trojan_hash FROM users").all();
+              await Promise.all((ctUsers || []).map((r) => invalidateUserAuthCache(ctx, r.uuid, r.trojan_hash)));
+            } catch (e) {
+            }
+          }
+        }
+        return new Response(JSON.stringify({ success: true, unpinned_countries: unpinRemoval.countries, users_updated: unpinRemoval.usersUpdated, frag_applied: fragApplied, early_data_applied: earlyDataApplied, user_limit_applied: userLimitApplied, fingerprint_applied: fingerprintApplied, connection_type_applied: connTypeApplied, clean_ip_applied: cleanIpApplied, port_applied: portApplied }), { headers: { "Content-Type": "application/json" } });
+      }
+    }
+    if (url.pathname === "/api/settings/sync-vip-proxies") {
+      if (request2.method === "POST") {
+        try {
+          const result = await syncAllVipProxies();
+          return new Response(JSON.stringify({ success: true, ...result }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+        } catch (e) {
+          return new Response(JSON.stringify({ error: e.message || "خطا در دریافت مخزن VIP" }), { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } });
+        }
+      }
+      if (request2.method === "GET") {
+        const perCountry = {};
+        let fetchedAt = null;
+        for (const [key, entry] of REPO_FILE_CACHE) {
+          const m = key.match(/^proxy_vip\/([A-Za-z0-9]+)\.txt$/);
+          if (!m) continue;
+          const cc = m[1].toUpperCase();
+          const lines = (entry.data || "").split("\n").map((l) => l.trim()).filter((l) => l.length > 5);
+          if (lines.length === 0) continue;
+          perCountry[cc] = lines;
+          if (fetchedAt === null || entry.timestamp > fetchedAt) fetchedAt = entry.timestamp;
+        }
+        return new Response(JSON.stringify({ success: true, perCountry, totalCountries: Object.keys(perCountry).length, fetchedAt }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+      }
+    }
+    if (url.pathname === "/api/settings/vip-healthy-countries" && request2.method === "GET") {
+      try {
+        const jsonHeaders = { "Content-Type": "application/json; charset=utf-8" };
+        if (url.searchParams.get("step") === "check") {
+          const codes = (url.searchParams.get("codes") || "").split(",");
+          const r2 = await checkVipCountriesChunk(codes, url.searchParams.get("force") === "1");
+          return new Response(JSON.stringify({ success: true, checked: r2.checked, healthy: r2.healthy }), { headers: jsonHeaders });
+        }
+        const r = await getVipHealthCandidates(env.GITHUB_TOKEN);
+        return new Response(JSON.stringify({ success: true, candidates: r.candidates, personalDiscovery: r.personalDiscovery, chunkSize: HEALTHY_VIP_CHUNK_SIZE }), { headers: jsonHeaders });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message || "خطا در بررسی کشورهای سالم" }), {
+          status: 502,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+    }
+    if (url.pathname === "/api/proxy-ip") {
+      if (request2.method === "POST") {
+        const { proxy_ip, iata, socks5 } = await readJsonBody(request2);
+        if (proxy_ip) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_ip', ?)").bind(proxy_ip).run();
+        if (iata !== void 0) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_location_iata', ?)").bind(iata).run();
+        if (socks5 !== void 0) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('socks5', ?)").bind(socks5).run();
+        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+      }
+      if (request2.method === "GET") {
+        const proxyIpRows = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('proxy_ip','proxy_location_iata','socks5')").all();
+        const proxyIpMap = {};
+        (proxyIpRows.results || []).forEach((r) => {
+          proxyIpMap[r.key] = r.value;
+        });
+        const rowIp = proxyIpMap.proxy_ip !== void 0 ? { value: proxyIpMap.proxy_ip } : null;
+        const rowIata = proxyIpMap.proxy_location_iata !== void 0 ? { value: proxyIpMap.proxy_location_iata } : null;
+        const rowSocks = proxyIpMap.socks5 !== void 0 ? { value: proxyIpMap.socks5 } : null;
+        return new Response(
+          JSON.stringify({
+            proxy_ip: rowIp ? rowIp.value : "",
+            iata: rowIata ? rowIata.value : "",
+            socks5: rowSocks ? rowSocks.value : ""
+          }),
+          { headers: { "Content-Type": "application/json" } }
+        );
+      }
+    }
+    if (url.pathname === "/api/test-proxy" && request2.method === "POST") {
+      const { proxy, skip_country, username, replace_on_fail } = await readJsonBody(request2);
+      if (!proxy) return new Response(JSON.stringify({ error: "پـروکـسـی وارد نشده است" }), { status: 400, headers: { "Content-Type": "application/json" } });
+      if (proxy === "direct") {
+        const startT = Date.now();
+        try {
+          const controller = new AbortController();
+          const tid = setTimeout(() => controller.abort(), 3e3);
+          await fetch("https://cp.cloudflare.com/generate_204", { method: "HEAD", signal: controller.signal });
+          clearTimeout(tid);
+          return new Response(JSON.stringify({ success: true, ping: Date.now() - startT, country: "UN" }), { headers: { "Content-Type": "application/json" } });
+        } catch (e) {
+          return new Response(JSON.stringify({ error: "نت آزاد قطع است" }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+      }
+      try {
+        let ip = "";
+        let workingProxy = proxy;
+        if (proxy.includes("t.me/socks") || proxy.includes("tg://socks")) {
+          ip = proxy.match(/server=([^&]+)/)?.[1] || "";
+        } else {
+          let cleanProxy = proxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+          let remain = cleanProxy;
+          if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
+          if (remain.startsWith("[")) {
+            ip = remain.substring(1, remain.indexOf("]"));
+          } else {
+            const lastColon = remain.lastIndexOf(":");
+            if (lastColon !== -1 && remain.indexOf(":") === lastColon) ip = remain.substring(0, lastColon);
+            else ip = remain;
+          }
+        }
+        let country = "UN";
+        const startTime = Date.now();
+        let targetHost = skip_country ? "1.1.1.1" : "ip-api.com";
+        let reqPath = skip_country ? "/" : "/json/?fields=countryCode";
+        const payload = new TextEncoder().encode("GET " + reqPath + " HTTP/1.1\r\nHost: " + targetHost + "\r\nConnection: close\r\n\r\n");
+        const s = await connectProxy(proxy, targetHost, 80, payload);
+        const reader = s.readable.getReader();
+        let resStr = "";
+        const dec = new TextDecoder();
+        const timeoutId = setTimeout(() => {
+          try {
+            s.close();
+          } catch (e) {
+          }
+        }, 7e3);
+        try {
+          while (true) {
+            const res = await reader.read();
+            if (res.done || !res.value) break;
+            resStr += dec.decode(res.value, { stream: true });
+            if (skip_country) {
+              if (resStr.includes("HTTP/1.")) break;
+            } else {
+              if (resStr.includes("countryCode")) break;
+            }
+          }
+        } finally {
+          clearTimeout(timeoutId);
+          try {
+            s.close();
+          } catch (e) {
+          }
+        }
+        if (!resStr) {
+          throw new Error("تایم‌اوت در دریافت دیتا");
+        }
+        const ping = Date.now() - startTime;
+        if (!skip_country) {
+          try {
+            const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
+            if (jsonMatch && jsonMatch[1]) country = jsonMatch[1];
+          } catch (e) {
+          }
+          if (country === "UN" && ip) {
+            try {
+              const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
+              const geoData = await geoRes.json();
+              if (geoData && geoData.countryCode) country = geoData.countryCode;
+            } catch (e) {
+            }
+          }
+        }
+        return new Response(JSON.stringify({ success: true, ping, country }), { headers: { "Content-Type": "application/json" } });
+      } catch (e) {
+        if (username && replace_on_fail) {
+          const replaceTask = replaceBrokenProxy(username, env, proxy);
+          if (ctx) ctx.waitUntil(replaceTask);
+          else replaceTask.catch(() => {
+          });
+        }
+        let msg = e.message;
+        if (msg.includes("Stream was cancelled") || msg.includes("network")) msg = "ارتباط با سرور قطع شد (احتمالاً پـروکـسـی مسدود یا خاموش است)";
+        else if (msg.includes("timeout") || msg.includes("timed out") || msg.includes("تایم‌اوت")) msg = "تایم‌اوت در اتصال (پـروکـسـی در دسترس نیست)";
+        else if (msg.includes("Invalid URL") || msg.includes("Invalid format")) msg = "فرمت وارد شده برای پـروکـسـی اشتباه است";
+        else if (msg === "err") msg = "خطای نامشخص (ارتباط برقرار نشد)";
+        return new Response(JSON.stringify({ error: msg }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+    }
+    if (url.pathname === "/api/stats-history" && request2.method === "GET") {
+      try {
+        const now = Date.now();
+        const days = [];
+        for (let i = 29; i >= 0; i--) days.push(utcDateKey(now - i * 864e5));
+        const startKey = days[0];
+        const todayKey = days[days.length - 1];
+        const [reqRows, trafficRows] = await Promise.all([
+          env.DB.prepare("SELECT substr(date,1,10) as date, SUM(count) as count FROM daily_requests WHERE date >= ? GROUP BY substr(date,1,10)").bind(startKey).all(),
+          env.DB.prepare("SELECT substr(date,1,10) as date, SUM(gb) as gb FROM daily_traffic WHERE date >= ? GROUP BY substr(date,1,10)").bind(startKey).all()
+        ]);
+        const reqMap = new Map((reqRows.results || []).map((r) => [r.date, r.count || 0]));
+        const trafficMap = new Map((trafficRows.results || []).map((r) => [r.date, r.gb || 0]));
+        let pendingGb = 0;
+        for (const v of GLOBAL_TRAFFIC_CACHE.values()) pendingGb += v || 0;
+        pendingGb = pendingGb / (1024 * 1024 * 1024);
+        const pendingReq = GLOBAL_REQ_COUNT || 0;
+        const requests = days.map((d) => ({ date: d, value: (reqMap.get(d) || 0) + (d === todayKey ? pendingReq : 0) }));
+        const traffic = days.map((d) => ({ date: d, value: (trafficMap.get(d) || 0) + (d === todayKey ? pendingGb : 0) }));
+        return new Response(JSON.stringify({ requests, traffic }), {
+          headers: { "Content-Type": "application/json", "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0" }
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ requests: [], traffic: [], error: e.message }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+    if (url.pathname.startsWith("/api/users")) {
+      const pathParts = url.pathname.split("/");
+      const isUserAction = pathParts.length > 3;
+      if (isUserAction) {
+        const username = safeDecodeURI(pathParts.pop());
+        if (request2.method === "PUT") {
+          const body = await readJsonBody(request2);
+          if (Object.keys(body).length === 0) {
+            return new Response(JSON.stringify({ error: "Invalid request body" }), { status: 400, headers: { "Content-Type": "application/json" } });
+          }
+          if (body.toggle_only !== void 0) {
+            await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
+            const toggledUser = await env.DB.prepare("SELECT uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
+            if (toggledUser) await invalidateUserAuthCache(ctx, toggledUser.uuid, toggledUser.trojan_hash);
+            return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+          } else if (body.reset_action !== void 0) {
+            if (body.reset_action === "volume") {
+              await env.DB.prepare("UPDATE users SET used_gb = 0, is_active = 1 WHERE username = ?").bind(username).run();
+              GLOBAL_TRAFFIC_CACHE.set(username, 0);
+            } else if (body.reset_action === "req") {
+              await env.DB.prepare("UPDATE users SET used_req = 0, is_active = 1 WHERE username = ?").bind(username).run();
+              USER_REQ_CACHE.set(username, 0);
+            } else if (body.reset_action === "time") {
+              await env.DB.prepare("UPDATE users SET created_at = CURRENT_TIMESTAMP, first_connection_time = NULL, is_active = 1 WHERE username = ?").bind(username).run();
+              for (const [lockK] of GLOBAL_WRITE_LOCK.entries()) {
+                if (lockK.endsWith("_first_conn")) GLOBAL_WRITE_LOCK.delete(lockK);
+              }
+            } else if (body.reset_action === "locations") {
+              const pinnedLocations = await getPinnedLocationsSetting(env);
+              const existingRow = await env.DB.prepare("SELECT user_socks5 FROM users WHERE username = ?").bind(username).first();
+              let existingList = [];
+              try {
+                if (existingRow && existingRow.user_socks5 && existingRow.user_socks5.trim().startsWith("[")) {
+                  existingList = JSON.parse(existingRow.user_socks5);
+                }
+              } catch (e) {
+                existingList = [];
+              }
+              const { list: mergedList, cappedOut } = await mergePinnedLocationsForUser(existingList, pinnedLocations);
+              await env.DB.prepare("UPDATE users SET user_socks5 = ?, auto_rotate_user_proxy = 1 WHERE username = ?").bind(JSON.stringify(mergedList), username).run();
+              const locUser = await env.DB.prepare("SELECT uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
+              if (locUser) await invalidateUserAuthCache(ctx, locUser.uuid, locUser.trojan_hash);
+              return new Response(JSON.stringify({ success: true, username, capped: cappedOut.length > 0, cappedCountries: cappedOut }), { headers: { "Content-Type": "application/json" } });
+            } else if (body.reset_action === "remove_location") {
+              const targetCountry = String(body.country || "").trim().toUpperCase();
+              if (!targetCountry) {
+                return new Response(JSON.stringify({ error: "Missing country" }), { status: 400, headers: { "Content-Type": "application/json" } });
+              }
+              const rmRow = await env.DB.prepare("SELECT user_socks5 FROM users WHERE username = ?").bind(username).first();
+              let rmList = [];
+              try {
+                if (rmRow && rmRow.user_socks5 && rmRow.user_socks5.trim().startsWith("[")) {
+                  rmList = JSON.parse(rmRow.user_socks5);
+                }
+              } catch (e) {
+                rmList = [];
+              }
+              const beforeLen = rmList.length;
+              rmList = rmList.filter((p) => !(typeof p === "object" && p !== null && (p.country || "").toUpperCase() === targetCountry));
+              const removed = rmList.length < beforeLen;
+              if (removed) {
+                await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(JSON.stringify(rmList), username).run();
+                const rmUser = await env.DB.prepare("SELECT uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
+                if (rmUser) await invalidateUserAuthCache(ctx, rmUser.uuid, rmUser.trojan_hash);
+              }
+              return new Response(JSON.stringify({ success: true, username, removed }), { headers: { "Content-Type": "application/json" } });
+            }
+            const resetUser = await env.DB.prepare("SELECT uuid, trojan_hash FROM users WHERE username = ?").bind(username).first();
+            if (resetUser) await invalidateUserAuthCache(ctx, resetUser.uuid, resetUser.trojan_hash);
+            return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+          } else {
+            const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = body;
+            if (new_username && new_username !== username) {
+              if (!/^[a-zA-Z0-9_-]+$/.test(new_username)) {
+                return new Response(JSON.stringify({ error: "نام کاربری جدید غیرمجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+              }
+              const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ? COLLATE NOCASE").bind(new_username).first();
+              if (existing) {
+                return new Response(JSON.stringify({ error: "این نام کاربری از قبل وجود دارد" }), { status: 400, headers: { "Content-Type": "application/json" } });
+              }
+              if (GLOBAL_TRAFFIC_CACHE.has(username)) {
+                GLOBAL_TRAFFIC_CACHE.set(new_username, GLOBAL_TRAFFIC_CACHE.get(username));
+                GLOBAL_TRAFFIC_CACHE.delete(username);
+              }
+              if (USER_REQ_CACHE.has(username)) {
+                USER_REQ_CACHE.set(new_username, USER_REQ_CACHE.get(username));
+                USER_REQ_CACHE.delete(username);
+              }
+              if (ACTIVE_CONNECTIONS_COUNT.has(username)) {
+                ACTIVE_CONNECTIONS_COUNT.set(new_username, ACTIVE_CONNECTIONS_COUNT.get(username));
+                ACTIVE_CONNECTIONS_COUNT.delete(username);
+              }
+              if (GLOBAL_LAST_ACTIVE_WRITE.has(username)) {
+                GLOBAL_LAST_ACTIVE_WRITE.set(new_username, GLOBAL_LAST_ACTIVE_WRITE.get(username));
+                GLOBAL_LAST_ACTIVE_WRITE.delete(username);
+              }
+            }
+            let finalConnType = void 0;
+            if (protocols && Array.isArray(protocols) && protocols.length > 0) {
+              finalConnType = protocols.join(",");
+            } else if (connection_type) {
+              finalConnType = connection_type;
+            }
+            const existingUser = await env.DB.prepare("SELECT id, uuid, trojan_hash, user_socks5 FROM users WHERE username = ?").bind(username).first();
+            let finalUuid = existingUser ? existingUser.uuid : null;
+            if (new_uuid !== void 0 && new_uuid !== null && String(new_uuid).trim() !== "") {
+              const trimmedUuid = String(new_uuid).trim().toLowerCase();
+              if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(trimmedUuid)) {
+                return new Response(JSON.stringify({ error: "فرمت UUID نامعتبر است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+              }
+              if (trimmedUuid !== (existingUser && existingUser.uuid ? String(existingUser.uuid).toLowerCase() : null)) {
+                const existingUuidUser = await env.DB.prepare("SELECT id FROM users WHERE uuid = ? COLLATE NOCASE AND id != ?").bind(trimmedUuid, existingUser ? existingUser.id : -1).first();
+                if (existingUuidUser) {
+                  return new Response(JSON.stringify({ error: "این UUID قبلاً برای کاربر دیگری استفاده شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+                }
+              }
+              finalUuid = trimmedUuid;
+            }
+            const trojanHash = finalUuid ? sha224Pure(finalUuid) : null;
+            const resetProxyToDefault = body.reset_user_to_default === true;
+            let finalUserSocks5 = user_socks5;
+            if (resetProxyToDefault) {
+              const pinnedForReset = await getPinnedLocationsSetting(env);
+              const rebuiltList = await buildPinnedDefaultProxyList(pinnedForReset);
+              if (rebuiltList.length > 0 && rebuiltList.every((slot) => !slot.proxy)) {
+                return new Response(JSON.stringify({ error: "لیست پروکسی‌های VIP در حال حاضر در دسترس نیست؛ هیچ تغییری اعمال نشد. کمی بعد دوباره تلاش کنید." }), { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } });
+              }
+              finalUserSocks5 = JSON.stringify(rebuiltList);
+            } else {
+              finalUserSocks5 = preserveProxyCountryTags(user_socks5, existingUser ? existingUser.user_socks5 : null);
+            }
+            try {
+              await env.DB.prepare("UPDATE users SET username = ?, uuid = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, advanced_frag = ?, cipher_suites = ?, tls_mask = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ?, start_on_first_connect = ?, enable_direct = ?, connection_type = CASE WHEN ? IS NOT NULL THEN ? ELSE connection_type END, trojan_hash = ? WHERE username = ?").bind(new_username || username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== void 0 ? frag_len : "200-3000", frag_int !== void 0 ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, finalUserSocks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 999999, resetProxyToDefault || auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== void 0 ? enable_direct ? 1 : 0 : 1, finalConnType !== void 0 ? finalConnType : null, finalConnType !== void 0 ? finalConnType : null, trojanHash, username).run();
+            } catch (err) {
+              const msg = String(err && err.message || "");
+              if (msg.toLowerCase().includes("unique")) {
+                return new Response(JSON.stringify({ error: "این UUID قبلاً برای کاربر دیگری استفاده شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+              }
+              return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
+            }
+            try {
+              const edEnabledPut = early_data_enabled !== void 0 && early_data_enabled !== null ? early_data_enabled && early_data_enabled !== "0" && early_data_enabled !== "false" ? 1 : 0 : null;
+              const edSizePutRaw = early_data_size !== void 0 && early_data_size !== null ? parseInt(early_data_size, 10) : NaN;
+              const edSizePut = edSizePutRaw >= 1 && edSizePutRaw <= EARLY_DATA_MAX_SIZE ? edSizePutRaw : null;
+              if (edEnabledPut !== null || edSizePut !== null) {
+                await env.DB.prepare("UPDATE users SET early_data_enabled = COALESCE(?, early_data_enabled), early_data_size = COALESCE(?, early_data_size) WHERE username = ?").bind(edEnabledPut, edSizePut, new_username || username).run();
+              }
+            } catch (e) {
+            }
+            if (resetProxyToDefault) {
+              const resetTodayUtc = Math.floor(Date.now() / 864e5) * 864e5;
+              try {
+                await env.DB.prepare("UPDATE users SET proxy_rotate_cooldowns = '{}', last_reset_vol_time = ?, last_reset_req_time = ? WHERE username = ?").bind(resetTodayUtc, resetTodayUtc, new_username || username).run();
+              } catch (e) {
+              }
+            }
+            if (existingUser) await invalidateUserAuthCache(ctx, existingUser.uuid, existingUser.trojan_hash);
+            if (finalUuid && (!existingUser || finalUuid !== existingUser.uuid)) await invalidateUserAuthCache(ctx, finalUuid, trojanHash);
+            return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+          }
+        }
+        if (request2.method === "DELETE") {
+          let userToDelete = null;
+          try {
+            userToDelete = await env.DB.prepare("SELECT uuid, trojan_hash, lifetime_used_gb, used_gb FROM users WHERE username = ?").bind(username).first();
+            if (userToDelete) {
+              const gbToKeep = userToDelete.lifetime_used_gb || userToDelete.used_gb || 0;
+              if (gbToKeep > 0) {
+                await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('deleted_users_gb', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS REAL) + ?").bind(String(gbToKeep), String(gbToKeep)).run();
+              }
+            }
+          } catch (e) {
+          }
+          await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(username).run();
+          if (userToDelete) await invalidateUserAuthCache(ctx, userToDelete.uuid, userToDelete.trojan_hash);
+          return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+        }
+      } else {
+        if (request2.method === "GET") {
+          try {
+            await flushExpiredTraffic(env);
+          } catch (e) {
+          }
+          try {
+            const { results } = await env.DB.prepare("SELECT * FROM users ORDER BY id DESC").all();
+            const now = Date.now();
+            const cachedIpsData = await getCachedIps();
+            const enrichedUsers = (results || []).map((user) => {
+              let finalIps = user.ips;
+              if (user.auto_rotate_ip === 1) {
+                const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
+                if (randomIps.length > 0) finalIps = randomIps.join("\n");
+              }
+              const currentOnlineCount = Math.max(ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0, getActiveIpCount(user.active_ips));
+              const deviceWarning = !!(user.device_warning_at && now - user.device_warning_at < 24 * 60 * 60 * 1e3);
+              return {
+                ...user,
+                ips: finalIps,
+                used_gb: (user.used_gb || 0) + (GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024),
+                used_req: (user.used_req || 0) + (USER_REQ_CACHE.get(user.username) || 0),
+                is_online: currentOnlineCount > 0 ? 1 : 0,
+                online_count: currentOnlineCount,
+                device_warning: deviceWarning
+              };
+            });
+            const panelSettings = {};
+            try {
+              const settingsRes = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('req_last_date','req_total','req_today','deleted_users_gb')").all();
+              (settingsRes.results || []).forEach((r) => {
+                panelSettings[r.key] = r.value;
+              });
+            } catch (e) {
+            }
+            let cfReqs = { today: 0, total: 0, d1Reads: 0, d1Writes: 0 };
+            try {
+              const liveCf = await getCfUsage(env);
+              const todayStr = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+              let dbTotal = parseInt(panelSettings.req_total) || 0;
+              let dbToday = panelSettings.req_last_date === todayStr ? parseInt(panelSettings.req_today) || 0 : 0;
+              if (liveCf.today > dbToday) {
+                dbToday = liveCf.today;
+                await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbToday), String(dbToday)).run();
+                await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(todayStr, todayStr).run();
+              }
+              if (liveCf.total > dbTotal) {
+                dbTotal = liveCf.total;
+                await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTotal), String(dbTotal)).run();
+              }
+              cfReqs.today = dbToday + GLOBAL_REQ_COUNT;
+              cfReqs.total = dbTotal + GLOBAL_REQ_COUNT;
+              cfReqs.d1Reads = liveCf.d1Reads;
+              cfReqs.d1Writes = liveCf.d1Writes;
+            } catch (e) {
+            }
+            const deletedGb = parseFloat(panelSettings.deleted_users_gb) || 0;
+            let trafficDaily = 0, traffic7d = 0, traffic30d = 0;
+            try {
+              const dailyCutoffKey = utcHourKey(now - 24 * 36e5);
+              const sevenAgoKey = utcHourKey(now - 7 * 864e5);
+              const thirtyAgoKey = utcHourKey(now - 30 * 864e5);
+              const [dailyRow, sevenRow, thirtyRow] = await Promise.all([
+                env.DB.prepare("SELECT SUM(gb) as s FROM daily_traffic WHERE date >= ?").bind(dailyCutoffKey).first(),
+                env.DB.prepare("SELECT SUM(gb) as s FROM daily_traffic WHERE date >= ?").bind(sevenAgoKey).first(),
+                env.DB.prepare("SELECT SUM(gb) as s FROM daily_traffic WHERE date >= ?").bind(thirtyAgoKey).first()
+              ]);
+              let pendingGb = 0;
+              for (const v of GLOBAL_TRAFFIC_CACHE.values()) pendingGb += v || 0;
+              pendingGb = pendingGb / (1024 * 1024 * 1024);
+              trafficDaily = (dailyRow?.s || 0) + pendingGb;
+              traffic7d = (sevenRow?.s || 0) + pendingGb;
+              traffic30d = (thirtyRow?.s || 0) + pendingGb;
+            } catch (e) {
+            }
+            let cfRequests7d = 0, cfRequests30d = 0;
+            try {
+              const sevenAgoKey = utcHourKey(now - 7 * 864e5);
+              const thirtyAgoKey = utcHourKey(now - 30 * 864e5);
+              const [sevenReqRow, thirtyReqRow] = await Promise.all([
+                env.DB.prepare("SELECT SUM(count) as s FROM daily_requests WHERE date >= ?").bind(sevenAgoKey).first(),
+                env.DB.prepare("SELECT SUM(count) as s FROM daily_requests WHERE date >= ?").bind(thirtyAgoKey).first()
+              ]);
+              cfRequests7d = (sevenReqRow?.s || 0) + GLOBAL_REQ_COUNT;
+              cfRequests30d = (thirtyReqRow?.s || 0) + GLOBAL_REQ_COUNT;
+            } catch (e) {
+            }
+            return new Response(
+              JSON.stringify({
+                users: enrichedUsers,
+                serverTime: now,
+                cfRequestsToday: cfReqs.today,
+                cfRequestsTotal: cfReqs.total,
+                cfRequests7d,
+                cfRequests30d,
+                d1Reads: cfReqs.d1Reads,
+                d1Writes: cfReqs.d1Writes,
+                deletedGb,
+                trafficDaily,
+                traffic7d,
+                traffic30d
+              }),
+              {
+                headers: {
+                  "Content-Type": "application/json",
+                  "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+                }
+              }
+            );
+          } catch (dbErr) {
+            return new Response(
+              JSON.stringify({
+                users: [],
+                serverTime: Date.now(),
+                cfRequestsToday: 0,
+                cfRequestsTotal: 0,
+                cfRequests7d: 0,
+                cfRequests30d: 0,
+                error: dbErr.message
+              }),
+              {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+                }
+              }
+            );
+          }
+        }
+        if (request2.method === "POST") {
+          const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = await readJsonBody(request2);
+          if (!username) {
+            return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
+          }
+          if (username.length > 32) {
+            return new Response(JSON.stringify({ error: "نام کاربری نمی‌تواند بیشتر از ۳۲ کاراکتر باشد" }), { status: 400, headers: { "Content-Type": "application/json" } });
+          }
+          if (!/^[a-zA-Z0-9_-]+$/.test(username)) {
+            return new Response(JSON.stringify({ error: "نام کاربری غیرمجاز است (فقط حروف، اعداد، خط تیره و آندرلاین)" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+          }
+          let finalUuid = uuid ? String(uuid).trim().toLowerCase() : "";
+          if (finalUuid) {
+            if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(finalUuid)) {
+              return new Response(JSON.stringify({ error: "فرمت UUID نامعتبر است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+            }
+            const existingUuidUser = await env.DB.prepare("SELECT id FROM users WHERE uuid = ? COLLATE NOCASE").bind(finalUuid).first();
+            if (existingUuidUser) {
+              return new Response(JSON.stringify({ error: "این UUID قبلاً برای کاربر دیگری استفاده شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+            }
+          } else {
+            finalUuid = crypto.randomUUID();
+          }
+          const parsedUsedGb = parseFloat(used_gb);
+          const finalUsedGb = !isNaN(parsedUsedGb) ? parsedUsedGb : 0;
+          const parsedUsedReq = parseInt(used_req);
+          const finalUsedReq = !isNaN(parsedUsedReq) ? parsedUsedReq : 0;
+          const finalCreatedAt = created_at || (/* @__PURE__ */ new Date()).toISOString();
+          const parsedIsActive = parseInt(is_active);
+          const finalIsActive = !isNaN(parsedIsActive) ? parsedIsActive : 1;
+          const existingUser = await env.DB.prepare("SELECT id FROM users WHERE username = ? COLLATE NOCASE").bind(username).first();
+          if (existingUser) {
+            return new Response(JSON.stringify({ error: "این نام کاربری از قبل وجود دارد" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+          }
+          try {
+            const todayUtc = Math.floor(Date.now() / 864e5) * 864e5;
+            const nowTime = Date.now();
+            let finalConnType = "vless";
+            if (protocols && Array.isArray(protocols) && protocols.length > 0) {
+              finalConnType = protocols.join(",");
+            } else if (connection_type) {
+              finalConnType = connection_type;
+            }
+            const trojanHash = sha224Pure(finalUuid);
+            const finalIpLimit = ip_limit !== void 0 && ip_limit !== null && String(ip_limit).trim() !== "" ? parseInt(ip_limit) : await getUserLimitSetting(env);
+            const finalPort = port !== void 0 && port !== null && String(port).trim() !== "" ? port : await getDefaultPortSetting(env);
+            const nud = await getNewUserDefaults(env);
+            const given = (v) => v !== void 0 && v !== null;
+            const flagOf = (v, dfltStr) => given(v) ? v && v !== "0" && v !== "false" ? 1 : 0 : dfltStr === "1" ? 1 : 0;
+            const intOf = (v, dfltStr) => given(v) ? parseInt(v) || 0 : parseInt(dfltStr) || 0;
+            const finalFingerprint = fingerprint || nud.new_user_fingerprint;
+            const finalIps = ips !== void 0 ? ips : nud.global_clean_ip;
+            const finalEarlyDataEnabled = flagOf(early_data_enabled, nud.new_user_early_data_enabled);
+            const edSizeParsed = parseInt(given(early_data_size) ? early_data_size : nud.new_user_early_data_size, 10);
+            const finalEarlyDataSize = edSizeParsed >= 1 && edSizeParsed <= EARLY_DATA_MAX_SIZE ? edSizeParsed : 2560;
+            const finalTls = given(tls) && String(tls).trim() !== "" ? tls : String(finalPort).split(",").some((p) => NEW_USER_TLS_PORTS.includes(p.trim())) ? "on" : "off";
+            if (!(protocols && Array.isArray(protocols) && protocols.length > 0) && !connection_type) finalConnType = nud.new_user_connection_type;
+            await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, early_data_enabled, early_data_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== void 0 ? frag_len : nud.new_user_frag_len, frag_int !== void 0 ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(void 0, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct), finalEarlyDataEnabled, finalEarlyDataSize).run();
+            await invalidateUserAuthCache(ctx, finalUuid, trojanHash);
+            if (ctx) {
+              ctx.waitUntil((async () => {
+                for (let fillAttempt = 1; fillAttempt <= 2; fillAttempt++) {
+                  try {
+                    const pinnedLocations = await getPinnedLocationsSetting(env);
+                    const pinnedList = await buildPinnedDefaultProxyList(pinnedLocations);
+                    await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ? AND (user_socks5 IS NULL OR TRIM(user_socks5) = '' OR TRIM(user_socks5) = '[]')").bind(JSON.stringify(pinnedList), username).run();
+                    break;
+                  } catch (e) {
+                    console.error("pinned-locations fill failed for", username, "(attempt " + fillAttempt + "):", e && e.message);
+                    if (fillAttempt < 2) await new Promise((r) => setTimeout(r, 2e3));
+                  }
+                }
+                await invalidateUserAuthCache(ctx, finalUuid, trojanHash);
+              })());
+            }
+            return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+          } catch (err) {
+            return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+          }
+        }
+      }
+    }
+    return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+  }
 };
 let schemaEnsured = false;
 let schemaPromise = null;
 let cachedPanelPassword = null;
 const DbService = {
-	async ensureSchema(db) {
-	if (schemaEnsured) return;
-		if (schemaPromise) {
-			await schemaPromise;
-			return;
-		}
-		schemaPromise = (async () => {
-			try {
-				await db.prepare(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, uuid TEXT, limit_gb REAL, expiry_days INTEGER, ips TEXT, connection_type TEXT, tls TEXT, port INTEGER, used_gb REAL DEFAULT 0, is_active INTEGER DEFAULT 1, last_active INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`).run();
-			} catch (e) { }
-			try {
-				await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run();
-			} catch (e) { }
-			try {
-				// پیش‌فرض‌های آیپی تمیز سراسری/آیپی‌های تمیز دیگر/Proxy IP رو همین‌جا توی
-				// دیتابیس seed می‌کنیم (نه فقط توی فرم سمت کلاینت)، تا از همون دیپلوی اول
-				// این مقادیر واقعاً در تنظیمات وجود داشته باشن و نیازی به زدن دستی دکمه‌ی
-				// «ذخیره» بعد از دیپلوی نباشه. INSERT OR IGNORE یعنی اگه ادمین قبلاً این
-				// کلید رو (حتی با مقدار خالی) ذخیره کرده باشه، دست‌نخورده می‌مونه.
-				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_clean_ip', ?)").bind(DEFAULT_GLOBAL_CLEAN_IP_FALLBACK).run();
-				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('other_clean_ips', ?)").bind(DEFAULT_OTHER_CLEAN_IPS_FALLBACK.join("\n")).run();
-				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('inline_proxy_ip', ?)").bind(DEFAULT_INLINE_PROXY_IP_FALLBACK).run();
-				await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_port', ?)").bind(DEFAULT_PORT_FALLBACK).run();
-				// پیش‌فرض‌های کاربر جدید (new_user_*) - یک batch، INSERT OR IGNORE: کلیدی که
-				// ادمین/پنل مادر قبلاً ذخیره کرده دست‌نخورده می‌ماند.
-				await db.batch(Object.entries(NEW_USER_DEFAULTS_FALLBACK).map(([k, v]) => db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").bind(k, v)));
-			} catch (e) { }
-			try {
-				// جدول ترافیک، به تفکیک ساعت UTC (ستون "date" همچنان TEXT PRIMARY KEY است، فقط از این پس
-				// مقداری به فرم YYYY-MM-DDTHH در آن ذخیره می‌شود - نه YYYY-MM-DD؛ به utcHourKey نگاه کنید).
-				// برای نگه‌داری تاریخچه‌ی 30 روز اخیر و محاسبه‌ی آمار رولینگ "روزانه"/"7 روز"/"30 روز گذشته"
-				// با دقت ~۱ ساعت. هر ساعت فقط یک ردیف دارد (UPSERT، حداکثر 24×30=720 ردیف کل)؛ قدیمی‌تر
-				// از 30 روز به‌صورت دوره‌ای پاک می‌شود (ردیف‌های قدیمیِ فرمت روزانه هم با همان cutoff رشته‌ای
-				// درست پاک می‌شوند، چون هر دو فرمت با همان 10 کاراکتر YYYY-MM-DD شروع می‌شوند).
-				await db.prepare("CREATE TABLE IF NOT EXISTS daily_traffic (date TEXT PRIMARY KEY, gb REAL DEFAULT 0)").run();
-			} catch (e) { }
-			try {
-				// جدول تعداد ریکوئست‌ها، به تفکیک ساعت UTC - همون توضیح جدول daily_traffic بالا صدق می‌کند.
-				await db.prepare("CREATE TABLE IF NOT EXISTS daily_requests (date TEXT PRIMARY KEY, count INTEGER DEFAULT 0)").run();
-			} catch (e) { }
-			try {
-				// ایندکس روی uuid برای سریع/ارزون‌تر شدن پرتکرارترین query سیستم (چک اعتبار هر کانکشن کاربر)
-				// اول تلاش برای UNIQUE (هم سرعت هم یکپارچگی داده)؛ اگر به هر دلیلی (مثلاً داده‌ی تکراری قدیمی) شکست خورد، ایندکس معمولی جایگزین می‌شود تا حداقل سرعت query حفظ شود
-				await db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_uuid ON users(uuid)").run();
-			} catch (e) {
-				try {
-					await db.prepare("CREATE INDEX IF NOT EXISTS idx_users_uuid ON users(uuid)").run();
-				} catch (e2) { }
-			}
-			try {
-				const { results } = await db.prepare("PRAGMA table_info(users)").all();
-				const existingCols = new Set((results || []).map((r) => r.name));
-				const colsToAdd = [
-					{ name: "advanced_frag", def: "TEXT DEFAULT NULL" },
-					{ name: "cipher_suites", def: "TEXT DEFAULT NULL" },
-					{ name: "tls_mask", def: "TEXT DEFAULT NULL" },
-					{ name: "is_active", def: "INTEGER DEFAULT 1" },
-					{ name: "last_active", def: "INTEGER" },
-					{ name: "fingerprint", def: "TEXT DEFAULT 'chrome'" },
-					{ name: "max_connections", def: "INTEGER" },
-					{ name: "limit_req", def: "INTEGER" },
-					{ name: "used_req", def: "INTEGER DEFAULT 0" },
-					{ name: "ip_limit", def: "INTEGER DEFAULT NULL" },
-					{ name: "active_ips", def: "TEXT DEFAULT NULL" },
-					{ name: "block_porn", def: "INTEGER DEFAULT 0" },
-					{ name: "block_ads", def: "INTEGER DEFAULT 0" },
-					{ name: "frag_len", def: "TEXT DEFAULT '200-3000'" },
-					{ name: "frag_int", def: "TEXT DEFAULT '1-2'" },
-					{ name: "lifetime_used_gb", def: "REAL DEFAULT 0" },
-					{ name: "user_proxy_ip", def: "TEXT DEFAULT NULL" },
-					{ name: "user_proxy_iata", def: "TEXT DEFAULT NULL" },
-					{ name: "user_socks5", def: "TEXT DEFAULT NULL" },
-					{ name: "auto_reset_vol_days", def: "INTEGER DEFAULT 0" },
-					{ name: "auto_reset_req_days", def: "INTEGER DEFAULT 0" },
-					{ name: "last_reset_vol_time", def: "INTEGER DEFAULT 0" },
-					{ name: "last_reset_req_time", def: "INTEGER DEFAULT 0" },
-					{ name: "auto_rotate_ip", def: "INTEGER DEFAULT 1" },
-					{ name: "rotate_time", def: "INTEGER DEFAULT 0" },
-					{ name: "ip_operator", def: "TEXT DEFAULT 'all'" },
-					{ name: "ip_count", def: "INTEGER DEFAULT 999999" },
-					{ name: "last_rotate_time", def: "INTEGER DEFAULT 0" },
-					{ name: "auto_rotate_user_proxy", def: "INTEGER DEFAULT 0" },
-					{ name: "start_on_first_connect", def: "INTEGER DEFAULT 0" },
-					{ name: "first_connection_time", def: "INTEGER DEFAULT NULL" },
-					{ name: "trojan_hash", def: "TEXT DEFAULT NULL" },
-					{ name: "enable_direct", def: "INTEGER DEFAULT 1" },
-					{ name: "proxy_rotate_cooldowns", def: "TEXT DEFAULT '{}'" },
-					{ name: "device_warning_at", def: "INTEGER DEFAULT NULL" },
-					{ name: "device_warning_peak_count", def: "INTEGER DEFAULT NULL" },
-					{ name: "device_warning_streak", def: "INTEGER DEFAULT 0" },
-					// Early Data: ستون‌های خام کاربر؛ با DEFAULT ساخته می‌شن تا کاربرهای موجود هم
-					// early_data_enabled=0 داشته باشن (نه NULL) و user.early_data_enabled بدون fallback جدا کار کنه.
-					{ name: "early_data_enabled", def: "INTEGER DEFAULT 0" },
-					{ name: "early_data_size", def: "INTEGER DEFAULT 2560" },
-				];
-				const stmts = [];
-				for (const col of colsToAdd) {
-					if (!existingCols.has(col.name)) {
-						stmts.push(db.prepare(`ALTER TABLE users ADD COLUMN ${col.name} ${col.def}`));
-					}
-				}
-				if (stmts.length > 0) {
-					await db.batch(stmts);
-				}
-			} catch (e) { }
-			try {
-				await db.prepare("UPDATE users SET ip_limit = max_connections WHERE ip_limit IS NULL AND max_connections IS NOT NULL").run();
-			} catch (e) { }
-			try {
-				// این UPDATE فقط برای backfill یک‌باره‌ی ردیف‌های قدیمی لازم بود (قبل از اضافه شدن ستون lifetime_used_gb).
-				// چون schemaEnsured فقط یه فلگ حافظه‌ای isolate هست و در D1 ذخیره نمی‌شه، بدون این چک این UPDATE
-				// روی هر cold start دوباره اجرا می‌شد و هر کاربر idle/صفر-مصرف رو (که lifetime_used_gb=0 هست) دوباره WRITE می‌کرد.
-				// اینجا با یه فلگ ماندگار در settings، migration واقعاً فقط یک‌بار در کل عمر دیتابیس اجرا می‌شه؛
-				// از دفعه‌ی دوم به بعد فقط همین یک SELECT سبک اجرا می‌شه و هیچ UPDATE ای روی users نمی‌ره.
-				const migRow = await db.prepare("SELECT value FROM settings WHERE key = 'migrated_lifetime_used_gb'").first();
-				if (!migRow) {
-					await db.prepare("UPDATE users SET lifetime_used_gb = used_gb WHERE lifetime_used_gb = 0 OR lifetime_used_gb IS NULL").run();
-					await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('migrated_lifetime_used_gb', '1')").run();
-				}
-			} catch (e) { }
-		})();
-		await schemaPromise;
-		schemaEnsured = true;
-	},
-	async getPanelPassword(db, forceRefresh = true) {
-		try {
-			const row = await db.prepare("SELECT value FROM settings WHERE key = 'panel_password'").first();
-			cachedPanelPassword = row && row.value ? row.value : null;
-			return cachedPanelPassword;
-		} catch (e) {
-			return null;
-		}
-	},
-	async setPanelPassword(db, password) {
-		await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_password', ?)").bind(password).run();
-		cachedPanelPassword = password;
-	},
-	async verifyApiAuth(request, env) {
-		// --- جدید: راه دوم ورود، مخصوص پنل مادر ---
-		const masterKeyHeader = request.headers.get("X-Master-Key");
-		if (masterKeyHeader) {
-			const path = new URL(request.url).pathname;
-			if (MASTER_KEY_BLOCKED_PATHS.includes(path)) return false; // این مسیرها با کلید مادر مجاز نیستن
-			const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'master_api_key'").first();
-			return !!(row && row.value && masterKeyHeader === row.value);
-		}
-		// --- قبلی: چک کوکی، بدون تغییر ---
-		const storedPasswordHash = await this.getPanelPassword(env.DB);
-		if (!storedPasswordHash) return true;
-		const cookies = request.headers.get("Cookie") || "";
-		const sessionCookie = cookies.split(";").find((c) => c.trim().startsWith("panel_session="));
-		if (!sessionCookie) return false;
-		const sessionToken = sessionCookie.split("=")[1].trim();
-		return sessionToken === storedPasswordHash;
-	},
-	async sha256(message) {
-		const msgBuffer = new TextEncoder().encode(message);
-		const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
-		const hashArray = Array.from(new Uint8Array(hashBuffer));
-		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-	},
-	async oldSha256(message) {
-		const msgBuffer = new TextEncoder().encode(message);
-		const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
-		const hashArray = Array.from(new Uint8Array(hashBuffer));
-		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-	},
+  async ensureSchema(db) {
+    if (schemaEnsured) return;
+    if (schemaPromise) {
+      await schemaPromise;
+      return;
+    }
+    schemaPromise = (async () => {
+      try {
+        await db.prepare(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, uuid TEXT, limit_gb REAL, expiry_days INTEGER, ips TEXT, connection_type TEXT, tls TEXT, port INTEGER, used_gb REAL DEFAULT 0, is_active INTEGER DEFAULT 1, last_active INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`).run();
+      } catch (e) {
+      }
+      try {
+        await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run();
+      } catch (e) {
+      }
+      try {
+        await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_clean_ip', ?)").bind(DEFAULT_GLOBAL_CLEAN_IP_FALLBACK).run();
+        await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('other_clean_ips', ?)").bind(DEFAULT_OTHER_CLEAN_IPS_FALLBACK.join("\n")).run();
+        await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('inline_proxy_ip', ?)").bind(DEFAULT_INLINE_PROXY_IP_FALLBACK).run();
+        await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_port', ?)").bind(DEFAULT_PORT_FALLBACK).run();
+        await db.batch(Object.entries(NEW_USER_DEFAULTS_FALLBACK).map(([k, v]) => db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").bind(k, v)));
+      } catch (e) {
+      }
+      try {
+        await db.prepare("CREATE TABLE IF NOT EXISTS daily_traffic (date TEXT PRIMARY KEY, gb REAL DEFAULT 0)").run();
+      } catch (e) {
+      }
+      try {
+        await db.prepare("CREATE TABLE IF NOT EXISTS daily_requests (date TEXT PRIMARY KEY, count INTEGER DEFAULT 0)").run();
+      } catch (e) {
+      }
+      try {
+        await db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_uuid ON users(uuid)").run();
+      } catch (e) {
+        try {
+          await db.prepare("CREATE INDEX IF NOT EXISTS idx_users_uuid ON users(uuid)").run();
+        } catch (e2) {
+        }
+      }
+      try {
+        const { results } = await db.prepare("PRAGMA table_info(users)").all();
+        const existingCols = new Set((results || []).map((r) => r.name));
+        const colsToAdd = [
+          { name: "advanced_frag", def: "TEXT DEFAULT NULL" },
+          { name: "cipher_suites", def: "TEXT DEFAULT NULL" },
+          { name: "tls_mask", def: "TEXT DEFAULT NULL" },
+          { name: "is_active", def: "INTEGER DEFAULT 1" },
+          { name: "last_active", def: "INTEGER" },
+          { name: "fingerprint", def: "TEXT DEFAULT 'chrome'" },
+          { name: "max_connections", def: "INTEGER" },
+          { name: "limit_req", def: "INTEGER" },
+          { name: "used_req", def: "INTEGER DEFAULT 0" },
+          { name: "ip_limit", def: "INTEGER DEFAULT NULL" },
+          { name: "active_ips", def: "TEXT DEFAULT NULL" },
+          { name: "block_porn", def: "INTEGER DEFAULT 0" },
+          { name: "block_ads", def: "INTEGER DEFAULT 0" },
+          { name: "frag_len", def: "TEXT DEFAULT '200-3000'" },
+          { name: "frag_int", def: "TEXT DEFAULT '1-2'" },
+          { name: "lifetime_used_gb", def: "REAL DEFAULT 0" },
+          { name: "user_proxy_ip", def: "TEXT DEFAULT NULL" },
+          { name: "user_proxy_iata", def: "TEXT DEFAULT NULL" },
+          { name: "user_socks5", def: "TEXT DEFAULT NULL" },
+          { name: "auto_reset_vol_days", def: "INTEGER DEFAULT 0" },
+          { name: "auto_reset_req_days", def: "INTEGER DEFAULT 0" },
+          { name: "last_reset_vol_time", def: "INTEGER DEFAULT 0" },
+          { name: "last_reset_req_time", def: "INTEGER DEFAULT 0" },
+          { name: "auto_rotate_ip", def: "INTEGER DEFAULT 1" },
+          { name: "rotate_time", def: "INTEGER DEFAULT 0" },
+          { name: "ip_operator", def: "TEXT DEFAULT 'all'" },
+          { name: "ip_count", def: "INTEGER DEFAULT 999999" },
+          { name: "last_rotate_time", def: "INTEGER DEFAULT 0" },
+          { name: "auto_rotate_user_proxy", def: "INTEGER DEFAULT 0" },
+          { name: "start_on_first_connect", def: "INTEGER DEFAULT 0" },
+          { name: "first_connection_time", def: "INTEGER DEFAULT NULL" },
+          { name: "trojan_hash", def: "TEXT DEFAULT NULL" },
+          { name: "enable_direct", def: "INTEGER DEFAULT 1" },
+          { name: "proxy_rotate_cooldowns", def: "TEXT DEFAULT '{}'" },
+          { name: "device_warning_at", def: "INTEGER DEFAULT NULL" },
+          { name: "device_warning_peak_count", def: "INTEGER DEFAULT NULL" },
+          { name: "device_warning_streak", def: "INTEGER DEFAULT 0" },
+          // Early Data: ستون‌های خام کاربر؛ با DEFAULT ساخته می‌شن تا کاربرهای موجود هم
+          // early_data_enabled=0 داشته باشن (نه NULL) و user.early_data_enabled بدون fallback جدا کار کنه.
+          { name: "early_data_enabled", def: "INTEGER DEFAULT 0" },
+          { name: "early_data_size", def: "INTEGER DEFAULT 2560" }
+        ];
+        const stmts = [];
+        for (const col of colsToAdd) {
+          if (!existingCols.has(col.name)) {
+            stmts.push(db.prepare(`ALTER TABLE users ADD COLUMN ${col.name} ${col.def}`));
+          }
+        }
+        if (stmts.length > 0) {
+          await db.batch(stmts);
+        }
+      } catch (e) {
+      }
+      try {
+        await db.prepare("UPDATE users SET ip_limit = max_connections WHERE ip_limit IS NULL AND max_connections IS NOT NULL").run();
+      } catch (e) {
+      }
+      try {
+        const migRow = await db.prepare("SELECT value FROM settings WHERE key = 'migrated_lifetime_used_gb'").first();
+        if (!migRow) {
+          await db.prepare("UPDATE users SET lifetime_used_gb = used_gb WHERE lifetime_used_gb = 0 OR lifetime_used_gb IS NULL").run();
+          await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('migrated_lifetime_used_gb', '1')").run();
+        }
+      } catch (e) {
+      }
+    })();
+    await schemaPromise;
+    schemaEnsured = true;
+  },
+  async getPanelPassword(db, forceRefresh = true) {
+    try {
+      const row = await db.prepare("SELECT value FROM settings WHERE key = 'panel_password'").first();
+      cachedPanelPassword = row && row.value ? row.value : null;
+      return cachedPanelPassword;
+    } catch (e) {
+      return null;
+    }
+  },
+  async setPanelPassword(db, password) {
+    await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_password', ?)").bind(password).run();
+    cachedPanelPassword = password;
+  },
+  async verifyApiAuth(request2, env) {
+    const masterKeyHeader = request2.headers.get("X-Master-Key");
+    if (masterKeyHeader) {
+      const path = new URL(request2.url).pathname;
+      if (MASTER_KEY_BLOCKED_PATHS.includes(path)) return false;
+      const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'master_api_key'").first();
+      return !!(row && row.value && masterKeyHeader === row.value);
+    }
+    const storedPasswordHash = await this.getPanelPassword(env.DB);
+    if (!storedPasswordHash) return true;
+    const cookies = request2.headers.get("Cookie") || "";
+    const sessionCookie = cookies.split(";").find((c) => c.trim().startsWith("panel_session="));
+    if (!sessionCookie) return false;
+    const sessionToken = sessionCookie.split("=")[1].trim();
+    return sessionToken === storedPasswordHash;
+  },
+  async sha256(message) {
+    const msgBuffer = new TextEncoder().encode(message);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  },
+  async oldSha256(message) {
+    const msgBuffer = new TextEncoder().encode(message);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
 };
-// Fix (device-counter bug): user rows served from the 10s auth cache (getCachedAuthUser)
-// carry a possibly-stale `active_ips`. Writing that stale snapshot back to D1 on every new
-// connection / heartbeat tick could silently erase other devices' entries when several
-// connections for the same account land within the same 10s window (last write wins).
-//
-// Fix, scoped to stay cheap: only at the moment we were ALREADY about to write (the caller
-// still does its own isNewIp / 15-min throttling on the cached copy - unchanged, and cheap),
-// re-read just the `active_ips` column fresh from D1, merge this one IP onto THAT copy, and
-// write the merge back. This keeps the extra D1 read bound to the existing write frequency
-// instead of every connection/heartbeat. A per-username promise-chain lock serializes this
-// within the same isolate so two near-simultaneous writes for the same user can't still race
-// each other on the read step.
-//
-// «تأخیر هشدار تعداد دستگاه» (device_warning_at delay/streak - نگاه کنید DEVICE_WARNING_CONFIRM_STREAK
-// بالای فایل): به‌جای ثبتِ فوریِ هشدار همون اولین باری که activeDeviceCount از آستانه رد
-// می‌شه، device_warning_at فقط وقتی واقعاً ست می‌شه که این تعداد بار پشت‌سرهم عبور از
-// آستانه دیده شده باشه. persistActiveIp (رفرش IP از قبل تأییدشده) و confirmActiveIp (تأیید
-// IP تازه) هر دو از همین یه تابع استفاده می‌کنن تا این حساب یه‌جا بمونه و دوبار نوشته نشه.
 function evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now) {
-	const overThreshold = !!(warnThreshold && warnThreshold > 0 && activeDeviceCount > warnThreshold);
-	// برگشتن به زیر آستانه (حتی یه بار) شمارش رو صفر می‌کنه - یعنی نوسانِ کوتاه دور
-	// آستانه هیچ‌وقت به تنهایی هشدار نمی‌سازه، باید واقعاً پشت‌سرهم بمونه.
-	const newStreak = overThreshold ? (prevStreak || 0) + 1 : 0;
-	const shouldWarn = newStreak >= DEVICE_WARNING_CONFIRM_STREAK;
-	// «بیشترین تعداد دستگاه» (device_warning_peak_count): همون منطق قبلی، دست‌نخورده -
-	// فقط وقتی چرخه‌ی هشدارِ قبلی هنوز منقضی نشده (کمتر از ۲۴ ساعت) بیشینه نگه داشته
-	// می‌شه؛ وگرنه یه چرخه‌ی تازه از همین عدد فعلی شروع می‌شه.
-	const warningStillFresh = !!(prevWarningAt && now - prevWarningAt < 24 * 60 * 60 * 1000);
-	const newPeakCount = warningStillFresh ? Math.max(prevPeakCount || 0, activeDeviceCount) : activeDeviceCount;
-	return { shouldWarn, newStreak, newPeakCount };
+  const overThreshold = !!(warnThreshold && warnThreshold > 0 && activeDeviceCount > warnThreshold);
+  const newStreak = overThreshold ? (prevStreak || 0) + 1 : 0;
+  const shouldWarn = newStreak >= DEVICE_WARNING_CONFIRM_STREAK;
+  const warningStillFresh = !!(prevWarningAt && now - prevWarningAt < 24 * 60 * 60 * 1e3);
+  const newPeakCount = warningStillFresh ? Math.max(prevPeakCount || 0, activeDeviceCount) : activeDeviceCount;
+  return { shouldWarn, newStreak, newPeakCount };
 }
 async function persistActiveIp(env, ctx, uuid, username, clientIP, now) {
-	const run = async () => {
-		let freshIps = {};
-		let warnThreshold = DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
-		let prevWarningAt = null;
-		let prevPeakCount = null;
-		let prevStreak = 0;
-		try {
-			// آستانه‌ی سراسری «هشدار تعداد دستگاه» (settings.device_warning_threshold) با همون کوئری
-			// ردیف کاربر و به‌صورت subselect خونده می‌شه - بدون رفت‌وبرگشت اضافه‌ی D1.
-			const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, device_warning_streak, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
-			freshIps = JSON.parse((row && row.active_ips) || "{}");
-			warnThreshold = parseDeviceWarningThreshold(row ? row.dw_threshold : null);
-			prevWarningAt = row ? row.device_warning_at : null;
-			prevPeakCount = row ? row.device_warning_peak_count : null;
-			prevStreak = (row && row.device_warning_streak) || 0;
-		} catch (e) { }
-		for (const [ip, data] of Object.entries(freshIps)) {
-			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-			const lastSeenNum = typeof lastSeen === "number" ? lastSeen : Number(lastSeen);
-			// مقدار خراب/غیرعددی (undefined، null، رشته‌ی نامعتبر) هم «کهنه» حساب می‌شه: قبلاً
-			// now - lastSeen برای این‌ها NaN می‌شد، مقایسه false برمی‌گشت و اون IP هیچ‌وقت
-			// prune نمی‌شد - یعنی برای همیشه توی شمارنده‌ی دستگاه‌های آنلاین می‌موند.
-			if (ip !== clientIP && (!isFinite(lastSeenNum) || now - lastSeenNum > 180000)) delete freshIps[ip];
-		}
-		if (freshIps[clientIP] && typeof freshIps[clientIP] === "object") {
-			freshIps[clientIP].timestamp = now;
-			freshIps[clientIP].count = (freshIps[clientIP].count || 0) + 1;
-		} else {
-			freshIps[clientIP] = { timestamp: now, count: 1 };
-		}
-		// «هشدار تعداد دستگاه» (admin-facing only - NOT enforcement, enforcement moved to
-		// confirmActiveIp() - نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): همین‌جا، دقیقاً
-		// روی همون snapshot تازه‌ای که بالا merge شد (نه یک کپی جدا)، evaluateDeviceWarning
-		// تصمیم می‌گیره که آیا device_warning_at واقعاً ست بشه یا فقط شمارش (streak) جلو بره.
-		const activeDeviceCount = Object.keys(freshIps).length;
-		const { shouldWarn, newStreak, newPeakCount } = evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now);
-		try {
-			if (shouldWarn) {
-				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, newStreak, uuid).run();
-			} else {
-				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, newStreak, uuid).run();
-			}
-		} catch (e) { }
-	};
-	const prior = GLOBAL_ACTIVE_IPS_WRITE_LOCK.get(username) || Promise.resolve();
-	const chained = prior.then(run, run);
-	GLOBAL_ACTIVE_IPS_WRITE_LOCK.set(username, chained);
-	if (ctx) ctx.waitUntil(chained);
-	else await chained;
+  const run = async () => {
+    let freshIps = {};
+    let warnThreshold = DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+    let prevWarningAt = null;
+    let prevPeakCount = null;
+    let prevStreak = 0;
+    try {
+      const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, device_warning_streak, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
+      freshIps = JSON.parse(row && row.active_ips || "{}");
+      warnThreshold = parseDeviceWarningThreshold(row ? row.dw_threshold : null);
+      prevWarningAt = row ? row.device_warning_at : null;
+      prevPeakCount = row ? row.device_warning_peak_count : null;
+      prevStreak = row && row.device_warning_streak || 0;
+    } catch (e) {
+    }
+    for (const [ip, data] of Object.entries(freshIps)) {
+      const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+      const lastSeenNum = typeof lastSeen === "number" ? lastSeen : Number(lastSeen);
+      if (ip !== clientIP && (!isFinite(lastSeenNum) || now - lastSeenNum > 18e4)) delete freshIps[ip];
+    }
+    if (freshIps[clientIP] && typeof freshIps[clientIP] === "object") {
+      freshIps[clientIP].timestamp = now;
+      freshIps[clientIP].count = (freshIps[clientIP].count || 0) + 1;
+    } else {
+      freshIps[clientIP] = { timestamp: now, count: 1 };
+    }
+    const activeDeviceCount = Object.keys(freshIps).length;
+    const { shouldWarn, newStreak, newPeakCount } = evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now);
+    try {
+      if (shouldWarn) {
+        await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, newStreak, uuid).run();
+      } else {
+        await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, newStreak, uuid).run();
+      }
+    } catch (e) {
+    }
+  };
+  const prior = GLOBAL_ACTIVE_IPS_WRITE_LOCK.get(username) || Promise.resolve();
+  const chained = prior.then(run, run);
+  GLOBAL_ACTIVE_IPS_WRITE_LOCK.set(username, chained);
+  if (ctx) ctx.waitUntil(chained);
+  else await chained;
 }
-// «تأیید دستگاه» (confirmActiveIp) - طبق سیاستِ «دیده‌شده/تأییدشده» (نگاه کنید توضیح
-// DEVICE_CONFIRM_* بالای فایل)، این تنها جاییه که یک IPِ *تازه* واقعاً «تأییدشده» می‌شه:
-// توی active_ips نوشته می‌شه، جزو تعداد دستگاه‌ها حساب می‌شه، و به سقف «محدودیت
-// کاربر»/ip_limit می‌خوره - این سقف هم از همین نسخه به بعد فقط همین‌جا (لحظه‌ی تأیید)
-// چک می‌شه، نه موقع هندشیک اولیه‌ی اتصال. فقط از checkDeviceConfirmation() توی
-// handlevIees صدا زده می‌شه، وقتی شرطِ «اتصال پایدار» یا «اتصال‌های کوتاهِ زیاد» رد شده
-// باشه. با persistActiveIp() روی همون قفلِ per-username (GLOBAL_ACTIVE_IPS_WRITE_LOCK)
-// مشترکه تا این دوتا هیچ‌وقت رو نوشتنِ همدیگه روی ستون active_ips مسابقه ندن. خروجی:
-// true = تأیید شد/جا بود، false = سقف پر بود (تماس‌گیرنده باید همین اتصال رو ببنده).
 async function confirmActiveIp(env, ctx, uuid, username, clientIP, now) {
-	let admitted = true;
-	const run = async () => {
-		let freshIps = {};
-		let warnThreshold = DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
-		let prevWarningAt = null;
-		let prevPeakCount = null;
-		let prevStreak = 0;
-		let ipLimit = null;
-		try {
-			const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, device_warning_streak, ip_limit, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
-			freshIps = JSON.parse((row && row.active_ips) || "{}");
-			warnThreshold = parseDeviceWarningThreshold(row ? row.dw_threshold : null);
-			prevWarningAt = row ? row.device_warning_at : null;
-			prevPeakCount = row ? row.device_warning_peak_count : null;
-			prevStreak = (row && row.device_warning_streak) || 0;
-			ipLimit = row ? row.ip_limit : null;
-		} catch (e) { }
-		for (const [ip, data] of Object.entries(freshIps)) {
-			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-			const lastSeenNum = typeof lastSeen === "number" ? lastSeen : Number(lastSeen);
-			if (ip !== clientIP && (!isFinite(lastSeenNum) || now - lastSeenNum > 180000)) delete freshIps[ip];
-		}
-		if (!freshIps[clientIP]) {
-			// «سقف در لحظه‌ی تأیید، نه هندشیک»: دقیقاً همون مقایسه‌ای که قبلاً موقع هندشیک
-			// انجام می‌شد (>= ip_limit یعنی جا نیست)، فقط حالا اینجا و روی دیتای تازه.
-			const confirmedCount = Object.keys(freshIps).length;
-			if (ipLimit && ipLimit > 0 && confirmedCount >= ipLimit) {
-				admitted = false;
-				return;
-			}
-			freshIps[clientIP] = { timestamp: now, count: 1 };
-		} else {
-			// یه اتصال دیگه از همین (کاربر, IP) زودتر (مثلاً هم‌زمان) تأیید کرده بوده - فقط رفرش.
-			if (typeof freshIps[clientIP] === "object") {
-				freshIps[clientIP].timestamp = now;
-				freshIps[clientIP].count = (freshIps[clientIP].count || 0) + 1;
-			} else {
-				freshIps[clientIP] = { timestamp: now, count: 1 };
-			}
-		}
-		const activeDeviceCount = Object.keys(freshIps).length;
-		const { shouldWarn, newStreak, newPeakCount } = evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now);
-		try {
-			if (shouldWarn) {
-				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, newStreak, uuid).run();
-			} else {
-				await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, newStreak, uuid).run();
-			}
-		} catch (e) { }
-	};
-	const prior = GLOBAL_ACTIVE_IPS_WRITE_LOCK.get(username) || Promise.resolve();
-	const chained = prior.then(run, run);
-	GLOBAL_ACTIVE_IPS_WRITE_LOCK.set(username, chained);
-	if (ctx) ctx.waitUntil(chained);
-	await chained;
-	return admitted;
+  let admitted = true;
+  const run = async () => {
+    let freshIps = {};
+    let warnThreshold = DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+    let prevWarningAt = null;
+    let prevPeakCount = null;
+    let prevStreak = 0;
+    let ipLimit = null;
+    try {
+      const row = await env.DB.prepare("SELECT active_ips, device_warning_at, device_warning_peak_count, device_warning_streak, ip_limit, (SELECT value FROM settings WHERE key = 'device_warning_threshold') AS dw_threshold FROM users WHERE uuid = ?").bind(uuid).first();
+      freshIps = JSON.parse(row && row.active_ips || "{}");
+      warnThreshold = parseDeviceWarningThreshold(row ? row.dw_threshold : null);
+      prevWarningAt = row ? row.device_warning_at : null;
+      prevPeakCount = row ? row.device_warning_peak_count : null;
+      prevStreak = row && row.device_warning_streak || 0;
+      ipLimit = row ? row.ip_limit : null;
+    } catch (e) {
+    }
+    for (const [ip, data] of Object.entries(freshIps)) {
+      const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+      const lastSeenNum = typeof lastSeen === "number" ? lastSeen : Number(lastSeen);
+      if (ip !== clientIP && (!isFinite(lastSeenNum) || now - lastSeenNum > 18e4)) delete freshIps[ip];
+    }
+    if (!freshIps[clientIP]) {
+      const confirmedCount = Object.keys(freshIps).length;
+      if (ipLimit && ipLimit > 0 && confirmedCount >= ipLimit) {
+        admitted = false;
+        return;
+      }
+      freshIps[clientIP] = { timestamp: now, count: 1 };
+    } else {
+      if (typeof freshIps[clientIP] === "object") {
+        freshIps[clientIP].timestamp = now;
+        freshIps[clientIP].count = (freshIps[clientIP].count || 0) + 1;
+      } else {
+        freshIps[clientIP] = { timestamp: now, count: 1 };
+      }
+    }
+    const activeDeviceCount = Object.keys(freshIps).length;
+    const { shouldWarn, newStreak, newPeakCount } = evaluateDeviceWarning(activeDeviceCount, warnThreshold, prevStreak, prevWarningAt, prevPeakCount, now);
+    try {
+      if (shouldWarn) {
+        await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_at = ?, device_warning_peak_count = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, now, newPeakCount, newStreak, uuid).run();
+      } else {
+        await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ?, device_warning_streak = ? WHERE uuid = ?").bind(JSON.stringify(freshIps), now, newStreak, uuid).run();
+      }
+    } catch (e) {
+    }
+  };
+  const prior = GLOBAL_ACTIVE_IPS_WRITE_LOCK.get(username) || Promise.resolve();
+  const chained = prior.then(run, run);
+  GLOBAL_ACTIVE_IPS_WRITE_LOCK.set(username, chained);
+  if (ctx) ctx.waitUntil(chained);
+  await chained;
+  return admitted;
 }
-// «دیده‌شده/تأییدشده» - کمک‌تابع‌های DEVICE_CONFIRM_BURST_* (شرط «اتصال‌های کوتاهِ زیاد»):
-// recordBurstBytes روی هر addBytes صدا زده می‌شه (فقط تا وقتی همون اتصال تأیید نشده)،
-// getBurstBytes فقط می‌خونه (از checkDeviceConfirmation/هیت‌بیت). کلید همیشه
-// `${username}|${clientIP}` است - نگاه کنید توضیح IP_BURST_BYTES بالای فایل.
 function recordBurstBytes(key, bytes, now) {
-	let entry = IP_BURST_BYTES.get(key);
-	if (!entry || now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) {
-		entry = { bytes: 0, windowStart: now };
-	}
-	entry.bytes += bytes;
-	IP_BURST_BYTES.set(key, entry);
+  let entry = IP_BURST_BYTES.get(key);
+  if (!entry || now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) {
+    entry = { bytes: 0, windowStart: now };
+  }
+  entry.bytes += bytes;
+  IP_BURST_BYTES.set(key, entry);
 }
 function getBurstBytes(key, now) {
-	const entry = IP_BURST_BYTES.get(key);
-	if (!entry || now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) return 0;
-	return entry.bytes;
+  const entry = IP_BURST_BYTES.get(key);
+  if (!entry || now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) return 0;
+  return entry.bytes;
 }
 function getActiveIpCount(activeIpsJson) {
-	if (!activeIpsJson) return 0;
-	try {
-		const activeIps = JSON.parse(activeIpsJson);
-		const now = Date.now();
-		let count = 0;
-		for (const [ip, data] of Object.entries(activeIps)) {
-			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-			if (now - lastSeen <= 180000) {
-				count++;
-			}
-		}
-		return count;
-	} catch (e) {
-		return 0;
-	}
+  if (!activeIpsJson) return 0;
+  try {
+    const activeIps = JSON.parse(activeIpsJson);
+    const now = Date.now();
+    let count = 0;
+    for (const [ip, data] of Object.entries(activeIps)) {
+      const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+      if (now - lastSeen <= 18e4) {
+        count++;
+      }
+    }
+    return count;
+  } catch (e) {
+    return 0;
+  }
 }
-// Builds the optional trailing path segment consumed by decodeInlinePanelIPs()
-// (see the "inline ProxyIP" fallback feature above), from the admin-configured
-// "Proxy IP" panel setting. Only ever appended where a config link would
-// otherwise use the bare rawPath (no per-user location suffix) - see call sites.
 function generateInlineProxyJunk(len = 10) {
-	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-	let out = "";
-	for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
-	return out;
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let out = "";
+  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
 }
 function buildInlineProxyIpSegment(ip) {
-	if (!ip || typeof ip !== "string" || !ip.trim()) return "";
-	try {
-		const payload = { junk: generateInlineProxyJunk(10), protocol: "vl", mode: "proxyip", panelIPs: [ip.trim()] };
-		return "/" + btoa(JSON.stringify(payload)).replace(/\+/g, "-").replace(/\//g, "_");
-	} catch (e) {
-		return "";
-	}
+  if (!ip || typeof ip !== "string" || !ip.trim()) return "";
+  try {
+    const payload = { junk: generateInlineProxyJunk(10), protocol: "vl", mode: "proxyip", panelIPs: [ip.trim()] };
+    return "/" + btoa(JSON.stringify(payload)).replace(/\+/g, "-").replace(/\//g, "_");
+  } catch (e) {
+    return "";
+  }
 }
-// «Proxy IP» (inline_proxy_ip) و «آیپی‌های تمیز دیگر» (other_clean_ips) همیشه با هم و در
-// همون یک درخواست لازم می‌شن (ساب متنی، ساب Singbox، و رندر صفحه‌ی status). قبلاً هرکدوم
-// یک SELECT جدا بودن، یعنی دو رفت‌وبرگشت D1 روی هر فچ ساب؛ حالا هر دو کلید با یک کوئری
-// IN (...) خونده می‌شن - همون الگوی isGlobalReqLimitReached و GET /api/users.
-// فالبک‌ها عیناً همون رفتار قبلیِ دو getter جدا هستن: «کلید اصلاً ذخیره نشده» (نصب تازه)
-// فالبک می‌گیره، ولی «کلیدِ ذخیره‌شده‌ی خالی» عمداً خالی می‌مونه و فیچر خاموش می‌شه -
-// به همین خاطر نبودِ ردیف با مقدارِ خالی تفکیک می‌شه، نه فقط falsy بودن مقدار.
 async function getSubscriptionIpSettings(env) {
-	const fallback = { inlineProxyIp: DEFAULT_INLINE_PROXY_IP_FALLBACK, otherCleanIps: DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice() };
-	if (!env || !env.DB) return fallback;
-	try {
-		const res = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('inline_proxy_ip','other_clean_ips')").all();
-		const map = {};
-		(res.results || []).forEach((r) => { map[r.key] = r.value; });
-		const hasInline = Object.prototype.hasOwnProperty.call(map, "inline_proxy_ip");
-		const hasOther = Object.prototype.hasOwnProperty.call(map, "other_clean_ips");
-		return {
-			inlineProxyIp: !hasInline ? DEFAULT_INLINE_PROXY_IP_FALLBACK : (map.inline_proxy_ip ? String(map.inline_proxy_ip).trim() : ""),
-			otherCleanIps: !hasOther
-				? DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice()
-				: !map.other_clean_ips
-					? []
-					: String(map.other_clean_ips).split("\n").map((ip) => ip.trim()).filter((ip) => ip.length > 0),
-		};
-	} catch (e) {
-		return fallback;
-	}
+  const fallback = { inlineProxyIp: DEFAULT_INLINE_PROXY_IP_FALLBACK, otherCleanIps: DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice() };
+  if (!env || !env.DB) return fallback;
+  try {
+    const res = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('inline_proxy_ip','other_clean_ips')").all();
+    const map = {};
+    (res.results || []).forEach((r) => {
+      map[r.key] = r.value;
+    });
+    const hasInline = Object.prototype.hasOwnProperty.call(map, "inline_proxy_ip");
+    const hasOther = Object.prototype.hasOwnProperty.call(map, "other_clean_ips");
+    return {
+      inlineProxyIp: !hasInline ? DEFAULT_INLINE_PROXY_IP_FALLBACK : map.inline_proxy_ip ? String(map.inline_proxy_ip).trim() : "",
+      otherCleanIps: !hasOther ? DEFAULT_OTHER_CLEAN_IPS_FALLBACK.slice() : !map.other_clean_ips ? [] : String(map.other_clean_ips).split("\n").map((ip) => ip.trim()).filter((ip) => ip.length > 0)
+    };
+  } catch (e) {
+    return fallback;
+  }
 }
-// Extra always-on clean-IP addresses ("آیپی های تمیز دیگر" panel setting).
-// One extra VLESS/Trojan config per entry is appended to every user's
-// configs, addressed at that IP, using the same Path as the admin-configured
-// "Proxy IP" inline segment (see buildInlineProxyIpSegment above), and
-// named with a German flag + zero-padded index (see call sites).
-// Reads the admin-editable pinned-locations list from the settings table
-// (see the "لوکیشن‌ها" section of the settings modal / saveLocations() on
-// the client side). Falls back to PINNED_DEFAULT_LOCATIONS_FALLBACK ONLY if the
-// setting was never saved (no row / empty string) or is malformed (not valid
-// JSON, or not an array) - so a fresh install (or a corrupted value) never
-// breaks user provisioning.
-// An EXPLICITLY saved empty list ("[]", i.e. the admin removed every pinned
-// country) is respected and returned as [] - it is NOT turned back into the
-// 15-country default. (Before, an empty list silently came back as the
-// defaults, so "remove all countries" never actually removed anything: the
-// "which countries were un-pinned" comparison saw the defaults on both sides.)
-// Only valid ISO 3166-1 alpha-2 codes are kept; duplicates are dropped,
-// order is preserved (this order becomes loc-0..loc-N for new users).
 async function getPinnedLocationsSetting(env) {
-	if (!env || !env.DB) return PINNED_DEFAULT_LOCATIONS_FALLBACK;
-	try {
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'pinned_locations'").first();
-		if (!row || !row.value) return PINNED_DEFAULT_LOCATIONS_FALLBACK;
-		const parsed = JSON.parse(row.value);
-		if (!Array.isArray(parsed)) return PINNED_DEFAULT_LOCATIONS_FALLBACK;
-		const cleaned = [];
-		for (const raw of parsed) {
-			if (typeof raw !== "string") continue;
-			const cc = raw.trim().toUpperCase();
-			if (cc && ISO_ALPHA3_MAP[cc] && !cleaned.includes(cc)) cleaned.push(cc);
-		}
-		return cleaned;
-	} catch (e) {
-		return PINNED_DEFAULT_LOCATIONS_FALLBACK;
-	}
+  if (!env || !env.DB) return PINNED_DEFAULT_LOCATIONS_FALLBACK;
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'pinned_locations'").first();
+    if (!row || !row.value) return PINNED_DEFAULT_LOCATIONS_FALLBACK;
+    const parsed = JSON.parse(row.value);
+    if (!Array.isArray(parsed)) return PINNED_DEFAULT_LOCATIONS_FALLBACK;
+    const cleaned = [];
+    for (const raw of parsed) {
+      if (typeof raw !== "string") continue;
+      const cc = raw.trim().toUpperCase();
+      if (cc && ISO_ALPHA3_MAP[cc] && !cleaned.includes(cc)) cleaned.push(cc);
+    }
+    return cleaned;
+  } catch (e) {
+    return PINNED_DEFAULT_LOCATIONS_FALLBACK;
+  }
 }
-// Reads the admin-editable «محدودیت کاربر» (user limit) global from settings (key
-// 'user_limit'). Used as the value auto-filled into a brand-new user's ip_limit and
-// max_connections columns at creation time when the request didn't carry one (see the
-// POST /api/users handler). The same setting is also written onto every EXISTING user by
-// POST /api/settings/bulk. Falls back to DEFAULT_USER_LIMIT_FALLBACK if never configured
-// (fresh install) or malformed; an explicitly-saved 0 is respected as-is (0 = no limit,
-// exactly like an empty per-user field).
 async function getUserLimitSetting(env) {
-	if (!env || !env.DB) return DEFAULT_USER_LIMIT_FALLBACK;
-	try {
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'user_limit'").first();
-		if (!row || row.value === null || row.value === undefined || String(row.value).trim() === "") return DEFAULT_USER_LIMIT_FALLBACK;
-		const parsed = parseInt(row.value);
-		return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_USER_LIMIT_FALLBACK;
-	} catch (e) {
-		return DEFAULT_USER_LIMIT_FALLBACK;
-	}
+  if (!env || !env.DB) return DEFAULT_USER_LIMIT_FALLBACK;
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'user_limit'").first();
+    if (!row || row.value === null || row.value === void 0 || String(row.value).trim() === "") return DEFAULT_USER_LIMIT_FALLBACK;
+    const parsed = parseInt(row.value);
+    return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_USER_LIMIT_FALLBACK;
+  } catch (e) {
+    return DEFAULT_USER_LIMIT_FALLBACK;
+  }
 }
-// Parses the raw value of the admin-editable «هشدار تعداد دستگاه» (device-count warning)
-// global threshold (settings key 'device_warning_threshold') - persistActiveIp reads it
-// together with the user row in one query and passes the raw text here. Missing/empty/
-// malformed => DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK; an explicitly-saved 0 is respected
-// (0 = the warning is off, since persistActiveIp skips the exceeded-check for a falsy value).
 function parseDeviceWarningThreshold(raw) {
-	if (raw === null || raw === undefined || String(raw).trim() === "") return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
-	const parsed = parseInt(raw);
-	return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+  if (raw === null || raw === void 0 || String(raw).trim() === "") return DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
+  const parsed = parseInt(raw);
+  return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_DEVICE_WARNING_THRESHOLD_FALLBACK;
 }
-// Reads the admin-editable «پورت» global default from settings (key
-// 'default_port'). Used only to pre-fill a brand-new user's `port` column at
-// creation time when the request didn't explicitly include one (see POST
-// /api/users) - the *existing*-user override on save is handled separately
-// in POST /api/settings/bulk. Falls back to DEFAULT_PORT_FALLBACK if never
-// configured or malformed/empty.
 async function getDefaultPortSetting(env) {
-	if (!env || !env.DB) return DEFAULT_PORT_FALLBACK;
-	try {
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'default_port'").first();
-		if (!row || row.value === null || row.value === undefined || String(row.value).trim() === "") return DEFAULT_PORT_FALLBACK;
-		return String(row.value).trim();
-	} catch (e) {
-		return DEFAULT_PORT_FALLBACK;
-	}
+  if (!env || !env.DB) return DEFAULT_PORT_FALLBACK;
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'default_port'").first();
+    if (!row || row.value === null || row.value === void 0 || String(row.value).trim() === "") return DEFAULT_PORT_FALLBACK;
+    return String(row.value).trim();
+  } catch (e) {
+    return DEFAULT_PORT_FALLBACK;
+  }
 }
-// «پیش‌فرض‌های کاربر جدید»: همه‌ی کلیدهای new_user_* (+ global_clean_ip برای ستون
-// ips) در یک کوئری. برای هر کلیدی که نبود/خالی بود (به‌جز frag_len/frag_int که
-// خالی معنی‌دار دارد) مقدار NEW_USER_DEFAULTS_FALLBACK برمی‌گردد. فقط وقتی
-// global_clean_ip اصلاً در settings نیست، DEFAULT_GLOBAL_CLEAN_IP_FALLBACK؛ اگر
-// ادمین عمداً خالی ذخیره کرده باشد همان خالی رعایت می‌شود.
 async function getNewUserDefaults(env) {
-	const out = Object.assign({}, NEW_USER_DEFAULTS_FALLBACK, { global_clean_ip: DEFAULT_GLOBAL_CLEAN_IP_FALLBACK });
-	if (!env || !env.DB) return out;
-	try {
-		const { results } = await env.DB.prepare("SELECT key, value FROM settings WHERE key LIKE 'new_user_%' OR key = 'global_clean_ip'").all();
-		(results || []).forEach((r) => {
-			if (r.value === null || r.value === undefined) return;
-			const v = String(r.value);
-			if (r.key === "global_clean_ip") { out.global_clean_ip = v; return; }
-			if (!Object.prototype.hasOwnProperty.call(NEW_USER_DEFAULTS_FALLBACK, r.key)) return;
-			if (v.trim() === "" && !NEW_USER_DEFAULTS_EMPTY_OK.includes(r.key)) return;
-			out[r.key] = v.trim();
-		});
-	} catch (e) { }
-	return out;
+  const out = Object.assign({}, NEW_USER_DEFAULTS_FALLBACK, { global_clean_ip: DEFAULT_GLOBAL_CLEAN_IP_FALLBACK });
+  if (!env || !env.DB) return out;
+  try {
+    const { results } = await env.DB.prepare("SELECT key, value FROM settings WHERE key LIKE 'new_user_%' OR key = 'global_clean_ip'").all();
+    (results || []).forEach((r) => {
+      if (r.value === null || r.value === void 0) return;
+      const v = String(r.value);
+      if (r.key === "global_clean_ip") {
+        out.global_clean_ip = v;
+        return;
+      }
+      if (!Object.prototype.hasOwnProperty.call(NEW_USER_DEFAULTS_FALLBACK, r.key)) return;
+      if (v.trim() === "" && !NEW_USER_DEFAULTS_EMPTY_OK.includes(r.key)) return;
+      out[r.key] = v.trim();
+    });
+  } catch (e) {
+  }
+  return out;
 }
 const SubscriptionService = {
-	async generateText(user, host, env) {
-		let ips = [host];
-		if (user.auto_rotate_ip === 1) {
-			const cachedIpsData = await getCachedIps();
-			const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
-			if (randomIps.length > 0) ips = randomIps;
-		}
-		if (ips.length === 1 && ips[0] === host && user.ips) {
-			const parsedIps = user.ips
-				.split("\n")
-				.map((ip) => ip.trim())
-				.filter((ip) => ip.length > 0);
-			if (parsedIps.length > 0) ips = parsedIps;
-		}
-		const ports = String(user.port || "443")
-			.split(",")
-			.map((p) => p.trim())
-			.filter((p) => p.length > 0);
-		const fp = user.fingerprint || "chrome";
-		const links = [];
-		let remVol = "Unlimited";
-		if (user.limit_gb) {
-			let liveUsedGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024));
-			let rem = user.limit_gb - liveUsedGb;
-			remVol = rem > 0 ? rem.toFixed(2) + "GB" : "0GB";
-		}
-		let remTime = "Unlimited";
-		if (user.expiry_days) {
-			if (user.start_on_first_connect === 1) {
-				if (user.first_connection_time) {
-					const expiryDate = new Date(user.first_connection_time + user.expiry_days * 86400000);
-					const diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / 86400000);
-					remTime = diffDays > 0 ? diffDays + "Days" : "0Days";
-				} else {
-					remTime = user.expiry_days + "Days (Not Started)";
-				}
-			} else if (user.created_at) {
-				const created = new Date(user.created_at);
-				const expiryDate = new Date(created.getTime() + user.expiry_days * 86400000);
-				const diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / 86400000);
-				remTime = diffDays > 0 ? diffDays + "Days" : "0Days";
-			}
-		}
-		let remReq = "Unlimited";
-		if (user.limit_req) {
-			let liveUsedReq = (user.used_req || 0) + (USER_REQ_CACHE.get(user.username) || 0);
-			let rem = user.limit_req - liveUsedReq;
-			remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
-		}
-		const rawPath = "/ZYX";
-		const subIpSettings = await getSubscriptionIpSettings(env);
-		const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
-		let proxyList = [];
-		try {
-			if (user.user_socks5 && user.user_socks5.trim().startsWith("[")) {
-				proxyList = JSON.parse(user.user_socks5);
-			} else if (user.user_socks5 || user.user_proxy_ip) {
-				proxyList = [user.user_socks5 || user.user_proxy_ip];
-			} else {
-				proxyList = [null];
-			}
-		} catch (e) {
-			proxyList = [user.user_socks5 || user.user_proxy_ip];
-		}
-		if (!Array.isArray(proxyList) || proxyList.length === 0) proxyList = [];
-		const allowDirect = user.enable_direct !== 0;
-		if (allowDirect) {
-			let hasDirect = proxyList.some(p => p === null || p === "");
-			if (!hasDirect) proxyList.push(null);
-		} else {
-			proxyList = proxyList.filter(p => p !== null && p !== "");
-		}
-		if (proxyList.length === 0) proxyList = [null];
-		let resolvedProxies = [];
-		for (let locIdx = 0; locIdx < proxyList.length; locIdx++) {
-			let proxyItem = proxyList[locIdx];
-			let proxyStr = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.proxy : proxyItem;
-			let countryCode = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.country : user.user_proxy_iata || "";
-			if (!countryCode && proxyStr) {
-				try {
-					const payload = new TextEncoder().encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
-					const s = await connectProxy(proxyStr, "ip-api.com", 80, payload);
-					const reader = s.readable.getReader();
-					let resStr = "";
-					const dec = new TextDecoder();
-					const timeoutId = setTimeout(() => {
-						try {
-							s.close();
-						} catch (e) { }
-					}, 2000);
-					try {
-						while (true) {
-							const res = await reader.read();
-							if (res.done || !res.value) break;
-							resStr += dec.decode(res.value, { stream: true });
-							if (resStr.includes("countryCode")) break;
-						}
-					} finally {
-						clearTimeout(timeoutId);
-						try {
-							s.close();
-						} catch (e) { }
-					}
-					const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
-					if (jsonMatch && jsonMatch[1]) countryCode = jsonMatch[1];
-				} catch (e) { }
-				if (!countryCode) {
-					let ip = "";
-					let cleanProxy = proxyStr.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-					let remain = cleanProxy;
-					if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
-					if (remain.startsWith("[")) {
-						ip = remain.substring(1, remain.indexOf("]"));
-					} else {
-						const lastColon = remain.lastIndexOf(":");
-						if (lastColon !== -1 && remain.indexOf(":") === lastColon) ip = remain.substring(0, lastColon);
-						else ip = remain;
-					}
-					if (ip) {
-						try {
-							const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
-							const geoData = await geoRes.json();
-							if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
-						} catch (e) { }
-					}
-				}
-			}
-			let flagEmoji = "🌐";
-			if (countryCode) {
-				const codePoints = countryCode
-					.toUpperCase()
-					.split("")
-					.map((char) => 127397 + char.charCodeAt(0));
-				try {
-					flagEmoji = String.fromCodePoint(...codePoints);
-				} catch (e) { }
-			}
-			const currentDynPath = encodeURIComponent(rawPath + (proxyItem !== null && proxyItem !== "" ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment) + buildEarlyDataPathSuffix(user));
-			resolvedProxies.push({ flagEmoji, currentDynPath });
-		}
-		const connType = String(user.connection_type || "vless").toLowerCase();
-		const enableVless = connType.includes("vless") || connType === "vl" + "e" + "ss" || (!connType.includes("trojan"));
-		const enableTrojan = connType.includes("trojan");
-		let protoCycleIdx = 0;
-		ips.forEach((ip) => {
-			ports.forEach((portStr) => {
-				resolvedProxies.forEach((proxy) => {
-					protoCycleIdx++;
-					const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-					const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
-					const isTlsPort = TLS_PORTS.has(portStr);
-					const tlsVal = isTlsPort ? "tls" : "none";
-					let userFrag = "";
-					if (user.frag_len && user.frag_int) userFrag += "&fragment=" + encodeURIComponent(user.frag_len + "," + user.frag_int + (isTlsPort ? ",tlshello" : ""));
-					if (user.advanced_frag) userFrag += "&fm=" + encodeURIComponent(user.advanced_frag);
-					if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
-					if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
-						
-					const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
-
-					if (useVless) {
-						const remark = proxy.flagEmoji;
-						links.push("vl" + "e" + "ss://" + user.uuid + "@" + ip + ":" + portStr + "?path=" + proxy.currentDynPath + "&security=" + tlsVal + "&encryption=none&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
-					}
-					if (useTrojan) {
-						const trojanRemark = proxy.flagEmoji;
-						links.push("trojan://" + user.uuid + "@" + ip + ":" + portStr + "?path=" + proxy.currentDynPath + "&security=" + tlsVal + "&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(trojanRemark));
-					}
-				});
-			});
-		});
-		const otherCleanIps = subIpSettings.otherCleanIps;
-		if (otherCleanIps.length > 0) {
-			const otherPortStr = ports[0] || "443";
-			const isTlsPort = TLS_PORTS.has(otherPortStr);
-			const tlsVal = isTlsPort ? "tls" : "none";
-			let userFrag = "";
-			if (user.frag_len && user.frag_int) userFrag += "&fragment=" + encodeURIComponent(user.frag_len + "," + user.frag_int + (isTlsPort ? ",tlshello" : ""));
-			if (user.advanced_frag) userFrag += "&fm=" + encodeURIComponent(user.advanced_frag);
-			if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
-			if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
-			const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
-			const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + buildEarlyDataPathSuffix(user));
-			otherCleanIps.forEach((otherIp, otherIdx) => {
-				protoCycleIdx++;
-				const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-				const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
-				const remark = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
-				if (useVless) {
-					links.push("vl" + "e" + "ss://" + user.uuid + "@" + otherIp + ":" + otherPortStr + "?path=" + otherDynPath + "&security=" + tlsVal + "&encryption=none&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
-				}
-				if (useTrojan) {
-					links.push("trojan://" + user.uuid + "@" + otherIp + ":" + otherPortStr + "?path=" + otherDynPath + "&security=" + tlsVal + "&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
-				}
-			});
-		}
-		const noise = ["# System Update Feed: OK", "# Sync Code: " + Math.random().toString(36).slice(2, 10), "# Version: 2.2.0", "# Description: Secure Node Configurations", ""].join("\n");
-		const plainContent = noise + links.join("\n");
-		const subContent = btoa(unescape(encodeURIComponent(plainContent)));
-		const downloadBytes = Math.floor((user.used_gb || 0) * 1073741824);
-		const totalBytes = user.limit_gb ? Math.floor(user.limit_gb * 1073741824) : 0;
-		let expireTimestamp = 0;
-		if (user.expiry_days) {
-			if (user.start_on_first_connect === 1) {
-				if (user.first_connection_time) {
-					expireTimestamp = Math.floor((user.first_connection_time + user.expiry_days * 86400000) / 1000);
-				} else {
-					expireTimestamp = Math.floor((Date.now() + user.expiry_days * 86400000) / 1000);
-				}
-			} else if (user.created_at) {
-				expireTimestamp = Math.floor((new Date(user.created_at).getTime() + user.expiry_days * 86400000) / 1000);
-			}
-		}
-		const subUserInfo = `upload=0; download=${downloadBytes}; total=${totalBytes}; expire=${expireTimestamp}`;
-		return new Response(subContent, {
-			headers: {
-				"Content-Type": "text/plain; charset=utf-8",
-				"Access-Control-Allow-Origin": "*",
-				"Cache-Control": "no-store",
-				"Subscription-Userinfo": subUserInfo,
-			},
-		});
-	},
-	async generateSingbox(user, host, env) {
-		let ips = [host];
-		if (user.auto_rotate_ip === 1) {
-			const cachedIpsData = await getCachedIps();
-			const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
-			if (randomIps.length > 0) ips = randomIps;
-		}
-		if (ips.length === 1 && ips[0] === host && user.ips) {
-			const parsedIps = user.ips.split("\n").map((ip) => ip.trim()).filter((ip) => ip.length > 0);
-			if (parsedIps.length > 0) ips = parsedIps;
-		}
-		const ports = String(user.port || "443").split(",").map((p) => p.trim()).filter((p) => p.length > 0);
-		const fp = user.fingerprint || "chrome";
-		const rawPath = "/ZYX";
-		const subIpSettings = await getSubscriptionIpSettings(env);
-		const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
-
-		let proxyList = [];
-		try {
-			if (user.user_socks5 && user.user_socks5.trim().startsWith("[")) {
-				proxyList = JSON.parse(user.user_socks5);
-			} else if (user.user_socks5 || user.user_proxy_ip) {
-				proxyList = [user.user_socks5 || user.user_proxy_ip];
-			} else {
-				proxyList = [null];
-			}
-		} catch (e) {
-			proxyList = [user.user_socks5 || user.user_proxy_ip];
-		}
-		if (!Array.isArray(proxyList) || proxyList.length === 0) proxyList = [null];
-		const allowDirect = user.enable_direct !== 0;
-		if (allowDirect) {
-			let hasDirect = proxyList.some(p => p === null || p === "");
-			if (!hasDirect) proxyList.push(null);
-		} else {
-			proxyList = proxyList.filter(p => p !== null && p !== "");
-		}
-		if (proxyList.length === 0) proxyList = [null];
-
-		const outbounds = [];
-		const connType = String(user.connection_type || "vless").toLowerCase();
-		const enableVless = connType.includes("vless") || connType === "vless" || (!connType.includes("trojan"));
-		const enableTrojan = connType.includes("trojan");
-
-		let locIdx = 0;
-		let protoCycleIdx = 0;
-		for (let proxyItem of proxyList) {
-			const countryCode = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.country : "";
-			const currentDynPath = rawPath + (proxyItem !== null && proxyItem !== "" ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment);
-			ips.forEach((ip) => {
-				ports.forEach((portStr) => {
-					protoCycleIdx++;
-					const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-					const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
-					const isTlsPort = TLS_PORTS.has(portStr);
-					const sni = user.tls_mask || host;
-					const safeFp = (fp === "unsafe") ? "chrome" : fp;
-					
-					if (useVless) {
-						let outbound = {
-							type: "vless",
-							tag: `ZYX-VLESS-${ip}-${portStr}-loc${locIdx}`,
-							server: ip,
-							server_port: parseInt(portStr),
-							uuid: user.uuid,
-							packet_encoding: "xudp",
-							transport: {
-								type: "ws",
-								path: currentDynPath,
-								headers: { Host: host }
-							}
-						};
-						
-						if (isTlsPort) {
-							outbound.tls = {
-								enabled: true,
-								server_name: sni,
-								insecure: false,
-								utls: { enabled: true, fingerprint: safeFp }
-							};
-						}
-						applySingboxEarlyData(outbound.transport, user);
-						outbounds.push(outbound);
-					}
-					if (useTrojan) {
-						let outbound = {
-							type: "trojan",
-							tag: `ZYX-Trojan-${ip}-${portStr}-loc${locIdx}`,
-							server: ip,
-							server_port: parseInt(portStr),
-							password: user.uuid,
-							transport: {
-								type: "ws",
-								path: currentDynPath,
-								headers: { Host: host }
-							}
-						};
-						
-						if (isTlsPort) {
-							outbound.tls = {
-								enabled: true,
-								server_name: sni,
-								insecure: false,
-								utls: { enabled: true, fingerprint: safeFp }
-							};
-						}
-						applySingboxEarlyData(outbound.transport, user);
-						outbounds.push(outbound);
-					}
-				});
-			});
-			locIdx++;
-		}
-
-		const otherCleanIps = subIpSettings.otherCleanIps;
-		if (otherCleanIps.length > 0) {
-			const otherPortStr = ports[0] || "443";
-			const isTlsPort = TLS_PORTS.has(otherPortStr);
-			const sni = user.tls_mask || host;
-			const safeFp = (fp === "unsafe") ? "chrome" : fp;
-			const otherDynPath = rawPath + inlineProxySegment;
-			otherCleanIps.forEach((otherIp, otherIdx) => {
-				protoCycleIdx++;
-				const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
-				const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
-				const flagTag = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
-				if (useVless) {
-					let outbound = {
-						type: "vless",
-						tag: flagTag + (enableTrojan ? " (VLESS)" : ""),
-						server: otherIp,
-						server_port: parseInt(otherPortStr),
-						uuid: user.uuid,
-						packet_encoding: "xudp",
-						transport: { type: "ws", path: otherDynPath, headers: { Host: host } }
-					};
-					if (isTlsPort) {
-						outbound.tls = { enabled: true, server_name: sni, insecure: false, utls: { enabled: true, fingerprint: safeFp } };
-					}
-					applySingboxEarlyData(outbound.transport, user);
-					outbounds.push(outbound);
-				}
-				if (useTrojan) {
-					let outbound = {
-						type: "trojan",
-						tag: flagTag + (enableVless ? " (Trojan)" : ""),
-						server: otherIp,
-						server_port: parseInt(otherPortStr),
-						password: user.uuid,
-						transport: { type: "ws", path: otherDynPath, headers: { Host: host } }
-					};
-					if (isTlsPort) {
-						outbound.tls = { enabled: true, server_name: sni, insecure: false, utls: { enabled: true, fingerprint: safeFp } };
-					}
-					applySingboxEarlyData(outbound.transport, user);
-					outbounds.push(outbound);
-				}
-			});
-		}
-
-		const outboundsList = outbounds.map(o => o.tag);
-
-		let targetDns = "udp://8.8.8.8";
-		if (user.block_porn === 1 && user.block_ads === 1) {
-			targetDns = "udp://94.140.14.15";
-		} else if (user.block_porn === 1) {
-			targetDns = "udp://1.1.1.3";
-		} else if (user.block_ads === 1) {
-			targetDns = "udp://94.140.14.14";
-		}
-
-		const config = {
-			log: { disabled: false, level: "info" },
-			dns: {
-				servers: [
-					{
-						tag: "remote-dns",
-						address: targetDns,
-						detour: outboundsList.length > 0 ? "proxy" : "direct"
-					}
-				],
-				final: "remote-dns",
-				independent_cache: true
-			},
-			inbounds: [
-				{
-					type: "tun",
-					tag: "tun-in",
-					interface_name: "tun0",
-					address: [
-						"172.19.0.1/30",
-						"fdfe:dcba:9876::1/126"
-					],
-					auto_route: true,
-					strict_route: true,
-					stack: "mixed"
-				}
-			],
-			outbounds: [
-				{
-					type: "selector",
-					tag: "proxy",
-					outbounds: outboundsList.length > 0 ? outboundsList : ["direct"]
-				},
-				...outbounds,
-				{ type: "direct", tag: "direct" },
-				{ type: "block", tag: "block" }
-			],
-			route: {
-				rules: [
-					{ protocol: "dns", action: "hijack-dns" },
-					{ port: 53, action: "hijack-dns" },
-					{ protocol: "icmp", outbound: "direct" }
-				],
-				auto_detect_interface: true,
-				final: outboundsList.length > 0 ? "proxy" : "direct"
-			}
-		};
-
-		return new Response(JSON.stringify(config, null, 2), {
-			headers: {
-				"Content-Type": "application/json; charset=utf-8",
-				"Access-Control-Allow-Origin": "*",
-				"Cache-Control": "no-store"
-			}
-		});
-	}
-}
+  async generateText(user, host, env) {
+    let ips = [host];
+    if (user.auto_rotate_ip === 1) {
+      const cachedIpsData = await getCachedIps();
+      const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
+      if (randomIps.length > 0) ips = randomIps;
+    }
+    if (ips.length === 1 && ips[0] === host && user.ips) {
+      const parsedIps = user.ips.split("\n").map((ip) => ip.trim()).filter((ip) => ip.length > 0);
+      if (parsedIps.length > 0) ips = parsedIps;
+    }
+    const ports = String(user.port || "443").split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+    const fp = user.fingerprint || "chrome";
+    const links = [];
+    let remVol = "Unlimited";
+    if (user.limit_gb) {
+      let liveUsedGb = (user.used_gb || 0) + (GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024);
+      let rem = user.limit_gb - liveUsedGb;
+      remVol = rem > 0 ? rem.toFixed(2) + "GB" : "0GB";
+    }
+    let remTime = "Unlimited";
+    if (user.expiry_days) {
+      if (user.start_on_first_connect === 1) {
+        if (user.first_connection_time) {
+          const expiryDate = new Date(user.first_connection_time + user.expiry_days * 864e5);
+          const diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / 864e5);
+          remTime = diffDays > 0 ? diffDays + "Days" : "0Days";
+        } else {
+          remTime = user.expiry_days + "Days (Not Started)";
+        }
+      } else if (user.created_at) {
+        const created = new Date(user.created_at);
+        const expiryDate = new Date(created.getTime() + user.expiry_days * 864e5);
+        const diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / 864e5);
+        remTime = diffDays > 0 ? diffDays + "Days" : "0Days";
+      }
+    }
+    let remReq = "Unlimited";
+    if (user.limit_req) {
+      let liveUsedReq = (user.used_req || 0) + (USER_REQ_CACHE.get(user.username) || 0);
+      let rem = user.limit_req - liveUsedReq;
+      remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
+    }
+    const rawPath = "/ZYX";
+    const subIpSettings = await getSubscriptionIpSettings(env);
+    const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
+    let proxyList = [];
+    try {
+      if (user.user_socks5 && user.user_socks5.trim().startsWith("[")) {
+        proxyList = JSON.parse(user.user_socks5);
+      } else if (user.user_socks5 || user.user_proxy_ip) {
+        proxyList = [user.user_socks5 || user.user_proxy_ip];
+      } else {
+        proxyList = [null];
+      }
+    } catch (e) {
+      proxyList = [user.user_socks5 || user.user_proxy_ip];
+    }
+    if (!Array.isArray(proxyList) || proxyList.length === 0) proxyList = [];
+    const allowDirect = user.enable_direct !== 0;
+    if (allowDirect) {
+      let hasDirect = proxyList.some((p) => p === null || p === "");
+      if (!hasDirect) proxyList.push(null);
+    } else {
+      proxyList = proxyList.filter((p) => p !== null && p !== "");
+    }
+    if (proxyList.length === 0) proxyList = [null];
+    let resolvedProxies = [];
+    for (let locIdx = 0; locIdx < proxyList.length; locIdx++) {
+      let proxyItem = proxyList[locIdx];
+      let proxyStr = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.proxy : proxyItem;
+      let countryCode = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.country : user.user_proxy_iata || "";
+      if (!countryCode && proxyStr) {
+        try {
+          const payload = new TextEncoder().encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
+          const s = await connectProxy(proxyStr, "ip-api.com", 80, payload);
+          const reader = s.readable.getReader();
+          let resStr = "";
+          const dec = new TextDecoder();
+          const timeoutId = setTimeout(() => {
+            try {
+              s.close();
+            } catch (e) {
+            }
+          }, 2e3);
+          try {
+            while (true) {
+              const res = await reader.read();
+              if (res.done || !res.value) break;
+              resStr += dec.decode(res.value, { stream: true });
+              if (resStr.includes("countryCode")) break;
+            }
+          } finally {
+            clearTimeout(timeoutId);
+            try {
+              s.close();
+            } catch (e) {
+            }
+          }
+          const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
+          if (jsonMatch && jsonMatch[1]) countryCode = jsonMatch[1];
+        } catch (e) {
+        }
+        if (!countryCode) {
+          let ip = "";
+          let cleanProxy = proxyStr.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+          let remain = cleanProxy;
+          if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
+          if (remain.startsWith("[")) {
+            ip = remain.substring(1, remain.indexOf("]"));
+          } else {
+            const lastColon = remain.lastIndexOf(":");
+            if (lastColon !== -1 && remain.indexOf(":") === lastColon) ip = remain.substring(0, lastColon);
+            else ip = remain;
+          }
+          if (ip) {
+            try {
+              const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
+              const geoData = await geoRes.json();
+              if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
+            } catch (e) {
+            }
+          }
+        }
+      }
+      let flagEmoji = "🌐";
+      if (countryCode) {
+        const codePoints = countryCode.toUpperCase().split("").map((char) => 127397 + char.charCodeAt(0));
+        try {
+          flagEmoji = String.fromCodePoint(...codePoints);
+        } catch (e) {
+        }
+      }
+      const currentDynPath = encodeURIComponent(rawPath + (proxyItem !== null && proxyItem !== "" ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment) + buildEarlyDataPathSuffix(user));
+      resolvedProxies.push({ flagEmoji, currentDynPath });
+    }
+    const connType = String(user.connection_type || "vless").toLowerCase();
+    const enableVless = connType.includes("vless") || connType === "vless" || !connType.includes("trojan");
+    const enableTrojan = connType.includes("trojan");
+    let protoCycleIdx = 0;
+    ips.forEach((ip) => {
+      ports.forEach((portStr) => {
+        resolvedProxies.forEach((proxy) => {
+          protoCycleIdx++;
+          const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+          const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
+          const isTlsPort = TLS_PORTS.has(portStr);
+          const tlsVal = isTlsPort ? "tls" : "none";
+          let userFrag = "";
+          if (user.frag_len && user.frag_int) userFrag += "&fragment=" + encodeURIComponent(user.frag_len + "," + user.frag_int + (isTlsPort ? ",tlshello" : ""));
+          if (user.advanced_frag) userFrag += "&fm=" + encodeURIComponent(user.advanced_frag);
+          if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
+          if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
+          const tlsParams = isTlsPort ? "&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host : "";
+          if (useVless) {
+            const remark = proxy.flagEmoji;
+            links.push("vless://" + user.uuid + "@" + ip + ":" + portStr + "?path=" + proxy.currentDynPath + "&security=" + tlsVal + "&encryption=none&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
+          }
+          if (useTrojan) {
+            const trojanRemark = proxy.flagEmoji;
+            links.push("trojan://" + user.uuid + "@" + ip + ":" + portStr + "?path=" + proxy.currentDynPath + "&security=" + tlsVal + "&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(trojanRemark));
+          }
+        });
+      });
+    });
+    const otherCleanIps = subIpSettings.otherCleanIps;
+    if (otherCleanIps.length > 0) {
+      const otherPortStr = ports[0] || "443";
+      const isTlsPort = TLS_PORTS.has(otherPortStr);
+      const tlsVal = isTlsPort ? "tls" : "none";
+      let userFrag = "";
+      if (user.frag_len && user.frag_int) userFrag += "&fragment=" + encodeURIComponent(user.frag_len + "," + user.frag_int + (isTlsPort ? ",tlshello" : ""));
+      if (user.advanced_frag) userFrag += "&fm=" + encodeURIComponent(user.advanced_frag);
+      if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
+      if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
+      const tlsParams = isTlsPort ? "&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host : "";
+      const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + buildEarlyDataPathSuffix(user));
+      otherCleanIps.forEach((otherIp, otherIdx) => {
+        protoCycleIdx++;
+        const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+        const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
+        const remark = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
+        if (useVless) {
+          links.push("vless://" + user.uuid + "@" + otherIp + ":" + otherPortStr + "?path=" + otherDynPath + "&security=" + tlsVal + "&encryption=none&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
+        }
+        if (useTrojan) {
+          links.push("trojan://" + user.uuid + "@" + otherIp + ":" + otherPortStr + "?path=" + otherDynPath + "&security=" + tlsVal + "&host=" + host + "&type=ws" + tlsParams + userFrag + "#" + encodeURIComponent(remark));
+        }
+      });
+    }
+    const noise = ["# System Update Feed: OK", "# Sync Code: " + Math.random().toString(36).slice(2, 10), "# Version: 2.2.0", "# Description: Secure Node Configurations", ""].join("\n");
+    const plainContent = noise + links.join("\n");
+    const subContent = btoa(unescape(encodeURIComponent(plainContent)));
+    const downloadBytes = Math.floor((user.used_gb || 0) * 1073741824);
+    const totalBytes = user.limit_gb ? Math.floor(user.limit_gb * 1073741824) : 0;
+    let expireTimestamp = 0;
+    if (user.expiry_days) {
+      if (user.start_on_first_connect === 1) {
+        if (user.first_connection_time) {
+          expireTimestamp = Math.floor((user.first_connection_time + user.expiry_days * 864e5) / 1e3);
+        } else {
+          expireTimestamp = Math.floor((Date.now() + user.expiry_days * 864e5) / 1e3);
+        }
+      } else if (user.created_at) {
+        expireTimestamp = Math.floor((new Date(user.created_at).getTime() + user.expiry_days * 864e5) / 1e3);
+      }
+    }
+    const subUserInfo = `upload=0; download=${downloadBytes}; total=${totalBytes}; expire=${expireTimestamp}`;
+    return new Response(subContent, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store",
+        "Subscription-Userinfo": subUserInfo
+      }
+    });
+  },
+  async generateSingbox(user, host, env) {
+    let ips = [host];
+    if (user.auto_rotate_ip === 1) {
+      const cachedIpsData = await getCachedIps();
+      const randomIps = getRandomIps(cachedIpsData, user.ip_operator || "all", user.ip_count || 999999);
+      if (randomIps.length > 0) ips = randomIps;
+    }
+    if (ips.length === 1 && ips[0] === host && user.ips) {
+      const parsedIps = user.ips.split("\n").map((ip) => ip.trim()).filter((ip) => ip.length > 0);
+      if (parsedIps.length > 0) ips = parsedIps;
+    }
+    const ports = String(user.port || "443").split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+    const fp = user.fingerprint || "chrome";
+    const rawPath = "/ZYX";
+    const subIpSettings = await getSubscriptionIpSettings(env);
+    const inlineProxySegment = buildInlineProxyIpSegment(subIpSettings.inlineProxyIp);
+    let proxyList = [];
+    try {
+      if (user.user_socks5 && user.user_socks5.trim().startsWith("[")) {
+        proxyList = JSON.parse(user.user_socks5);
+      } else if (user.user_socks5 || user.user_proxy_ip) {
+        proxyList = [user.user_socks5 || user.user_proxy_ip];
+      } else {
+        proxyList = [null];
+      }
+    } catch (e) {
+      proxyList = [user.user_socks5 || user.user_proxy_ip];
+    }
+    if (!Array.isArray(proxyList) || proxyList.length === 0) proxyList = [null];
+    const allowDirect = user.enable_direct !== 0;
+    if (allowDirect) {
+      let hasDirect = proxyList.some((p) => p === null || p === "");
+      if (!hasDirect) proxyList.push(null);
+    } else {
+      proxyList = proxyList.filter((p) => p !== null && p !== "");
+    }
+    if (proxyList.length === 0) proxyList = [null];
+    const outbounds = [];
+    const connType = String(user.connection_type || "vless").toLowerCase();
+    const enableVless = connType.includes("vless") || connType === "vless" || !connType.includes("trojan");
+    const enableTrojan = connType.includes("trojan");
+    let locIdx = 0;
+    let protoCycleIdx = 0;
+    for (let proxyItem of proxyList) {
+      const countryCode = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.country : "";
+      const currentDynPath = rawPath + (proxyItem !== null && proxyItem !== "" ? "/" + getLocationPathSegment(countryCode, locIdx) : inlineProxySegment);
+      ips.forEach((ip) => {
+        ports.forEach((portStr) => {
+          protoCycleIdx++;
+          const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+          const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
+          const isTlsPort = TLS_PORTS.has(portStr);
+          const sni = user.tls_mask || host;
+          const safeFp = fp === "unsafe" ? "chrome" : fp;
+          if (useVless) {
+            let outbound = {
+              type: "vless",
+              tag: `ZYX-VLESS-${ip}-${portStr}-loc${locIdx}`,
+              server: ip,
+              server_port: parseInt(portStr),
+              uuid: user.uuid,
+              packet_encoding: "xudp",
+              transport: {
+                type: "ws",
+                path: currentDynPath,
+                headers: { Host: host }
+              }
+            };
+            if (isTlsPort) {
+              outbound.tls = {
+                enabled: true,
+                server_name: sni,
+                insecure: false,
+                utls: { enabled: true, fingerprint: safeFp }
+              };
+            }
+            applySingboxEarlyData(outbound.transport, user);
+            outbounds.push(outbound);
+          }
+          if (useTrojan) {
+            let outbound = {
+              type: "trojan",
+              tag: `ZYX-Trojan-${ip}-${portStr}-loc${locIdx}`,
+              server: ip,
+              server_port: parseInt(portStr),
+              password: user.uuid,
+              transport: {
+                type: "ws",
+                path: currentDynPath,
+                headers: { Host: host }
+              }
+            };
+            if (isTlsPort) {
+              outbound.tls = {
+                enabled: true,
+                server_name: sni,
+                insecure: false,
+                utls: { enabled: true, fingerprint: safeFp }
+              };
+            }
+            applySingboxEarlyData(outbound.transport, user);
+            outbounds.push(outbound);
+          }
+        });
+      });
+      locIdx++;
+    }
+    const otherCleanIps = subIpSettings.otherCleanIps;
+    if (otherCleanIps.length > 0) {
+      const otherPortStr = ports[0] || "443";
+      const isTlsPort = TLS_PORTS.has(otherPortStr);
+      const sni = user.tls_mask || host;
+      const safeFp = fp === "unsafe" ? "chrome" : fp;
+      const otherDynPath = rawPath + inlineProxySegment;
+      otherCleanIps.forEach((otherIp, otherIdx) => {
+        protoCycleIdx++;
+        const useVless = enableVless && (!enableTrojan || protoCycleIdx % 2 === 1);
+        const useTrojan = enableTrojan && (!enableVless || protoCycleIdx % 2 === 0);
+        const flagTag = "🇩🇪 " + String(otherIdx + 1).padStart(2, "0");
+        if (useVless) {
+          let outbound = {
+            type: "vless",
+            tag: flagTag + (enableTrojan ? " (VLESS)" : ""),
+            server: otherIp,
+            server_port: parseInt(otherPortStr),
+            uuid: user.uuid,
+            packet_encoding: "xudp",
+            transport: { type: "ws", path: otherDynPath, headers: { Host: host } }
+          };
+          if (isTlsPort) {
+            outbound.tls = { enabled: true, server_name: sni, insecure: false, utls: { enabled: true, fingerprint: safeFp } };
+          }
+          applySingboxEarlyData(outbound.transport, user);
+          outbounds.push(outbound);
+        }
+        if (useTrojan) {
+          let outbound = {
+            type: "trojan",
+            tag: flagTag + (enableVless ? " (Trojan)" : ""),
+            server: otherIp,
+            server_port: parseInt(otherPortStr),
+            password: user.uuid,
+            transport: { type: "ws", path: otherDynPath, headers: { Host: host } }
+          };
+          if (isTlsPort) {
+            outbound.tls = { enabled: true, server_name: sni, insecure: false, utls: { enabled: true, fingerprint: safeFp } };
+          }
+          applySingboxEarlyData(outbound.transport, user);
+          outbounds.push(outbound);
+        }
+      });
+    }
+    const outboundsList = outbounds.map((o) => o.tag);
+    let targetDns = "udp://8.8.8.8";
+    if (user.block_porn === 1 && user.block_ads === 1) {
+      targetDns = "udp://94.140.14.15";
+    } else if (user.block_porn === 1) {
+      targetDns = "udp://1.1.1.3";
+    } else if (user.block_ads === 1) {
+      targetDns = "udp://94.140.14.14";
+    }
+    const config = {
+      log: { disabled: false, level: "info" },
+      dns: {
+        servers: [
+          {
+            tag: "remote-dns",
+            address: targetDns,
+            detour: outboundsList.length > 0 ? "proxy" : "direct"
+          }
+        ],
+        final: "remote-dns",
+        independent_cache: true
+      },
+      inbounds: [
+        {
+          type: "tun",
+          tag: "tun-in",
+          interface_name: "tun0",
+          address: [
+            "172.19.0.1/30",
+            "fdfe:dcba:9876::1/126"
+          ],
+          auto_route: true,
+          strict_route: true,
+          stack: "mixed"
+        }
+      ],
+      outbounds: [
+        {
+          type: "selector",
+          tag: "proxy",
+          outbounds: outboundsList.length > 0 ? outboundsList : ["direct"]
+        },
+        ...outbounds,
+        { type: "direct", tag: "direct" },
+        { type: "block", tag: "block" }
+      ],
+      route: {
+        rules: [
+          { protocol: "dns", action: "hijack-dns" },
+          { port: 53, action: "hijack-dns" },
+          { protocol: "icmp", outbound: "direct" }
+        ],
+        auto_detect_interface: true,
+        final: outboundsList.length > 0 ? "proxy" : "direct"
+      }
+    };
+    return new Response(JSON.stringify(config, null, 2), {
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store"
+      }
+    });
+  }
+};
 async function flushExpiredTraffic(env) {
-	const now = Date.now();
-	for (const [key, val] of DNS_CACHE.entries()) {
-		if (now > val.expires) DNS_CACHE.delete(key);
-	}
-	for (const [ip, record] of LOGIN_ATTEMPTS.entries()) {
-		if (now - record.lastAttempt > 900000) LOGIN_ATTEMPTS.delete(ip);
-	}
-	for (const [key, entry] of IP_BURST_BYTES.entries()) {
-		if (now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) IP_BURST_BYTES.delete(key);
-	}
-	const allUsers = new Set([...GLOBAL_TRAFFIC_CACHE.keys(), ...USER_REQ_CACHE.keys()]);
-	// قبلاً به ازای هر کاربر یک UPDATE جدا + یک UPSERT جدای daily_traffic زده می‌شد، یعنی برای N
-	// کاربرِ در انتظار، 2N رفت‌وبرگشت پشت‌سرهم به D1. حالا همه‌ی UPDATE ها جمع می‌شن و با یک
-	// db.batch() در یک رفت‌وبرگشت اجرا می‌شن و مجموع مصرف با یک UPSERT واحد ثبت می‌شه.
-	// تعداد ردیف‌های نوشته‌شده (هزینه‌ی write در D1) دقیقاً مثل قبله، فقط round-trip ها کم شده.
-	const pendingFlush = [];
-	const flushStmts = [];
-	let batchDeltaGb = 0;
-	for (const uname of allUsers) {
-		const cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
-		const cachedReqs = USER_REQ_CACHE.get(uname) || 0;
-		const activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
-		if (cachedBytes <= 0 && cachedReqs <= 0) {
-			GLOBAL_TRAFFIC_CACHE.delete(uname);
-			USER_REQ_CACHE.delete(uname);
-			if (activeCount <= 0) {
-				GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-				GLOBAL_LAST_ACTIVE_WRITE.delete(uname + "_hb");
-			}
-			continue;
-		}
-		if (GLOBAL_WRITE_LOCK.get(uname)) continue;
-		const lastActive = GLOBAL_LAST_ACTIVE_WRITE.get(uname) || 0;
-		if (activeCount <= 0 || now - lastActive > 60000) {
-			GLOBAL_WRITE_LOCK.set(uname, true);
-			GLOBAL_TRAFFIC_CACHE.set(uname, 0);
-			USER_REQ_CACHE.set(uname, 0);
-			const deltaGb = cachedBytes / (1024 * 1024 * 1024);
-			batchDeltaGb += deltaGb;
-			pendingFlush.push({ uname, cachedBytes, cachedReqs, activeCount });
-			flushStmts.push(env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, now, uname));
-		}
-	}
-	if (flushStmts.length === 0) return;
-	try {
-		await env.DB.batch(flushStmts);
-		await recordDailyTraffic(env, null, batchDeltaGb);
-	} catch (e) {
-		console.error(e.message);
-		// برگردوندن مقدارهای commit-نشده به کش - دقیقاً همون کاری که مسیر اصلی نوشتن ترافیک
-		// (writeTask داخل handlevIees) از قبل می‌کرد. بدون این، اگر نوشتن شکست می‌خورد (مثلاً
-		// اتمام سهمیه‌ی روزانه‌ی D1) مصرفِ همون بازه برای همیشه پاک می‌شد، چون کش قبل از
-		// نوشتن صفر شده بود.
-		for (const p of pendingFlush) {
-			GLOBAL_TRAFFIC_CACHE.set(p.uname, (GLOBAL_TRAFFIC_CACHE.get(p.uname) || 0) + p.cachedBytes);
-			USER_REQ_CACHE.set(p.uname, (USER_REQ_CACHE.get(p.uname) || 0) + p.cachedReqs);
-		}
-	} finally {
-		for (const p of pendingFlush) {
-			GLOBAL_WRITE_LOCK.delete(p.uname);
-			if (p.activeCount <= 0) {
-				GLOBAL_LAST_ACTIVE_WRITE.delete(p.uname);
-				GLOBAL_LAST_ACTIVE_WRITE.delete(p.uname + "_hb");
-			}
-		}
-	}
+  const now = Date.now();
+  for (const [key, val] of DNS_CACHE.entries()) {
+    if (now > val.expires) DNS_CACHE.delete(key);
+  }
+  for (const [ip, record] of LOGIN_ATTEMPTS.entries()) {
+    if (now - record.lastAttempt > 9e5) LOGIN_ATTEMPTS.delete(ip);
+  }
+  for (const [key, entry] of IP_BURST_BYTES.entries()) {
+    if (now - entry.windowStart > DEVICE_CONFIRM_BURST_WINDOW_MS) IP_BURST_BYTES.delete(key);
+  }
+  const allUsers = /* @__PURE__ */ new Set([...GLOBAL_TRAFFIC_CACHE.keys(), ...USER_REQ_CACHE.keys()]);
+  const pendingFlush = [];
+  const flushStmts = [];
+  let batchDeltaGb = 0;
+  for (const uname of allUsers) {
+    const cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
+    const cachedReqs = USER_REQ_CACHE.get(uname) || 0;
+    const activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
+    if (cachedBytes <= 0 && cachedReqs <= 0) {
+      GLOBAL_TRAFFIC_CACHE.delete(uname);
+      USER_REQ_CACHE.delete(uname);
+      if (activeCount <= 0) {
+        GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+        GLOBAL_LAST_ACTIVE_WRITE.delete(uname + "_hb");
+      }
+      continue;
+    }
+    if (GLOBAL_WRITE_LOCK.get(uname)) continue;
+    const lastActive = GLOBAL_LAST_ACTIVE_WRITE.get(uname) || 0;
+    if (activeCount <= 0 || now - lastActive > 6e4) {
+      GLOBAL_WRITE_LOCK.set(uname, true);
+      GLOBAL_TRAFFIC_CACHE.set(uname, 0);
+      USER_REQ_CACHE.set(uname, 0);
+      const deltaGb = cachedBytes / (1024 * 1024 * 1024);
+      batchDeltaGb += deltaGb;
+      pendingFlush.push({ uname, cachedBytes, cachedReqs, activeCount });
+      flushStmts.push(env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, now, uname));
+    }
+  }
+  if (flushStmts.length === 0) return;
+  try {
+    await env.DB.batch(flushStmts);
+    await recordDailyTraffic(env, null, batchDeltaGb);
+  } catch (e) {
+    console.error(e.message);
+    for (const p of pendingFlush) {
+      GLOBAL_TRAFFIC_CACHE.set(p.uname, (GLOBAL_TRAFFIC_CACHE.get(p.uname) || 0) + p.cachedBytes);
+      USER_REQ_CACHE.set(p.uname, (USER_REQ_CACHE.get(p.uname) || 0) + p.cachedReqs);
+    }
+  } finally {
+    for (const p of pendingFlush) {
+      GLOBAL_WRITE_LOCK.delete(p.uname);
+      if (p.activeCount <= 0) {
+        GLOBAL_LAST_ACTIVE_WRITE.delete(p.uname);
+        GLOBAL_LAST_ACTIVE_WRITE.delete(p.uname + "_hb");
+      }
+    }
+  }
 }
-// Decodes an optional trailing path segment shaped like base64(JSON), e.g. the
-// segment after "/ZYX/" in ".../ZYX/eyJqdW5rIjoi...". The JSON looks like
-// {"junk":"...","protocol":"vl","mode":"proxyip","panelIPs":["1.2.3.4"]}.
-// This lets one specific config link carry its own ProxyIP fallback list
-// inline, instead of relying only on this user's stored user_proxy_ip/user_socks5.
-// Anything that isn't valid base64/JSON in this exact shape returns null, so
-// ordinary paths ("/ZYX", "/ZYX/loc-3", "/ZYX/K-a-z", ...) are unaffected.
-// Reuses the same private/reserved-address filter as the real destination check
-// above, so this can't be used to make the worker connect out to an internal address.
 const INLINE_PANEL_IP_BLOCKED_RE = /^(0\.|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|localhost$|::1|::ffff:|fd[0-9a-f]{2}:|fe80:)/i;
 function decodeInlinePanelIPs(segment) {
-	if (!segment || segment.length < 8) return null;
-	try {
-		const normalized = segment.replace(/-/g, "+").replace(/_/g, "/");
-		const decoded = JSON.parse(atob(normalized));
-		if (!decoded || typeof decoded !== "object" || decoded.mode !== "proxyip" || !Array.isArray(decoded.panelIPs)) {
-			return null;
-		}
-		const ips = decoded.panelIPs
-			.filter((ip) => typeof ip === "string" && ip.trim() && !INLINE_PANEL_IP_BLOCKED_RE.test(ip.trim()))
-			.map((ip) => ip.trim());
-		return ips.length ? ips : null;
-	} catch (e) {
-		return null;
-	}
+  if (!segment || segment.length < 8) return null;
+  try {
+    const normalized = segment.replace(/-/g, "+").replace(/_/g, "/");
+    const decoded = JSON.parse(atob(normalized));
+    if (!decoded || typeof decoded !== "object" || decoded.mode !== "proxyip" || !Array.isArray(decoded.panelIPs)) {
+      return null;
+    }
+    const ips = decoded.panelIPs.filter((ip) => typeof ip === "string" && ip.trim() && !INLINE_PANEL_IP_BLOCKED_RE.test(ip.trim())).map((ip) => ip.trim());
+    return ips.length ? ips : null;
+  } catch (e) {
+    return null;
+  }
 }
-function getSelectedUserProxy(userSocks5, request) {
-	if (!userSocks5) return "";
-	let proxyList = [];
-	try {
-		if (userSocks5.trim().startsWith("[")) {
-			proxyList = JSON.parse(userSocks5);
-		} else {
-			proxyList = [userSocks5];
-		}
-	} catch (e) {
-		proxyList = [userSocks5];
-	}
-	if (!Array.isArray(proxyList) || proxyList.length === 0) return "";
-	let idx = -1;
-	if (request) {
-		try {
-			const url = new URL(request.url);
-			// New format: last path segment is a path code for any ISO country
-			// (see getLocationPathSegment/getCountryForPathSegment near the top
-			// of the file) - map it back to the country, then find that
-			// country's slot in this user's own proxy list. Falls back to the
-			// legacy "/loc-N" suffix (or a "?loc=" query param) for any
-			// already-issued link, or any segment that isn't a valid country path.
-			const segments = url.pathname.split("/").filter(Boolean);
-			const lastSeg = decodeURIComponent(segments[segments.length - 1] || "");
-			const countryForCode = getCountryForPathSegment(lastSeg);
-			if (countryForCode) {
-				idx = proxyList.findIndex((p) => typeof p === "object" && p !== null && (p.country || "").toUpperCase() === countryForCode);
-			} else {
-				const pathMatch = url.pathname.match(/\/loc-(\d+)/);
-				if (pathMatch) {
-					idx = parseInt(pathMatch[1], 10);
-				} else {
-					const locParam = url.searchParams.get("loc");
-					if (locParam !== null && !isNaN(Number(locParam))) {
-						idx = parseInt(locParam, 10);
-					}
-				}
-			}
-		} catch (e) { }
-	}
-	if (idx === -1) return "";
-	const selected = proxyList[idx] || proxyList[0];
-	return typeof selected === "object" ? selected.proxy || "" : String(selected || "");
+function getSelectedUserProxy(userSocks5, request2) {
+  if (!userSocks5) return "";
+  let proxyList = [];
+  try {
+    if (userSocks5.trim().startsWith("[")) {
+      proxyList = JSON.parse(userSocks5);
+    } else {
+      proxyList = [userSocks5];
+    }
+  } catch (e) {
+    proxyList = [userSocks5];
+  }
+  if (!Array.isArray(proxyList) || proxyList.length === 0) return "";
+  let idx = -1;
+  if (request2) {
+    try {
+      const url = new URL(request2.url);
+      const segments = url.pathname.split("/").filter(Boolean);
+      const lastSeg = decodeURIComponent(segments[segments.length - 1] || "");
+      const countryForCode = getCountryForPathSegment(lastSeg);
+      if (countryForCode) {
+        idx = proxyList.findIndex((p) => typeof p === "object" && p !== null && (p.country || "").toUpperCase() === countryForCode);
+      } else {
+        const pathMatch = url.pathname.match(/\/loc-(\d+)/);
+        if (pathMatch) {
+          idx = parseInt(pathMatch[1], 10);
+        } else {
+          const locParam = url.searchParams.get("loc");
+          if (locParam !== null && !isNaN(Number(locParam))) {
+            idx = parseInt(locParam, 10);
+          }
+        }
+      }
+    } catch (e) {
+    }
+  }
+  if (idx === -1) return "";
+  const selected = proxyList[idx] || proxyList[0];
+  return typeof selected === "object" ? selected.proxy || "" : String(selected || "");
 }
-async function handlevIees(env, storedData = null, ctx = null, request = null) {
-	let rawClientIP = request ? request.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
-	let clientIP = rawClientIP;
-	if (rawClientIP !== "unknown") {
-		if (rawClientIP.includes(":")) {
-			const parts = rawClientIP.split(":");
-			if (parts.length >= 4) {
-				clientIP = parts.slice(0, 4).join(":") + "::/64";
-			}
-		} else if (rawClientIP.includes(".")) {
-			const parts = rawClientIP.split(".");
-			if (parts.length === 4) {
-				clientIP = parts.slice(0, 3).join(".") + ".0/24";
-			}
-		}
-	}
-	const socketPair = new WebSocketPair();
-	const [clientSock, serverSock] = Object.values(socketPair);
-	serverSock.accept();
-	serverSock.binaryType = "arraybuffer";
-	let username = null;
-	let validUUID = null;
-	let targetDns = "8.8.4.4";
-	let targetDoh = "https://cloudflare-dns.com/dns-query";
-	// «دیده‌شده/تأییدشده» (device seen/confirmed - نگاه کنید توضیح DEVICE_CONFIRM_* بالای
-	// فایل): وضعیتِ محلیِ همین یک اتصال، بین addBytes/هیت‌بیت/بلاکِ پارسِ هدر مشترکه.
-	// connectionStartTime همون لحظه‌ی accept شدنِ سوکته - معیار «حداقل ۱۰ ثانیه باز بمونه».
-	const connectionStartTime = Date.now();
-	let connectionBytesSoFar = 0;
-	let deviceConfirmed = false;
-	let deviceConfirmInFlight = false;
-	function addBytes(bytes) {
-		if (bytes <= 0) return;
-		if (!username) {
-			uncountedBytes += bytes;
-			return;
-		}
-		if (uncountedBytes > 0) {
-			bytes += uncountedBytes;
-			uncountedBytes = 0;
-		}
-		connectionBytesSoFar += bytes;
-		if (!deviceConfirmed && clientIP && clientIP !== "unknown") {
-			recordBurstBytes(username + "|" + clientIP, bytes, Date.now());
-			checkDeviceConfirmation();
-		}
-		let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
-		GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
-		GLOBAL_LAST_ACTIVE_WRITE.set(username, Date.now());
-		if (GLOBAL_WRITE_LOCK.get(username)) return;
-		let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
-		let now = Date.now();
-		let thresholdBytes = 500 * 1024 * 1024;
-		if ((current >= thresholdBytes && now - lastDbWrite > 180000) || (current > 0 && now - lastDbWrite > 900000)) {
-			GLOBAL_WRITE_LOCK.set(username, true);
-			let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
-			let toCommitReq = USER_REQ_CACHE.get(username) || 0;
-			if (toCommit <= 0 && toCommitReq <= 0) {
-				GLOBAL_WRITE_LOCK.set(username, false);
-				return;
-			}
-			GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) - toCommit);
-			USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) - toCommitReq);
-			GLOBAL_LAST_DB_WRITE.set(username, now);
-			let deltaGb = toCommit / (1024 * 1024 * 1024);
-			let writeTask = async () => {
-				try {
-					await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, now, username).run();
-					await recordDailyTraffic(env, ctx, deltaGb);
-				} catch (e) {
-					console.error(e.message);
-					GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) + toCommit);
-					USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) + toCommitReq);
-				} finally {
-					GLOBAL_WRITE_LOCK.set(username, false);
-				}
-			};
-			if (ctx) ctx.waitUntil(writeTask());
-			else writeTask();
-		}
-	}
-	let isOfflineSet = false;
-	let hasCountedAsActive = false;
-	const setOffline = () => {
-		if (isOfflineSet) return;
-		isOfflineSet = true;
-		const uname = username;
-		if (!uname) return;
-		let activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
-		if (hasCountedAsActive) {
-			activeCount = Math.max(0, activeCount - 1);
-		}
-		if (activeCount <= 0) {
-			ACTIVE_CONNECTIONS_COUNT.delete(uname);
-			let cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
-			let cachedReqs = USER_REQ_CACHE.get(uname) || 0;
-			let nowOff = Date.now();
-			let lastWrite = GLOBAL_LAST_DB_WRITE.get(uname) || 0;
-			let shouldCommit = (cachedBytes >= 20 * 1024 * 1024) || (nowOff - lastWrite > 600000) || (cachedReqs >= 20);
-			if (shouldCommit && (cachedBytes > 0 || cachedReqs > 0) && !GLOBAL_WRITE_LOCK.get(uname)) {
-				GLOBAL_WRITE_LOCK.set(uname, true);
-				GLOBAL_LAST_DB_WRITE.set(uname, nowOff);
-				GLOBAL_TRAFFIC_CACHE.set(uname, (GLOBAL_TRAFFIC_CACHE.get(uname) || 0) - cachedBytes);
-				USER_REQ_CACHE.set(uname, (USER_REQ_CACHE.get(uname) || 0) - cachedReqs);
-				const deltaGb = cachedBytes / (1024 * 1024 * 1024);
-				const writeTask = async () => {
-					try {
-						await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, nowOff, uname).run();
-						await recordDailyTraffic(env, ctx, deltaGb);
-					} catch (e) {
-						console.error(e.message);
-						GLOBAL_TRAFFIC_CACHE.set(uname, (GLOBAL_TRAFFIC_CACHE.get(uname) || 0) + cachedBytes);
-						USER_REQ_CACHE.set(uname, (USER_REQ_CACHE.get(uname) || 0) + cachedReqs);
-					} finally {
-						GLOBAL_WRITE_LOCK.delete(uname);
-						GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-					}
-				};
-				if (ctx) {
-					ctx.waitUntil(writeTask());
-				} else {
-					writeTask();
-				}
-			} else {
-				GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-			}
-		} else {
-			ACTIVE_CONNECTIONS_COUNT.set(uname, activeCount);
-		}
-	};
-	// «دیده‌شده/تأییدشده» (نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): فقط تصمیم
-	// می‌گیره که آیا شرایط تأیید (اتصال پایدار یا اتصال‌های کوتاهِ زیاد) رسیده یا نه -
-	// از addBytes (هر بار دیتا رد بشه) و از هیت‌بیت (هر ~۲۰-۲۵ ثانیه، برای اتصال‌های
-	// کم‌حجمی که addBytes به تنهایی زود بهشون نمی‌رسه) صدا زده می‌شه. تا وقتی شرط رد
-	// نشده کاملاً بی‌اثره - نه D1 می‌خونه/می‌نویسه، نه چیزی رو کند می‌کنه. فقط وقتی
-	// واقعاً رد بشه یک بار confirmActiveIp (تنها جایی که الان سقف ip_limit رو واقعاً
-	// اعمال می‌کنه) صدا زده می‌شه.
-	const checkDeviceConfirmation = () => {
-		if (deviceConfirmed || deviceConfirmInFlight) return;
-		if (!username || !validUUID || !clientIP || clientIP === "unknown") return;
-		const nowT = Date.now();
-		const stableOk = (nowT - connectionStartTime >= DEVICE_CONFIRM_MIN_DURATION_MS) && (connectionBytesSoFar >= DEVICE_CONFIRM_MIN_BYTES);
-		const burstOk = getBurstBytes(username + "|" + clientIP, nowT) >= DEVICE_CONFIRM_BURST_BYTES;
-		if (!stableOk && !burstOk) return;
-		deviceConfirmInFlight = true;
-		const task = (async () => {
-			try {
-				const admitted = await confirmActiveIp(env, ctx, validUUID, username, clientIP, nowT);
-				if (admitted) {
-					deviceConfirmed = true;
-					// اگه تا وقتی D1 round-trip بالا تموم بشه همین اتصال از قبل بسته شده باشه
-					// (setOffline زودتر اجرا شده)، شمارنده‌ی سوکت‌های زنده رو دست نمی‌زنیم -
-					// وگرنه یه شمارشِ اضافه‌ی «شبح» می‌مونه که هیچ‌وقت کم نمی‌شه.
-					if (!hasCountedAsActive && !isOfflineSet) {
-						let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
-						ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
-						hasCountedAsActive = true;
-					}
-				} else {
-					// سقف «محدودیت کاربر» پره - طبق سیاست، دقیقاً همین‌جا (لحظه‌ی تأیید) اعمال
-					// می‌شه، نه موقع هندشیک؛ نتیجه: تست‌های پینگِ کوتاه هیچ‌وقت به اینجا نمی‌رسن
-					// (رد نمی‌شن)، ولی استفاده‌ی واقعی‌ای که جا نداره همین‌جا قطع می‌شه.
-					closeSocketQuietly(serverSock);
-				}
-			} catch (e) {
-			} finally {
-				deviceConfirmInFlight = false;
-			}
-		})();
-		if (ctx) ctx.waitUntil(task);
-	};
-	let heartbeat;
-	const runHeartbeat = async () => {
-		if (serverSock.readyState === WebSocket.OPEN) {
-			try {
-				if (!validUUID || !username) {
-					heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
-					return;
-				}
-				const nowTime = Date.now();
-				const lastCheck = GLOBAL_LAST_ACTIVE_WRITE.get(username + "_hb") || 0;
-				if (nowTime - lastCheck >= 180000) {
-					GLOBAL_LAST_ACTIVE_WRITE.set(username + "_hb", nowTime);
-					let user = await getCachedAuthUser("u", validUUID);
-					if (user === undefined) {
-						user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(validUUID).first();
-						putCachedAuthUser(ctx, "u", validUUID, user || null);
-					}
-					let isExpired = false;
-					let isIpLimitExpired = false;
-					let updatedActiveIps = null;
-					if (!user || user.is_active === 0) {
-						isExpired = true;
-					} else {
-						const liveGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
-						if (user.limit_gb && liveGb >= user.limit_gb) isExpired = true;
-						if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) >= user.limit_req) isExpired = true;
-						if (user.expiry_days) {
-							if (user.start_on_first_connect === 1) {
-								if (user.first_connection_time) {
-									const expiryDate = new Date(user.first_connection_time + user.expiry_days * 86400000);
-									if (nowTime > expiryDate.getTime()) isExpired = true;
-								}
-							} else if (user.created_at) {
-								const expiryDate = new Date(new Date(user.created_at).getTime() + user.expiry_days * 86400000);
-								if (nowTime > expiryDate.getTime()) isExpired = true;
-							}
-						}
-						if (!isExpired && clientIP && clientIP !== "unknown") {
-							if (!deviceConfirmed) {
-								// «دیده‌شده/تأییدشده»: این اتصال هنوز تأیید نشده - این هیت‌بیت فقط یه
-								// فرصت دیگه‌ست تا شرایط تأیید (DEVICE_CONFIRM_*) چک بشه، بدون اینکه
-								// مستقیم چیزی توی activeIps نوشته بشه یا سقف اعمال بشه (اون کار فقط
-								// با checkDeviceConfirmation/confirmActiveIp انجام می‌شه).
-								checkDeviceConfirmation();
-							} else {
-								let activeIps = {};
-								try {
-									activeIps = JSON.parse(user.active_ips || "{}");
-								} catch (e) { }
-								let hasChanges = false;
-								let needsDbUpdateForTimestamp = false;
-
-								for (const [ip, data] of Object.entries(activeIps)) {
-									const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-									if (nowTime - lastSeen > 180000 && ip !== clientIP) {
-										delete activeIps[ip];
-										hasChanges = true;
-									}
-								}
-								if (!activeIps[clientIP]) {
-									activeIps[clientIP] = { timestamp: nowTime, count: 1 };
-									hasChanges = true;
-								} else {
-									const currentData = activeIps[clientIP];
-									const lastSeen = typeof currentData === "object" ? currentData.timestamp : currentData;
-									if (nowTime - lastSeen > 150000) {
-										if (typeof activeIps[clientIP] === "object") {
-											activeIps[clientIP].timestamp = nowTime;
-										} else {
-											activeIps[clientIP] = { timestamp: nowTime, count: 1 };
-										}
-										needsDbUpdateForTimestamp = true;
-									}
-								}
-								// «سقف در لحظه‌ی تأیید، نه هندشیک/هیت‌بیت»: ip_limit دیگه اینجا (رفرشِ
-								// یه دستگاهِ از قبل تأییدشده) چک نمی‌شه - فقط توی confirmActiveIp، یه
-								// بار، موقع تأیید. نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل.
-								if (hasChanges || needsDbUpdateForTimestamp) updatedActiveIps = true;
-							}
-						}
-					}
-					if (isExpired) {
-						await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(validUUID).run();
-						await invalidateUserAuthCache(ctx, validUUID);
-						clearTimeout(heartbeat);
-						closeSocketQuietly(serverSock);
-						return;
-					}
-					// محدودیت کل ریکوئست روزانه‌ی اکانت: بر خلاف بالا، عمداً هیچ فیلدی روی users نوشته
-					// نمی‌شه (کاربر is_active می‌مونه) - فقط همین سوکت باز بسته می‌شه. با رد شدن تاریخ
-					// UTC، isGlobalReqLimitReached خودش false برمی‌گرده و کاربر می‌تونه دوباره وصل بشه.
-					if (await isGlobalReqLimitReached(env, ctx)) {
-						clearTimeout(heartbeat);
-						closeSocketQuietly(serverSock);
-						return;
-					}
-					if (isIpLimitExpired) {
-						/* Bypassed: clearTimeout(heartbeat); closeSocketQuietly(serverSock); return; */
-					}
-					if (updatedActiveIps) {
-						GLOBAL_LAST_DB_WRITE.set(username, nowTime);
-						GLOBAL_LAST_ACTIVE_WRITE.set(username, nowTime);
-						await persistActiveIp(env, ctx, validUUID, username, clientIP, nowTime);
-					} else if (nowTime - (GLOBAL_LAST_DB_WRITE.get(username) || 0) >= 900000) {
-						GLOBAL_LAST_DB_WRITE.set(username, nowTime);
-						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(nowTime, username).run();
-					}
-				}
-			} catch (e) { }
-			heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
-		} else {
-			clearTimeout(heartbeat);
-		}
-	};
-	heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
-	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
-	let reqUUID = null;
-	let inlinePanelIPs = null; // optional per-connection ProxyIP fallback list, decoded from the request path (see decodeInlinePanelIPs)
-	let isHeaderParsed = false;
-	let isHeaderParsing = false;
-	let isDnsQuery = false;
-	let isTrojanProto = false;
-	let chunkBuffer = new Uint8Array(0);
-	let uncountedBytes = 0;
-	let wsChain = Promise.resolve();
-	let wsStopped = false,
-		wsFailed = false,
-		wsFinished = false;
-	let wsQueueBytes = 0,
-		wsQueueItems = 0;
-	let currentSocketWriter = null,
-		activeRemoteWriter = null;
-	const releaseRemoteWriter = () => {
-		if (activeRemoteWriter) {
-			try {
-				activeRemoteWriter.releaseLock();
-			} catch (e) { }
-			activeRemoteWriter = null;
-		}
-		currentSocketWriter = null;
-	};
-	const getRemoteWriter = () => {
-		const s = remoteConnWrapper.socket;
-		if (!s) return null;
-		if (s !== currentSocketWriter) {
-			releaseRemoteWriter();
-			currentSocketWriter = s;
-			activeRemoteWriter = s.writable.getWriter();
-		}
-		return activeRemoteWriter;
-	};
-	const upstreamQueue = createUpstreamQueue({
-		getWriter: getRemoteWriter,
-		releaseWriter: releaseRemoteWriter,
-		retryConnect: async () => {
-			if (typeof remoteConnWrapper.retryConnect === "function") {
-				await remoteConnWrapper.retryConnect();
-			}
-		},
-		closeConnection: () => {
-			try {
-				remoteConnWrapper.socket?.close();
-			} catch (e) { }
-			closeSocketQuietly(serverSock);
-		},
-		name: "vIeesWSQueue",
-	});
-	const writeToRemote = async (chunk, allowRetry = true) => {
-		return upstreamQueue.writeAndAwait(chunk, allowRetry);
-	};
-	const processWsMessage = async (chunk) => {
-		const bytes = chunk.byteLength || 0;
-		addBytes(bytes);
-		if (isDnsQuery) {
-			if (isTrojanProto) {
-				await forwardTrojanUDP(chunk, serverSock, addBytes, targetDns);
-			} else {
-				await forwardvIeesUDP(chunk, serverSock, null, addBytes, targetDns);
-			}
-			return;
-		}
-		if (isHeaderParsed) {
-			if (remoteConnWrapper.connectingPromise) {
-				await remoteConnWrapper.connectingPromise;
-			}
-			await writeToRemote(chunk);
-			return;
-		}
-		if (!isHeaderParsed) {
-			chunkBuffer = concatBytes(chunkBuffer, chunk);
-			
-			let isTrojan = false;
-			if (chunkBuffer.byteLength >= 58 && chunkBuffer[56] === 0x0D && chunkBuffer[57] === 0x0A) {
-				const checkHex = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
-				if (/^[0-9a-f]{56}$/.test(checkHex)) {
-					isTrojan = true;
-				}
-			}
-			let cmd = 0;
-			let port = 0;
-			let addrType = 0;
-			let addr = "";
-			let rawData = null;
-			let respHeader = null;
-			let userLookupKey = null;
-			if (isTrojan) {
-				if (chunkBuffer.byteLength < 60) return;
-				const hexHash = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
-				userLookupKey = hexHash;
-				let offset = 58;
-				cmd = chunkBuffer[offset++];
-				addrType = chunkBuffer[offset++];
-				if (addrType === 1) {
-					if (chunkBuffer.byteLength < offset + 4 + 2 + 2) return;
-					addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
-				} else if (addrType === 3) {
-					if (chunkBuffer.byteLength < offset + 1) return;
-					const domainLen = chunkBuffer[offset++];
-					if (chunkBuffer.byteLength < offset + domainLen + 2 + 2) return;
-					addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
-					offset += domainLen;
-				} else if (addrType === 4) {
-					if (chunkBuffer.byteLength < offset + 16 + 2 + 2) return;
-					const v6 = [];
-					for (let i = 0; i < 8; i++) {
-						v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
-					}
-					addr = v6.join(":");
-				} else {
-					serverSock.close();
-					return;
-				}
-				port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
-				if (chunkBuffer.byteLength < offset + 2) return;
-				if (chunkBuffer[offset] !== 0x0D || chunkBuffer[offset + 1] !== 0x0A) {
-					serverSock.close();
-					return;
-				}
-				offset += 2;
-				rawData = chunkBuffer.slice(offset);
-				respHeader = null;
-			} else {
-				if (chunkBuffer.byteLength < 24) return;
-				let optLen = chunkBuffer[17];
-				let requiredLen = 18 + optLen + 4;
-				if (chunkBuffer.byteLength < requiredLen) return;
-				addrType = chunkBuffer[18 + optLen + 3];
-				if (addrType === 1) {
-					requiredLen += 4;
-				} else if (addrType === 2) {
-					requiredLen += 1;
-					if (chunkBuffer.byteLength < requiredLen) return;
-					requiredLen += chunkBuffer[18 + optLen + 4];
-				} else if (addrType === 3) {
-					requiredLen += 16;
-				} else {
-					serverSock.close();
-					return;
-				}
-				if (chunkBuffer.byteLength < requiredLen) return;
-				reqUUID = extractUUIDFromvIees(chunkBuffer);
-				if (!reqUUID) {
-					serverSock.close();
-					return;
-				}
-				userLookupKey = reqUUID;
-				let offset = 17;
-				optLen = chunkBuffer[offset++];
-				offset += optLen;
-				cmd = chunkBuffer[offset++];
-				port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
-				addrType = chunkBuffer[offset++];
-				if (addrType === 1) {
-					addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
-				} else if (addrType === 2) {
-					const domainLen = chunkBuffer[offset++];
-					addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
-					offset += domainLen;
-				} else if (addrType === 3) {
-					const v6 = [];
-					for (let i = 0; i < 8; i++) {
-						v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
-					}
-					addr = v6.join(":");
-				}
-				rawData = chunkBuffer.slice(offset);
-				respHeader = new Uint8Array([chunkBuffer[0], 0]);
-			}
-			if (isHeaderParsing) return;
-			isHeaderParsing = true;
-			isTrojanProto = isTrojan;
-			let user = null;
-			try {
-				const authCacheKind = isTrojan ? "t" : "u";
-				const cachedAuthUser = await getCachedAuthUser(authCacheKind, userLookupKey);
-				if (cachedAuthUser !== undefined) {
-					user = cachedAuthUser; // may be null - a cached "no such user" (negative cache)
-				} else {
-					if (isTrojan) {
-						user = await env.DB.prepare("SELECT * FROM users WHERE trojan_hash = ? OR uuid = ?").bind(userLookupKey, userLookupKey).first();
-						if (!user) {
-							const { results } = await env.DB.prepare("SELECT * FROM users WHERE is_active = 1").all();
-							if (results) {
-								user = results.find(u => u.uuid && sha224Pure(u.uuid) === userLookupKey) || null;
-							}
-						}
-					} else {
-						user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(userLookupKey).first();
-					}
-					putCachedAuthUser(ctx, authCacheKind, userLookupKey, user || null);
-				}
-			} catch (e) { }
-			if (!user) {
-				serverSock.close();
-				return;
-			}
-			const userConn = String(user.connection_type || "vless").toLowerCase();
-			if (isTrojan) {
-				if (!userConn.includes("trojan")) {
-					serverSock.close();
-					return;
-				}
-			} else {
-				if (!userConn.includes("vless") && userConn !== "vl" + "e" + "ss") {
-					serverSock.close();
-					return;
-				}
-			}
-			reqUUID = user.uuid;
-			if (request) {
-				const reqUrl = new URL(request.url);
-				if (!reqUrl.pathname.startsWith("/ZYX")) {
-					serverSock.close();
-					return;
-				}
-				const pathSegments = reqUrl.pathname.split("/").filter(Boolean);
-				const lastPathSeg = decodeURIComponent(pathSegments[pathSegments.length - 1] || "");
-				inlinePanelIPs = decodeInlinePanelIPs(lastPathSeg);
-			}
-			username = user.username;
-			validUUID = reqUUID;
-			let currentReqs = USER_REQ_CACHE.get(username) || 0;
-			USER_REQ_CACHE.set(username, currentReqs + 1);
-			if (!GLOBAL_TRAFFIC_CACHE.has(username)) {
-				GLOBAL_TRAFFIC_CACHE.set(username, 0);
-			}
-			if (isOfflineSet || serverSock.readyState !== WebSocket.OPEN) {
-				return;
-			}
-			if (user.is_active === 0) {
-				serverSock.close();
-				return;
-			}
-			const liveGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
-			if (user.limit_gb && liveGb >= user.limit_gb) {
-				serverSock.close();
-				return;
-			}
-			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) > user.limit_req) {
-				serverSock.close();
-				return;
-			}
-			if (await isGlobalReqLimitReached(env, ctx)) {
-				serverSock.close();
-				return;
-			}
-			if (user.start_on_first_connect === 1 && !user.first_connection_time && !GLOBAL_WRITE_LOCK.get(reqUUID + "_first_conn")) {
-				GLOBAL_WRITE_LOCK.set(reqUUID + "_first_conn", true);
-				const firstConnectNow = Date.now();
-				user.first_connection_time = firstConnectNow;
-				const updateFirstTask = async () => {
-					try {
-						// Guard with "AND first_connection_time IS NULL" so a genuinely concurrent
-						// request (a race within this isolate, or - more likely, given the 10s auth
-						// cache TTL - a different isolate that hasn't seen this write yet) can never
-						// overwrite an already-stamped first_connection_time with a later timestamp.
-						await env.DB.prepare("UPDATE users SET first_connection_time = ? WHERE uuid = ? AND first_connection_time IS NULL").bind(firstConnectNow, reqUUID).run();
-						// BUGFIX: this write previously did not invalidate the auth cache entry, so
-						// any connection from the same user in the next up-to-10s (same isolate is
-						// covered by GLOBAL_WRITE_LOCK above, but a different isolate is not) could
-						// still read the stale cached row with first_connection_time still null,
-						// re-enter this block, and (before the IS NULL guard above) push the user's
-						// real expiry date later. Every other write to a cached/auth-relevant field
-						// in this file calls invalidateUserAuthCache() right after - this was the one
-						// path that didn't.
-						await invalidateUserAuthCache(ctx, reqUUID, user.trojan_hash);
-					} catch (e) {
-						GLOBAL_WRITE_LOCK.delete(reqUUID + "_first_conn");
-					}
-				};
-				if (ctx) ctx.waitUntil(updateFirstTask());
-				else updateFirstTask();
-			}
-			if (user.expiry_days) {
-				let isTimeExpired = false;
-				if (user.start_on_first_connect === 1) {
-					if (user.first_connection_time) {
-						const expiryDate = new Date(user.first_connection_time + user.expiry_days * 24 * 60 * 60 * 1000);
-						if (new Date() > expiryDate) isTimeExpired = true;
-					}
-				} else if (user.created_at) {
-					const created = new Date(user.created_at);
-					const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
-					if (new Date() > expiryDate) isTimeExpired = true;
-				}
-				if (isTimeExpired) {
-					try {
-						await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(reqUUID).run();
-						await invalidateUserAuthCache(ctx, reqUUID);
-					} catch (e) { }
-					serverSock.close();
-					return;
-				}
-			}
-			if (user.block_porn === 1 && user.block_ads === 1) {
-				targetDns = "94.140.14.15";
-				targetDoh = "https://family.adguard-dns.com/dns-query";
-			} else if (user.block_porn === 1) {
-				targetDns = "1.1.1.3";
-				targetDoh = "https://family.cloudflare-dns.com/dns-query";
-			} else if (user.block_ads === 1) {
-				targetDns = "94.140.14.14";
-				targetDoh = "https://dns.adguard-dns.com/dns-query";
-			}
-			if (clientIP && clientIP !== "unknown") {
-				// «دیده‌شده/تأییدشده» (نگاه کنید توضیح DEVICE_CONFIRM_* بالای فایل): این IP فقط
-				// وقتی همین‌جا فوری «تأییدشده» حساب می‌شه که از قبل توی active_ips کاربر باشه و
-				// هنوز تازه باشه - یعنی همین دستگاه از قبل یه اتصال دیگه داشته و این یکی صرفاً
-				// reconnect/تب جدیدشه؛ دقیقاً همون رفتار قبلی، بدون تأخیر، تا سرعت یا اتصال
-				// دستگاه‌های از قبل متصل عوض نشه. اگه IP تازه باشه، هیچی اینجا روی D1 نوشته
-				// نمی‌شه و سقف «محدودیت کاربر»/ip_limit هم اینجا چک نمی‌شه؛ تصمیم می‌مونه برای
-				// checkDeviceConfirmation() (تعریف‌شده بالاتر، از addBytes/هیت‌بیت صدا زده می‌شه).
-				let activeIps = {};
-				try {
-					activeIps = JSON.parse(user.active_ips || "{}");
-				} catch (e) { }
-				const now = Date.now();
-				for (const [ip, data] of Object.entries(activeIps)) {
-					const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-					if (now - lastSeen > 180000) delete activeIps[ip];
-				}
-				if (activeIps[clientIP]) {
-					deviceConfirmed = true;
-					if (typeof activeIps[clientIP] === "object") {
-						activeIps[clientIP].timestamp = now;
-						activeIps[clientIP].count = (activeIps[clientIP].count || 0) + 1;
-					} else {
-						activeIps[clientIP] = { timestamp: now, count: 1 };
-					}
-					let lastDbW = GLOBAL_LAST_DB_WRITE.get(username) || 0;
-					if (now - lastDbW > 900000) {
-						GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
-						GLOBAL_LAST_DB_WRITE.set(username, now);
-						persistActiveIp(env, ctx, reqUUID, username, clientIP, now);
-					}
-				}
-			}
-			isHeaderParsed = true;
-			if (deviceConfirmed) {
-				let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
-				ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
-				hasCountedAsActive = true;
-			}
-			try {
-				let isDomainAddress = (isTrojanProto && addrType === 3) || (!isTrojanProto && addrType === 2);
-				let isIpAddress = (isTrojanProto && (addrType === 1 || addrType === 4)) || (!isTrojanProto && (addrType === 1 || addrType === 3));
-				let sniffedDomain = null;
-				if (isIpAddress && port === 443 && rawData && rawData.byteLength > 43) {
-					try {
-						let pos = 43;
-						if (rawData[0] === 0x16 && rawData[5] === 0x01) {
-							const sessionIdLen = rawData[pos];
-							pos += 1 + sessionIdLen;
-							const cipherSuitesLen = (rawData[pos] << 8) | rawData[pos + 1];
-							pos += 2 + cipherSuitesLen;
-							const compMethodsLen = rawData[pos];
-							pos += 1 + compMethodsLen;
-							const extensionsLen = (rawData[pos] << 8) | rawData[pos + 1];
-							pos += 2;
-							const endPos = Math.min(pos + extensionsLen, rawData.byteLength);
-							while (pos + 4 <= endPos) {
-								const extType = (rawData[pos] << 8) | rawData[pos + 1];
-								const extLen = (rawData[pos + 2] << 8) | rawData[pos + 3];
-								pos += 4;
-								if (extType === 0x0000) {
-									let sniListLen = (rawData[pos] << 8) | rawData[pos + 1];
-									let sniPos = pos + 2;
-									if (rawData[sniPos] === 0x00) {
-										let sniLen = (rawData[sniPos + 1] << 8) | rawData[sniPos + 2];
-										sniffedDomain = new TextDecoder().decode(rawData.slice(sniPos + 3, sniPos + 3 + sniLen));
-										break;
-									}
-								}
-								pos += extLen;
-							}
-						}
-					} catch (e) {}
-				}
-				if (user.block_porn === 1 || user.block_ads === 1) {
-					const dohIps = ["8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9", "149.112.112.112", "208.67.222.222", "208.67.220.220", "2001:4860:4860::8888", "2001:4860:4860::8844", "2606:4700:4700::1111", "2606:4700:4700::1001"];
-					if (port === 443 && isIpAddress && dohIps.includes(addr)) {
-						serverSock.close();
-						return;
-					}
-				}
-				let checkDomain = isDomainAddress ? addr : sniffedDomain;
-				if ((user.block_ads === 1 || user.block_porn === 1) && checkDomain && port !== 53) {
-					try {
-						const dnsCheck = await dohQuery(checkDomain, "A", targetDoh);
-						const isBlocked = dnsCheck.some((r) => r.data === "0.0.0.0" || r.data === "::" || r.data === "176.103.130.130");
-						if (isBlocked) {
-							serverSock.close();
-							return;
-						}
-						if (user.block_porn === 1 && dnsCheck.length > 0) {
-							const isSearchEngine = /(google\.|bing\.com|yandex\.|yahoo\.|duckduckgo\.com|youtube\.)/i.test(checkDomain);
-							if (isSearchEngine) {
-								const validIpRecord = dnsCheck.find(r => r.type === 1 || r.type === 28);
-								if (validIpRecord) {
-									const safeIp = validIpRecord.data;
-									if (safeIp && safeIp !== "0.0.0.0" && safeIp !== "::") {
-										addr = safeIp;
-									}
-								}
-							}
-						}
-					} catch (e) { }
-				}
-				if ((isTrojanProto && cmd === 3) || (!isTrojanProto && cmd === 2)) {
-					if (port === 53) {
-						isDnsQuery = true;
-						if (isTrojanProto) {
-							await forwardTrojanUDP(rawData, serverSock, addBytes, targetDns);
-						} else {
-							await forwardvIeesUDP(rawData, serverSock, respHeader, addBytes, targetDns);
-						}
-						return;
-					}
-					if (!isTrojanProto && respHeader) {
-						try { serverSock.send(respHeader); } catch(e) {}
-					}
-					if (port === 443) {
-						setTimeout(() => {
-							try { serverSock.close(); } catch(e) {}
-						}, 100);
-						return;
-					}
-					return;
-				}
-				if (port === 25 || /^(0\.|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|localhost$|::1|::ffff:|fd[0-9a-f]{2}:|fe80:)/i.test(addr)) {
-					serverSock.close();
-					return;
-				}
-				const connectTCP = async (dataPayload = null, useFallback = true) => {
-					if (remoteConnWrapper.connectingPromise) {
-						await remoteConnWrapper.connectingPromise;
-						return;
-					}
-					const task = (async () => {
-						let s = null;
-						const socks5 = getSelectedUserProxy(user?.user_socks5, request);
-						if (socks5) {
-							try {
-								s = await connectProxy(socks5, addr, port, dataPayload);
-							} catch (proxyErr) {
-								if (user.auto_rotate_user_proxy === 1) {
-									const replaceTask = replaceBrokenProxy(user.username, env, socks5);
-									if (ctx) ctx.waitUntil(replaceTask);
-									else replaceTask.catch(() => { });
-								}
-								throw proxyErr;
-							}
-						} else {
-							try {
-								s = await connectDirect(addr, port, dataPayload, targetDoh);
-							} catch (directErr) {
-								if (useFallback) {
-									let fallbackSuccess = false;
-									if (inlinePanelIPs && inlinePanelIPs.length) {
-										for (const panelIP of inlinePanelIPs) {
-											try {
-												s = await connectDirect(panelIP, port, dataPayload, targetDoh);
-												fallbackSuccess = true;
-												break;
-											} catch (inlineErr) { }
-										}
-									}
-									if (!fallbackSuccess) {
-										const IATA_LIST = ["FRA", "AMS", "LHR", "CDG", "VIE", "HEL", "CPH", "MAD", "BCN", "MXP", "FCO", "ZRH", "WAW", "PRG", "DUB", "SNN", "MAN", "GVA", "BRU", "LIS", "ATH", "SOF", "OTP", "TLL", "RIX", "VNO", "BUD", "BEG", "ZAG", "MUC", "HAM", "SIN", "NRT", "HKG", "TPE", "ICN", "DXB", "BOM", "DEL", "YYZ", "YUL", "YVR", "JFK", "EWR", "LAX", "SFO", "ORD", "MIA", "DFW", "SEA", "IAD", "ATL"];
-										const shuffledIatas = IATA_LIST.slice().sort(() => 0.5 - Math.random());
-										const maxAttempts = 3;
-										for (let i = 0; i < maxAttempts && i < shuffledIatas.length; i++) {
-											const fallbackHost = shuffledIatas[i].toLowerCase() + ".proxyip.cmliussss.net";
-											try {
-												s = await connectDirect(fallbackHost, port, dataPayload, targetDoh);
-												fallbackSuccess = true;
-												break;
-											} catch (fallbackErr) { }
-										}
-									}
-									if (!fallbackSuccess) throw directErr;
-								} else {
-							throw directErr;
-						}
-					}
-				}
-				remoteConnWrapper.socket = s;
-				connectStreams(s, serverSock, respHeader, null, addBytes).finally(() => closeSocketQuietly(serverSock));
-			})();
-			remoteConnWrapper.connectingPromise = task;
-					try {
-						await task;
-					} finally {
-						if (remoteConnWrapper.connectingPromise === task) {
-							remoteConnWrapper.connectingPromise = null;
-						}
-					}
-				};
-				remoteConnWrapper.retryConnect = async () => connectTCP(null, false);
-				await connectTCP(rawData, true);
-			} catch (e) {
-				serverSock.close();
-			}
-		}
-	};
-	const handleWsError = (err) => {
-		if (wsFailed) return;
-		wsFailed = true;
-		wsStopped = true;
-		clearTimeout(heartbeat);
-		wsQueueBytes = 0;
-		wsQueueItems = 0;
-		upstreamQueue.clear();
-		releaseRemoteWriter();
-		closeSocketQuietly(serverSock);
-		setOffline();
-	};
-	const pushToChain = (task) => {
-		wsChain = wsChain.then(task).catch(handleWsError);
-	};
-	serverSock.addEventListener("message", (event) => {
-		if (wsStopped || wsFailed) return;
-		if (typeof event.data === "string") return;
-		const size = event.data.byteLength || 0;
-		const nextBytes = wsQueueBytes + size;
-		const nextItems = wsQueueItems + 1;
-		if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
-			handleWsError(new Error("ws queue overflow"));
-			return;
-		}
-		wsQueueBytes = nextBytes;
-		wsQueueItems = nextItems;
-		pushToChain(async () => {
-			wsQueueBytes = Math.max(0, wsQueueBytes - size);
-			wsQueueItems = Math.max(0, wsQueueItems - 1);
-			if (wsFailed) return;
-			await processWsMessage(event.data);
-		});
-	});
-	serverSock.addEventListener("close", () => {
-		clearTimeout(heartbeat);
-		closeSocketQuietly(serverSock);
-		setOffline();
-		if (wsFinished) return;
-		wsFinished = true;
-		wsStopped = true;
-		pushToChain(async () => {
-			if (wsFailed) return;
-			await upstreamQueue.awaitEmpty();
-			releaseRemoteWriter();
-		});
-	});
-	serverSock.addEventListener("error", (err) => {
-		handleWsError(err);
-	});
-	// Early Data (?ed=): وقتی path کانفیگ ed داشته باشد، کلاینت بایت‌های اول اتصال (هدر VLESS/Trojan + اولین دیتا)
-	// را به‌جای پیام WebSocket، داخل هدر Sec-WebSocket-Protocol و به‌صورت base64url می‌فرستد. اینجا همان
-	// بایت‌ها را دیکد می‌کنیم و قبل از هر پیام واقعی وارد همان زنجیره‌ی processWsMessage می‌کنیم (پارس هدر
-	// دست‌نخورده می‌ماند). هدر همین مقدار در پاسخ ۱۰۱ هم echo می‌شود. اگر کلاینت این هدر را نفرستد
-	// (لینک بدون ed) هیچ فرقی با قبل نمی‌کند؛ وابسته به فلگ دیتابیس هم نیست.
-	const earlyDataToken = request ? (request.headers.get("Sec-WebSocket-Protocol") || "").split(",")[0].trim() : "";
-	let earlyDataAccepted = false;
-	if (earlyDataToken && /^[A-Za-z0-9_-]+$/.test(earlyDataToken)) {
-		try {
-			let b64 = earlyDataToken.replace(/-/g, "+").replace(/_/g, "/");
-			b64 += "=".repeat((4 - (b64.length % 4)) % 4);
-			const bin = atob(b64);
-			const earlyBytes = new Uint8Array(bin.length);
-			for (let i = 0; i < bin.length; i++) earlyBytes[i] = bin.charCodeAt(i);
-			if (earlyBytes.byteLength > 0) {
-				earlyDataAccepted = true;
-				pushToChain(async () => {
-					if (wsFailed) return;
-					await processWsMessage(earlyBytes.buffer);
-				});
-			}
-		} catch (e) { }
-	}
-	return new Response(null, {
-		status: 101,
-		webSocket: clientSock,
-		headers: earlyDataAccepted ? { "Sec-WebSocket-Protocol": earlyDataToken } : undefined,
-	});
+async function handlevIees(env, storedData = null, ctx = null, request2 = null) {
+  let rawClientIP = request2 ? request2.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
+  let clientIP = rawClientIP;
+  if (rawClientIP !== "unknown") {
+    if (rawClientIP.includes(":")) {
+      const parts = rawClientIP.split(":");
+      if (parts.length >= 4) {
+        clientIP = parts.slice(0, 4).join(":") + "::/64";
+      }
+    } else if (rawClientIP.includes(".")) {
+      const parts = rawClientIP.split(".");
+      if (parts.length === 4) {
+        clientIP = parts.slice(0, 3).join(".") + ".0/24";
+      }
+    }
+  }
+  const socketPair = new WebSocketPair();
+  const [clientSock, serverSock] = Object.values(socketPair);
+  serverSock.accept();
+  serverSock.binaryType = "arraybuffer";
+  let username = null;
+  let validUUID = null;
+  let targetDns = "8.8.4.4";
+  let targetDoh = "https://cloudflare-dns.com/dns-query";
+  const connectionStartTime = Date.now();
+  let connectionBytesSoFar = 0;
+  let deviceConfirmed = false;
+  let deviceConfirmInFlight = false;
+  function addBytes(bytes) {
+    if (bytes <= 0) return;
+    if (!username) {
+      uncountedBytes += bytes;
+      return;
+    }
+    if (uncountedBytes > 0) {
+      bytes += uncountedBytes;
+      uncountedBytes = 0;
+    }
+    connectionBytesSoFar += bytes;
+    if (!deviceConfirmed && clientIP && clientIP !== "unknown") {
+      recordBurstBytes(username + "|" + clientIP, bytes, Date.now());
+      checkDeviceConfirmation();
+    }
+    let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+    GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
+    GLOBAL_LAST_ACTIVE_WRITE.set(username, Date.now());
+    if (GLOBAL_WRITE_LOCK.get(username)) return;
+    let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
+    let now = Date.now();
+    let thresholdBytes = 500 * 1024 * 1024;
+    if (current >= thresholdBytes && now - lastDbWrite > 18e4 || current > 0 && now - lastDbWrite > 9e5) {
+      GLOBAL_WRITE_LOCK.set(username, true);
+      let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+      let toCommitReq = USER_REQ_CACHE.get(username) || 0;
+      if (toCommit <= 0 && toCommitReq <= 0) {
+        GLOBAL_WRITE_LOCK.set(username, false);
+        return;
+      }
+      GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) - toCommit);
+      USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) - toCommitReq);
+      GLOBAL_LAST_DB_WRITE.set(username, now);
+      let deltaGb = toCommit / (1024 * 1024 * 1024);
+      let writeTask = async () => {
+        try {
+          await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, now, username).run();
+          await recordDailyTraffic(env, ctx, deltaGb);
+        } catch (e) {
+          console.error(e.message);
+          GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) + toCommit);
+          USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) + toCommitReq);
+        } finally {
+          GLOBAL_WRITE_LOCK.set(username, false);
+        }
+      };
+      if (ctx) ctx.waitUntil(writeTask());
+      else writeTask();
+    }
+  }
+  let isOfflineSet = false;
+  let hasCountedAsActive = false;
+  const setOffline = () => {
+    if (isOfflineSet) return;
+    isOfflineSet = true;
+    const uname = username;
+    if (!uname) return;
+    let activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
+    if (hasCountedAsActive) {
+      activeCount = Math.max(0, activeCount - 1);
+    }
+    if (activeCount <= 0) {
+      ACTIVE_CONNECTIONS_COUNT.delete(uname);
+      let cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
+      let cachedReqs = USER_REQ_CACHE.get(uname) || 0;
+      let nowOff = Date.now();
+      let lastWrite = GLOBAL_LAST_DB_WRITE.get(uname) || 0;
+      let shouldCommit = cachedBytes >= 20 * 1024 * 1024 || nowOff - lastWrite > 6e5 || cachedReqs >= 20;
+      if (shouldCommit && (cachedBytes > 0 || cachedReqs > 0) && !GLOBAL_WRITE_LOCK.get(uname)) {
+        GLOBAL_WRITE_LOCK.set(uname, true);
+        GLOBAL_LAST_DB_WRITE.set(uname, nowOff);
+        GLOBAL_TRAFFIC_CACHE.set(uname, (GLOBAL_TRAFFIC_CACHE.get(uname) || 0) - cachedBytes);
+        USER_REQ_CACHE.set(uname, (USER_REQ_CACHE.get(uname) || 0) - cachedReqs);
+        const deltaGb = cachedBytes / (1024 * 1024 * 1024);
+        const writeTask = async () => {
+          try {
+            await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, nowOff, uname).run();
+            await recordDailyTraffic(env, ctx, deltaGb);
+          } catch (e) {
+            console.error(e.message);
+            GLOBAL_TRAFFIC_CACHE.set(uname, (GLOBAL_TRAFFIC_CACHE.get(uname) || 0) + cachedBytes);
+            USER_REQ_CACHE.set(uname, (USER_REQ_CACHE.get(uname) || 0) + cachedReqs);
+          } finally {
+            GLOBAL_WRITE_LOCK.delete(uname);
+            GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+          }
+        };
+        if (ctx) {
+          ctx.waitUntil(writeTask());
+        } else {
+          writeTask();
+        }
+      } else {
+        GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+      }
+    } else {
+      ACTIVE_CONNECTIONS_COUNT.set(uname, activeCount);
+    }
+  };
+  const checkDeviceConfirmation = () => {
+    if (deviceConfirmed || deviceConfirmInFlight) return;
+    if (!username || !validUUID || !clientIP || clientIP === "unknown") return;
+    const nowT = Date.now();
+    const stableOk = nowT - connectionStartTime >= DEVICE_CONFIRM_MIN_DURATION_MS && connectionBytesSoFar >= DEVICE_CONFIRM_MIN_BYTES;
+    const burstOk = getBurstBytes(username + "|" + clientIP, nowT) >= DEVICE_CONFIRM_BURST_BYTES;
+    if (!stableOk && !burstOk) return;
+    deviceConfirmInFlight = true;
+    const task = (async () => {
+      try {
+        const admitted = await confirmActiveIp(env, ctx, validUUID, username, clientIP, nowT);
+        if (admitted) {
+          deviceConfirmed = true;
+          if (!hasCountedAsActive && !isOfflineSet) {
+            let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+            ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+            hasCountedAsActive = true;
+          }
+        } else {
+          closeSocketQuietly(serverSock);
+        }
+      } catch (e) {
+      } finally {
+        deviceConfirmInFlight = false;
+      }
+    })();
+    if (ctx) ctx.waitUntil(task);
+  };
+  let heartbeat;
+  const runHeartbeat = async () => {
+    if (serverSock.readyState === WebSocket.OPEN) {
+      try {
+        if (!validUUID || !username) {
+          heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5e3) + 2e4);
+          return;
+        }
+        const nowTime = Date.now();
+        const lastCheck = GLOBAL_LAST_ACTIVE_WRITE.get(username + "_hb") || 0;
+        if (nowTime - lastCheck >= 18e4) {
+          GLOBAL_LAST_ACTIVE_WRITE.set(username + "_hb", nowTime);
+          let user = await getCachedAuthUser("u", validUUID);
+          if (user === void 0) {
+            user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(validUUID).first();
+            putCachedAuthUser(ctx, "u", validUUID, user || null);
+          }
+          let isExpired = false;
+          let isIpLimitExpired = false;
+          let updatedActiveIps = null;
+          if (!user || user.is_active === 0) {
+            isExpired = true;
+          } else {
+            const liveGb = (user.used_gb || 0) + (GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024);
+            if (user.limit_gb && liveGb >= user.limit_gb) isExpired = true;
+            if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) >= user.limit_req) isExpired = true;
+            if (user.expiry_days) {
+              if (user.start_on_first_connect === 1) {
+                if (user.first_connection_time) {
+                  const expiryDate = new Date(user.first_connection_time + user.expiry_days * 864e5);
+                  if (nowTime > expiryDate.getTime()) isExpired = true;
+                }
+              } else if (user.created_at) {
+                const expiryDate = new Date(new Date(user.created_at).getTime() + user.expiry_days * 864e5);
+                if (nowTime > expiryDate.getTime()) isExpired = true;
+              }
+            }
+            if (!isExpired && clientIP && clientIP !== "unknown") {
+              if (!deviceConfirmed) {
+                checkDeviceConfirmation();
+              } else {
+                let activeIps = {};
+                try {
+                  activeIps = JSON.parse(user.active_ips || "{}");
+                } catch (e) {
+                }
+                let hasChanges = false;
+                let needsDbUpdateForTimestamp = false;
+                for (const [ip, data] of Object.entries(activeIps)) {
+                  const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+                  if (nowTime - lastSeen > 18e4 && ip !== clientIP) {
+                    delete activeIps[ip];
+                    hasChanges = true;
+                  }
+                }
+                if (!activeIps[clientIP]) {
+                  activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+                  hasChanges = true;
+                } else {
+                  const currentData = activeIps[clientIP];
+                  const lastSeen = typeof currentData === "object" ? currentData.timestamp : currentData;
+                  if (nowTime - lastSeen > 15e4) {
+                    if (typeof activeIps[clientIP] === "object") {
+                      activeIps[clientIP].timestamp = nowTime;
+                    } else {
+                      activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+                    }
+                    needsDbUpdateForTimestamp = true;
+                  }
+                }
+                if (hasChanges || needsDbUpdateForTimestamp) updatedActiveIps = true;
+              }
+            }
+          }
+          if (isExpired) {
+            await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(validUUID).run();
+            await invalidateUserAuthCache(ctx, validUUID);
+            clearTimeout(heartbeat);
+            closeSocketQuietly(serverSock);
+            return;
+          }
+          if (await isGlobalReqLimitReached(env, ctx)) {
+            clearTimeout(heartbeat);
+            closeSocketQuietly(serverSock);
+            return;
+          }
+          if (isIpLimitExpired) {
+          }
+          if (updatedActiveIps) {
+            GLOBAL_LAST_DB_WRITE.set(username, nowTime);
+            GLOBAL_LAST_ACTIVE_WRITE.set(username, nowTime);
+            await persistActiveIp(env, ctx, validUUID, username, clientIP, nowTime);
+          } else if (nowTime - (GLOBAL_LAST_DB_WRITE.get(username) || 0) >= 9e5) {
+            GLOBAL_LAST_DB_WRITE.set(username, nowTime);
+            await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(nowTime, username).run();
+          }
+        }
+      } catch (e) {
+      }
+      heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5e3) + 2e4);
+    } else {
+      clearTimeout(heartbeat);
+    }
+  };
+  heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5e3) + 2e4);
+  let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
+  let reqUUID = null;
+  let inlinePanelIPs = null;
+  let isHeaderParsed = false;
+  let isHeaderParsing = false;
+  let isDnsQuery = false;
+  let isTrojanProto = false;
+  let chunkBuffer = new Uint8Array(0);
+  let uncountedBytes = 0;
+  let wsChain = Promise.resolve();
+  let wsStopped = false, wsFailed = false, wsFinished = false;
+  let wsQueueBytes = 0, wsQueueItems = 0;
+  let currentSocketWriter = null, activeRemoteWriter = null;
+  const releaseRemoteWriter = () => {
+    if (activeRemoteWriter) {
+      try {
+        activeRemoteWriter.releaseLock();
+      } catch (e) {
+      }
+      activeRemoteWriter = null;
+    }
+    currentSocketWriter = null;
+  };
+  const getRemoteWriter = () => {
+    const s = remoteConnWrapper.socket;
+    if (!s) return null;
+    if (s !== currentSocketWriter) {
+      releaseRemoteWriter();
+      currentSocketWriter = s;
+      activeRemoteWriter = s.writable.getWriter();
+    }
+    return activeRemoteWriter;
+  };
+  const upstreamQueue = createUpstreamQueue({
+    getWriter: getRemoteWriter,
+    releaseWriter: releaseRemoteWriter,
+    retryConnect: async () => {
+      if (typeof remoteConnWrapper.retryConnect === "function") {
+        await remoteConnWrapper.retryConnect();
+      }
+    },
+    closeConnection: () => {
+      try {
+        remoteConnWrapper.socket?.close();
+      } catch (e) {
+      }
+      closeSocketQuietly(serverSock);
+    },
+    name: "vIeesWSQueue"
+  });
+  const writeToRemote = async (chunk, allowRetry = true) => {
+    return upstreamQueue.writeAndAwait(chunk, allowRetry);
+  };
+  const processWsMessage = async (chunk) => {
+    const bytes = chunk.byteLength || 0;
+    addBytes(bytes);
+    if (isDnsQuery) {
+      if (isTrojanProto) {
+        await forwardTrojanUDP(chunk, serverSock, addBytes, targetDns);
+      } else {
+        await forwardvIeesUDP(chunk, serverSock, null, addBytes, targetDns);
+      }
+      return;
+    }
+    if (isHeaderParsed) {
+      if (remoteConnWrapper.connectingPromise) {
+        await remoteConnWrapper.connectingPromise;
+      }
+      await writeToRemote(chunk);
+      return;
+    }
+    if (!isHeaderParsed) {
+      chunkBuffer = concatBytes(chunkBuffer, chunk);
+      let isTrojan = false;
+      if (chunkBuffer.byteLength >= 58 && chunkBuffer[56] === 13 && chunkBuffer[57] === 10) {
+        const checkHex = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
+        if (/^[0-9a-f]{56}$/.test(checkHex)) {
+          isTrojan = true;
+        }
+      }
+      let cmd = 0;
+      let port = 0;
+      let addrType = 0;
+      let addr = "";
+      let rawData = null;
+      let respHeader = null;
+      let userLookupKey = null;
+      if (isTrojan) {
+        if (chunkBuffer.byteLength < 60) return;
+        const hexHash = TEXT_DECODER.decode(chunkBuffer.slice(0, 56)).toLowerCase();
+        userLookupKey = hexHash;
+        let offset = 58;
+        cmd = chunkBuffer[offset++];
+        addrType = chunkBuffer[offset++];
+        if (addrType === 1) {
+          if (chunkBuffer.byteLength < offset + 4 + 2 + 2) return;
+          addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
+        } else if (addrType === 3) {
+          if (chunkBuffer.byteLength < offset + 1) return;
+          const domainLen = chunkBuffer[offset++];
+          if (chunkBuffer.byteLength < offset + domainLen + 2 + 2) return;
+          addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
+          offset += domainLen;
+        } else if (addrType === 4) {
+          if (chunkBuffer.byteLength < offset + 16 + 2 + 2) return;
+          const v6 = [];
+          for (let i = 0; i < 8; i++) {
+            v6.push((chunkBuffer[offset++] << 8 | chunkBuffer[offset++]).toString(16));
+          }
+          addr = v6.join(":");
+        } else {
+          serverSock.close();
+          return;
+        }
+        port = chunkBuffer[offset++] << 8 | chunkBuffer[offset++];
+        if (chunkBuffer.byteLength < offset + 2) return;
+        if (chunkBuffer[offset] !== 13 || chunkBuffer[offset + 1] !== 10) {
+          serverSock.close();
+          return;
+        }
+        offset += 2;
+        rawData = chunkBuffer.slice(offset);
+        respHeader = null;
+      } else {
+        if (chunkBuffer.byteLength < 24) return;
+        let optLen = chunkBuffer[17];
+        let requiredLen = 18 + optLen + 4;
+        if (chunkBuffer.byteLength < requiredLen) return;
+        addrType = chunkBuffer[18 + optLen + 3];
+        if (addrType === 1) {
+          requiredLen += 4;
+        } else if (addrType === 2) {
+          requiredLen += 1;
+          if (chunkBuffer.byteLength < requiredLen) return;
+          requiredLen += chunkBuffer[18 + optLen + 4];
+        } else if (addrType === 3) {
+          requiredLen += 16;
+        } else {
+          serverSock.close();
+          return;
+        }
+        if (chunkBuffer.byteLength < requiredLen) return;
+        reqUUID = extractUUIDFromvIees(chunkBuffer);
+        if (!reqUUID) {
+          serverSock.close();
+          return;
+        }
+        userLookupKey = reqUUID;
+        let offset = 17;
+        optLen = chunkBuffer[offset++];
+        offset += optLen;
+        cmd = chunkBuffer[offset++];
+        port = chunkBuffer[offset++] << 8 | chunkBuffer[offset++];
+        addrType = chunkBuffer[offset++];
+        if (addrType === 1) {
+          addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
+        } else if (addrType === 2) {
+          const domainLen = chunkBuffer[offset++];
+          addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
+          offset += domainLen;
+        } else if (addrType === 3) {
+          const v6 = [];
+          for (let i = 0; i < 8; i++) {
+            v6.push((chunkBuffer[offset++] << 8 | chunkBuffer[offset++]).toString(16));
+          }
+          addr = v6.join(":");
+        }
+        rawData = chunkBuffer.slice(offset);
+        respHeader = new Uint8Array([chunkBuffer[0], 0]);
+      }
+      if (isHeaderParsing) return;
+      isHeaderParsing = true;
+      isTrojanProto = isTrojan;
+      let user = null;
+      try {
+        const authCacheKind = isTrojan ? "t" : "u";
+        const cachedAuthUser = await getCachedAuthUser(authCacheKind, userLookupKey);
+        if (cachedAuthUser !== void 0) {
+          user = cachedAuthUser;
+        } else {
+          if (isTrojan) {
+            user = await env.DB.prepare("SELECT * FROM users WHERE trojan_hash = ? OR uuid = ?").bind(userLookupKey, userLookupKey).first();
+            if (!user) {
+              const { results } = await env.DB.prepare("SELECT * FROM users WHERE is_active = 1").all();
+              if (results) {
+                user = results.find((u) => u.uuid && sha224Pure(u.uuid) === userLookupKey) || null;
+              }
+            }
+          } else {
+            user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(userLookupKey).first();
+          }
+          putCachedAuthUser(ctx, authCacheKind, userLookupKey, user || null);
+        }
+      } catch (e) {
+      }
+      if (!user) {
+        serverSock.close();
+        return;
+      }
+      const userConn = String(user.connection_type || "vless").toLowerCase();
+      if (isTrojan) {
+        if (!userConn.includes("trojan")) {
+          serverSock.close();
+          return;
+        }
+      } else {
+        if (!userConn.includes("vless") && userConn !== "vless") {
+          serverSock.close();
+          return;
+        }
+      }
+      reqUUID = user.uuid;
+      if (request2) {
+        const reqUrl = new URL(request2.url);
+        if (!reqUrl.pathname.startsWith("/ZYX")) {
+          serverSock.close();
+          return;
+        }
+        const pathSegments = reqUrl.pathname.split("/").filter(Boolean);
+        const lastPathSeg = decodeURIComponent(pathSegments[pathSegments.length - 1] || "");
+        inlinePanelIPs = decodeInlinePanelIPs(lastPathSeg);
+      }
+      username = user.username;
+      validUUID = reqUUID;
+      let currentReqs = USER_REQ_CACHE.get(username) || 0;
+      USER_REQ_CACHE.set(username, currentReqs + 1);
+      if (!GLOBAL_TRAFFIC_CACHE.has(username)) {
+        GLOBAL_TRAFFIC_CACHE.set(username, 0);
+      }
+      if (isOfflineSet || serverSock.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      if (user.is_active === 0) {
+        serverSock.close();
+        return;
+      }
+      const liveGb = (user.used_gb || 0) + (GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024);
+      if (user.limit_gb && liveGb >= user.limit_gb) {
+        serverSock.close();
+        return;
+      }
+      if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) > user.limit_req) {
+        serverSock.close();
+        return;
+      }
+      if (await isGlobalReqLimitReached(env, ctx)) {
+        serverSock.close();
+        return;
+      }
+      if (user.start_on_first_connect === 1 && !user.first_connection_time && !GLOBAL_WRITE_LOCK.get(reqUUID + "_first_conn")) {
+        GLOBAL_WRITE_LOCK.set(reqUUID + "_first_conn", true);
+        const firstConnectNow = Date.now();
+        user.first_connection_time = firstConnectNow;
+        const updateFirstTask = async () => {
+          try {
+            await env.DB.prepare("UPDATE users SET first_connection_time = ? WHERE uuid = ? AND first_connection_time IS NULL").bind(firstConnectNow, reqUUID).run();
+            await invalidateUserAuthCache(ctx, reqUUID, user.trojan_hash);
+          } catch (e) {
+            GLOBAL_WRITE_LOCK.delete(reqUUID + "_first_conn");
+          }
+        };
+        if (ctx) ctx.waitUntil(updateFirstTask());
+        else updateFirstTask();
+      }
+      if (user.expiry_days) {
+        let isTimeExpired = false;
+        if (user.start_on_first_connect === 1) {
+          if (user.first_connection_time) {
+            const expiryDate = new Date(user.first_connection_time + user.expiry_days * 24 * 60 * 60 * 1e3);
+            if (/* @__PURE__ */ new Date() > expiryDate) isTimeExpired = true;
+          }
+        } else if (user.created_at) {
+          const created = new Date(user.created_at);
+          const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1e3);
+          if (/* @__PURE__ */ new Date() > expiryDate) isTimeExpired = true;
+        }
+        if (isTimeExpired) {
+          try {
+            await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(reqUUID).run();
+            await invalidateUserAuthCache(ctx, reqUUID);
+          } catch (e) {
+          }
+          serverSock.close();
+          return;
+        }
+      }
+      if (user.block_porn === 1 && user.block_ads === 1) {
+        targetDns = "94.140.14.15";
+        targetDoh = "https://family.adguard-dns.com/dns-query";
+      } else if (user.block_porn === 1) {
+        targetDns = "1.1.1.3";
+        targetDoh = "https://family.cloudflare-dns.com/dns-query";
+      } else if (user.block_ads === 1) {
+        targetDns = "94.140.14.14";
+        targetDoh = "https://dns.adguard-dns.com/dns-query";
+      }
+      if (clientIP && clientIP !== "unknown") {
+        let activeIps = {};
+        try {
+          activeIps = JSON.parse(user.active_ips || "{}");
+        } catch (e) {
+        }
+        const now = Date.now();
+        for (const [ip, data] of Object.entries(activeIps)) {
+          const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+          if (now - lastSeen > 18e4) delete activeIps[ip];
+        }
+        if (activeIps[clientIP]) {
+          deviceConfirmed = true;
+          if (typeof activeIps[clientIP] === "object") {
+            activeIps[clientIP].timestamp = now;
+            activeIps[clientIP].count = (activeIps[clientIP].count || 0) + 1;
+          } else {
+            activeIps[clientIP] = { timestamp: now, count: 1 };
+          }
+          let lastDbW = GLOBAL_LAST_DB_WRITE.get(username) || 0;
+          if (now - lastDbW > 9e5) {
+            GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
+            GLOBAL_LAST_DB_WRITE.set(username, now);
+            persistActiveIp(env, ctx, reqUUID, username, clientIP, now);
+          }
+        }
+      }
+      isHeaderParsed = true;
+      if (deviceConfirmed) {
+        let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+        ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+        hasCountedAsActive = true;
+      }
+      try {
+        let isDomainAddress = isTrojanProto && addrType === 3 || !isTrojanProto && addrType === 2;
+        let isIpAddress = isTrojanProto && (addrType === 1 || addrType === 4) || !isTrojanProto && (addrType === 1 || addrType === 3);
+        let sniffedDomain = null;
+        if (isIpAddress && port === 443 && rawData && rawData.byteLength > 43) {
+          try {
+            let pos = 43;
+            if (rawData[0] === 22 && rawData[5] === 1) {
+              const sessionIdLen = rawData[pos];
+              pos += 1 + sessionIdLen;
+              const cipherSuitesLen = rawData[pos] << 8 | rawData[pos + 1];
+              pos += 2 + cipherSuitesLen;
+              const compMethodsLen = rawData[pos];
+              pos += 1 + compMethodsLen;
+              const extensionsLen = rawData[pos] << 8 | rawData[pos + 1];
+              pos += 2;
+              const endPos = Math.min(pos + extensionsLen, rawData.byteLength);
+              while (pos + 4 <= endPos) {
+                const extType = rawData[pos] << 8 | rawData[pos + 1];
+                const extLen = rawData[pos + 2] << 8 | rawData[pos + 3];
+                pos += 4;
+                if (extType === 0) {
+                  let sniListLen = rawData[pos] << 8 | rawData[pos + 1];
+                  let sniPos = pos + 2;
+                  if (rawData[sniPos] === 0) {
+                    let sniLen = rawData[sniPos + 1] << 8 | rawData[sniPos + 2];
+                    sniffedDomain = new TextDecoder().decode(rawData.slice(sniPos + 3, sniPos + 3 + sniLen));
+                    break;
+                  }
+                }
+                pos += extLen;
+              }
+            }
+          } catch (e) {
+          }
+        }
+        if (user.block_porn === 1 || user.block_ads === 1) {
+          const dohIps = ["8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9", "149.112.112.112", "208.67.222.222", "208.67.220.220", "2001:4860:4860::8888", "2001:4860:4860::8844", "2606:4700:4700::1111", "2606:4700:4700::1001"];
+          if (port === 443 && isIpAddress && dohIps.includes(addr)) {
+            serverSock.close();
+            return;
+          }
+        }
+        let checkDomain = isDomainAddress ? addr : sniffedDomain;
+        if ((user.block_ads === 1 || user.block_porn === 1) && checkDomain && port !== 53) {
+          try {
+            const dnsCheck = await dohQuery(checkDomain, "A", targetDoh);
+            const isBlocked = dnsCheck.some((r) => r.data === "0.0.0.0" || r.data === "::" || r.data === "176.103.130.130");
+            if (isBlocked) {
+              serverSock.close();
+              return;
+            }
+            if (user.block_porn === 1 && dnsCheck.length > 0) {
+              const isSearchEngine = /(google\.|bing\.com|yandex\.|yahoo\.|duckduckgo\.com|youtube\.)/i.test(checkDomain);
+              if (isSearchEngine) {
+                const validIpRecord = dnsCheck.find((r) => r.type === 1 || r.type === 28);
+                if (validIpRecord) {
+                  const safeIp = validIpRecord.data;
+                  if (safeIp && safeIp !== "0.0.0.0" && safeIp !== "::") {
+                    addr = safeIp;
+                  }
+                }
+              }
+            }
+          } catch (e) {
+          }
+        }
+        if (isTrojanProto && cmd === 3 || !isTrojanProto && cmd === 2) {
+          if (port === 53) {
+            isDnsQuery = true;
+            if (isTrojanProto) {
+              await forwardTrojanUDP(rawData, serverSock, addBytes, targetDns);
+            } else {
+              await forwardvIeesUDP(rawData, serverSock, respHeader, addBytes, targetDns);
+            }
+            return;
+          }
+          if (!isTrojanProto && respHeader) {
+            try {
+              serverSock.send(respHeader);
+            } catch (e) {
+            }
+          }
+          if (port === 443) {
+            setTimeout(() => {
+              try {
+                serverSock.close();
+              } catch (e) {
+              }
+            }, 100);
+            return;
+          }
+          return;
+        }
+        if (port === 25 || /^(0\.|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|localhost$|::1|::ffff:|fd[0-9a-f]{2}:|fe80:)/i.test(addr)) {
+          serverSock.close();
+          return;
+        }
+        const connectTCP = async (dataPayload = null, useFallback = true) => {
+          if (remoteConnWrapper.connectingPromise) {
+            await remoteConnWrapper.connectingPromise;
+            return;
+          }
+          const task = (async () => {
+            let s = null;
+            const socks5 = getSelectedUserProxy(user?.user_socks5, request2);
+            if (socks5) {
+              try {
+                s = await connectProxy(socks5, addr, port, dataPayload);
+              } catch (proxyErr) {
+                if (user.auto_rotate_user_proxy === 1) {
+                  const replaceTask = replaceBrokenProxy(user.username, env, socks5);
+                  if (ctx) ctx.waitUntil(replaceTask);
+                  else replaceTask.catch(() => {
+                  });
+                }
+                throw proxyErr;
+              }
+            } else {
+              try {
+                s = await connectDirect(addr, port, dataPayload, targetDoh);
+              } catch (directErr) {
+                if (useFallback) {
+                  let fallbackSuccess = false;
+                  if (inlinePanelIPs && inlinePanelIPs.length) {
+                    for (const panelIP of inlinePanelIPs) {
+                      try {
+                        s = await connectDirect(panelIP, port, dataPayload, targetDoh);
+                        fallbackSuccess = true;
+                        break;
+                      } catch (inlineErr) {
+                      }
+                    }
+                  }
+                  if (!fallbackSuccess) {
+                    const IATA_LIST = ["FRA", "AMS", "LHR", "CDG", "VIE", "HEL", "CPH", "MAD", "BCN", "MXP", "FCO", "ZRH", "WAW", "PRG", "DUB", "SNN", "MAN", "GVA", "BRU", "LIS", "ATH", "SOF", "OTP", "TLL", "RIX", "VNO", "BUD", "BEG", "ZAG", "MUC", "HAM", "SIN", "NRT", "HKG", "TPE", "ICN", "DXB", "BOM", "DEL", "YYZ", "YUL", "YVR", "JFK", "EWR", "LAX", "SFO", "ORD", "MIA", "DFW", "SEA", "IAD", "ATL"];
+                    const shuffledIatas = IATA_LIST.slice().sort(() => 0.5 - Math.random());
+                    const maxAttempts = 3;
+                    for (let i = 0; i < maxAttempts && i < shuffledIatas.length; i++) {
+                      const fallbackHost = shuffledIatas[i].toLowerCase() + ".proxyip.cmliussss.net";
+                      try {
+                        s = await connectDirect(fallbackHost, port, dataPayload, targetDoh);
+                        fallbackSuccess = true;
+                        break;
+                      } catch (fallbackErr) {
+                      }
+                    }
+                  }
+                  if (!fallbackSuccess) throw directErr;
+                } else {
+                  throw directErr;
+                }
+              }
+            }
+            remoteConnWrapper.socket = s;
+            connectStreams(s, serverSock, respHeader, null, addBytes).finally(() => closeSocketQuietly(serverSock));
+          })();
+          remoteConnWrapper.connectingPromise = task;
+          try {
+            await task;
+          } finally {
+            if (remoteConnWrapper.connectingPromise === task) {
+              remoteConnWrapper.connectingPromise = null;
+            }
+          }
+        };
+        remoteConnWrapper.retryConnect = async () => connectTCP(null, false);
+        await connectTCP(rawData, true);
+      } catch (e) {
+        serverSock.close();
+      }
+    }
+  };
+  const handleWsError = (err) => {
+    if (wsFailed) return;
+    wsFailed = true;
+    wsStopped = true;
+    clearTimeout(heartbeat);
+    wsQueueBytes = 0;
+    wsQueueItems = 0;
+    upstreamQueue.clear();
+    releaseRemoteWriter();
+    closeSocketQuietly(serverSock);
+    setOffline();
+  };
+  const pushToChain = (task) => {
+    wsChain = wsChain.then(task).catch(handleWsError);
+  };
+  serverSock.addEventListener("message", (event) => {
+    if (wsStopped || wsFailed) return;
+    if (typeof event.data === "string") return;
+    const size = event.data.byteLength || 0;
+    const nextBytes = wsQueueBytes + size;
+    const nextItems = wsQueueItems + 1;
+    if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
+      handleWsError(new Error("ws queue overflow"));
+      return;
+    }
+    wsQueueBytes = nextBytes;
+    wsQueueItems = nextItems;
+    pushToChain(async () => {
+      wsQueueBytes = Math.max(0, wsQueueBytes - size);
+      wsQueueItems = Math.max(0, wsQueueItems - 1);
+      if (wsFailed) return;
+      await processWsMessage(event.data);
+    });
+  });
+  serverSock.addEventListener("close", () => {
+    clearTimeout(heartbeat);
+    closeSocketQuietly(serverSock);
+    setOffline();
+    if (wsFinished) return;
+    wsFinished = true;
+    wsStopped = true;
+    pushToChain(async () => {
+      if (wsFailed) return;
+      await upstreamQueue.awaitEmpty();
+      releaseRemoteWriter();
+    });
+  });
+  serverSock.addEventListener("error", (err) => {
+    handleWsError(err);
+  });
+  const earlyDataToken = request2 ? (request2.headers.get("Sec-WebSocket-Protocol") || "").split(",")[0].trim() : "";
+  let earlyDataAccepted = false;
+  if (earlyDataToken && /^[A-Za-z0-9_-]+$/.test(earlyDataToken)) {
+    try {
+      let b64 = earlyDataToken.replace(/-/g, "+").replace(/_/g, "/");
+      b64 += "=".repeat((4 - b64.length % 4) % 4);
+      const bin = atob(b64);
+      const earlyBytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) earlyBytes[i] = bin.charCodeAt(i);
+      if (earlyBytes.byteLength > 0) {
+        earlyDataAccepted = true;
+        pushToChain(async () => {
+          if (wsFailed) return;
+          await processWsMessage(earlyBytes.buffer);
+        });
+      }
+    } catch (e) {
+    }
+  }
+  return new Response(null, {
+    status: 101,
+    webSocket: clientSock,
+    headers: earlyDataAccepted ? { "Sec-WebSocket-Protocol": earlyDataToken } : void 0
+  });
 }
 let CF_USAGE_CACHE = null;
 let CF_USAGE_LAST_FETCH = 0;
-let CF_USAGE_CACHE_DATE = ""; 
-
+let CF_USAGE_CACHE_DATE = "";
 async function getCfUsage(env) {
-	if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return { today: 0, total: 0, d1Reads: 0, d1Writes: 0 };
-	const nowTime = Date.now();
-	const todayStr = new Date().toISOString().split("T")[0];
-	
-	if (CF_USAGE_CACHE && (nowTime - CF_USAGE_LAST_FETCH < 60000) && CF_USAGE_CACHE_DATE === todayStr) {
-		return CF_USAGE_CACHE;
-	}
-	try {
-		const now = new Date();
-		const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
-		const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
-		const q = `query {
+  if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return { today: 0, total: 0, d1Reads: 0, d1Writes: 0 };
+  const nowTime = Date.now();
+  const todayStr = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+  if (CF_USAGE_CACHE && nowTime - CF_USAGE_LAST_FETCH < 6e4 && CF_USAGE_CACHE_DATE === todayStr) {
+    return CF_USAGE_CACHE;
+  }
+  try {
+    const now = /* @__PURE__ */ new Date();
+    const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1e3).toISOString();
+    const q = `query {
 	  viewer {
 		accounts(filter: {accountTag: "${env.CF_ACCOUNT_ID}"}) {
 		  today: workersInvocationsAdaptive(limit: 10, filter: {datetime_geq: "${startOfDay}"}) {
@@ -4940,996 +4584,1101 @@ async function getCfUsage(env) {
 		}
 	  }
 	}`;
-		const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
-			method: "POST",
-			headers: { Authorization: "Bearer " + env.CF_API_TOKEN, "Content-Type": "application/json" },
-			body: JSON.stringify({ query: q }),
-			cache: "no-store" 
-		});
-		const j = await res.json();
-		const acc = j?.data?.viewer?.accounts?.[0];
-		const todayReqs = acc?.today?.[0]?.sum?.requests || 0;
-		const totalReqs = acc?.total?.[0]?.sum?.requests || todayReqs;
-		const d1Reads = acc?.d1?.[0]?.sum?.rowsRead || 0;
-		const d1Writes = acc?.d1?.[0]?.sum?.rowsWritten || 0;
-		
-		CF_USAGE_CACHE = { today: todayReqs, total: totalReqs, d1Reads, d1Writes };
-		CF_USAGE_LAST_FETCH = nowTime;
-		CF_USAGE_CACHE_DATE = todayStr;
-		return CF_USAGE_CACHE;
-	} catch (e) {
-		return CF_USAGE_CACHE || { today: 0, total: 0, d1Reads: 0, d1Writes: 0 };
-	}
+    const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + env.CF_API_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: q }),
+      cache: "no-store"
+    });
+    const j = await res.json();
+    const acc = j?.data?.viewer?.accounts?.[0];
+    const todayReqs = acc?.today?.[0]?.sum?.requests || 0;
+    const totalReqs = acc?.total?.[0]?.sum?.requests || todayReqs;
+    const d1Reads = acc?.d1?.[0]?.sum?.rowsRead || 0;
+    const d1Writes = acc?.d1?.[0]?.sum?.rowsWritten || 0;
+    CF_USAGE_CACHE = { today: todayReqs, total: totalReqs, d1Reads, d1Writes };
+    CF_USAGE_LAST_FETCH = nowTime;
+    CF_USAGE_CACHE_DATE = todayStr;
+    return CF_USAGE_CACHE;
+  } catch (e) {
+    return CF_USAGE_CACHE || { today: 0, total: 0, d1Reads: 0, d1Writes: 0 };
+  }
 }
 function isIPv4(value) {
-	const parts = String(value || "").split(".");
-	return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
+  const parts = String(value || "").split(".");
+  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
 }
 function convertToUint8Array(data) {
-	if (data instanceof Uint8Array) return data;
-	if (data instanceof ArrayBuffer) return new Uint8Array(data);
-	if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-	return new Uint8Array(data || 0);
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  return new Uint8Array(data || 0);
 }
 function concatBytes(...chunkList) {
-	if (chunkList.length === 2) {
-		const a = convertToUint8Array(chunkList[0]);
-		const b = convertToUint8Array(chunkList[1]);
-		if (!a.byteLength) return b;
-		if (!b.byteLength) return a;
-		const merged = new Uint8Array(a.byteLength + b.byteLength);
-		merged.set(a, 0);
-		merged.set(b, a.byteLength);
-		return merged;
-	}
-	const chunks = chunkList.map(convertToUint8Array);
-	let total = 0;
-	for (const c of chunks) total += c.byteLength;
-	const result = new Uint8Array(total);
-	let offset = 0;
-	for (const c of chunks) {
-		result.set(c, offset);
-		offset += c.byteLength;
-	}
-	return result;
+  if (chunkList.length === 2) {
+    const a = convertToUint8Array(chunkList[0]);
+    const b = convertToUint8Array(chunkList[1]);
+    if (!a.byteLength) return b;
+    if (!b.byteLength) return a;
+    const merged = new Uint8Array(a.byteLength + b.byteLength);
+    merged.set(a, 0);
+    merged.set(b, a.byteLength);
+    return merged;
+  }
+  const chunks = chunkList.map(convertToUint8Array);
+  let total = 0;
+  for (const c of chunks) total += c.byteLength;
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    result.set(c, offset);
+    offset += c.byteLength;
+  }
+  return result;
 }
 function closeSocketQuietly(socket) {
-	try {
-		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
-			socket.close();
-		}
-	} catch (e) { }
+  try {
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
+      socket.close();
+    }
+  } catch (e) {
+  }
 }
 async function dohQuery(domain, recordType, targetDoh = DOH_RESOLVER) {
-	const cacheKey = `${domain}:${recordType}:${targetDoh}`;
-	if (DNS_CACHE.has(cacheKey)) {
-		const cached = DNS_CACHE.get(cacheKey);
-		if (Date.now() < cached.expires) return cached.data;
-		DNS_CACHE.delete(cacheKey);
-	}
-	try {
-		const typeMap = { A: 1, AAAA: 28 };
-		const qtype = typeMap[recordType.toUpperCase()] || 1;
-		const encodeDomain = (name) => {
-			const parts = name.endsWith(".") ? name.slice(0, -1).split(".") : name.split(".");
-			const bufs = [];
-			for (const label of parts) {
-				const enc = TEXT_ENCODER.encode(label);
-				bufs.push(new Uint8Array([enc.length]), enc);
-			}
-			bufs.push(new Uint8Array([0]));
-			return concatBytes(...bufs);
-		};
-		const qname = encodeDomain(domain);
-		const query = new Uint8Array(12 + qname.length + 4);
-		const qview = new DataView(query.buffer);
-		qview.setUint16(0, crypto.getRandomValues(new Uint16Array(1))[0]);
-		qview.setUint16(2, 0x0100);
-		qview.setUint16(4, 1);
-		query.set(qname, 12);
-		qview.setUint16(12 + qname.length, qtype);
-		qview.setUint16(12 + qname.length + 2, 1);
-		const response = await fetch(targetDoh, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/dns-message",
-				Accept: "application/dns-message",
-			},
-			body: query,
-		});
-		if (!response.ok) return [];
-		const buf = new Uint8Array(await response.arrayBuffer());
-		const dv = new DataView(buf.buffer);
-		const qdcount = dv.getUint16(4);
-		const ancount = dv.getUint16(6);
-		const parseName = (pos) => {
-			const labels = [];
-			let p = pos,
-				jumped = false,
-				endPos = -1,
-				safe = 128;
-			while (p < buf.length && safe-- > 0) {
-				const len = buf[p];
-				if (len === 0) {
-					if (!jumped) endPos = p + 1;
-					break;
-				}
-				if ((len & 0xc0) === 0xc0) {
-					if (!jumped) endPos = p + 2;
-					p = ((len & 0x3f) << 8) | buf[p + 1];
-					jumped = true;
-					continue;
-				}
-				labels.push(TEXT_DECODER.decode(buf.slice(p + 1, p + 1 + len)));
-				p += len + 1;
-			}
-			if (endPos === -1) endPos = p + 1;
-			return [labels.join("."), endPos];
-		};
-		let offset = 12;
-		for (let i = 0; i < qdcount; i++) {
-			const [, end] = parseName(offset);
-			offset = Number(end) + 4;
-		}
-		const answers = [];
-		for (let i = 0; i < ancount && offset < buf.length; i++) {
-			const [name, nameEnd] = parseName(offset);
-			offset = Number(nameEnd);
-			const type = dv.getUint16(offset);
-			offset += 2;
-			offset += 2;
-			const ttl = dv.getUint32(offset);
-			offset += 4;
-			const rdlen = dv.getUint16(offset);
-			offset += 2;
-			const rdata = buf.slice(offset, offset + rdlen);
-			offset += rdlen;
-			let data;
-			if (type === 1 && rdlen === 4) {
-				data = `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`;
-			} else if (type === 28 && rdlen === 16) {
-				const segs = [];
-				for (let j = 0; j < 16; j += 2) segs.push(((rdata[j] << 8) | rdata[j + 1]).toString(16));
-				data = segs.join(":");
-			} else {
-				data = Array.from(rdata)
-					.map((b) => b.toString(16).padStart(2, "0"))
-					.join("");
-			}
-			answers.push({ name, type, TTL: ttl, data });
-		}
-		if (DNS_CACHE.size >= DNS_CACHE_MAX_ENTRIES) {
-			const oldestKey = DNS_CACHE.keys().next().value;
-			if (oldestKey !== undefined) DNS_CACHE.delete(oldestKey);
-		}
-		DNS_CACHE.set(cacheKey, { data: answers, expires: Date.now() + DNS_CACHE_TTL });
-		return answers;
-	} catch (e) {
-		return [];
-	}
+  const cacheKey = `${domain}:${recordType}:${targetDoh}`;
+  if (DNS_CACHE.has(cacheKey)) {
+    const cached = DNS_CACHE.get(cacheKey);
+    if (Date.now() < cached.expires) return cached.data;
+    DNS_CACHE.delete(cacheKey);
+  }
+  try {
+    const typeMap = { A: 1, AAAA: 28 };
+    const qtype = typeMap[recordType.toUpperCase()] || 1;
+    const encodeDomain = (name) => {
+      const parts = name.endsWith(".") ? name.slice(0, -1).split(".") : name.split(".");
+      const bufs = [];
+      for (const label of parts) {
+        const enc = TEXT_ENCODER.encode(label);
+        bufs.push(new Uint8Array([enc.length]), enc);
+      }
+      bufs.push(new Uint8Array([0]));
+      return concatBytes(...bufs);
+    };
+    const qname = encodeDomain(domain);
+    const query = new Uint8Array(12 + qname.length + 4);
+    const qview = new DataView(query.buffer);
+    qview.setUint16(0, crypto.getRandomValues(new Uint16Array(1))[0]);
+    qview.setUint16(2, 256);
+    qview.setUint16(4, 1);
+    query.set(qname, 12);
+    qview.setUint16(12 + qname.length, qtype);
+    qview.setUint16(12 + qname.length + 2, 1);
+    const response = await fetch(targetDoh, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/dns-message",
+        Accept: "application/dns-message"
+      },
+      body: query
+    });
+    if (!response.ok) return [];
+    const buf = new Uint8Array(await response.arrayBuffer());
+    const dv = new DataView(buf.buffer);
+    const qdcount = dv.getUint16(4);
+    const ancount = dv.getUint16(6);
+    const parseName = (pos) => {
+      const labels = [];
+      let p = pos, jumped = false, endPos = -1, safe = 128;
+      while (p < buf.length && safe-- > 0) {
+        const len = buf[p];
+        if (len === 0) {
+          if (!jumped) endPos = p + 1;
+          break;
+        }
+        if ((len & 192) === 192) {
+          if (!jumped) endPos = p + 2;
+          p = (len & 63) << 8 | buf[p + 1];
+          jumped = true;
+          continue;
+        }
+        labels.push(TEXT_DECODER.decode(buf.slice(p + 1, p + 1 + len)));
+        p += len + 1;
+      }
+      if (endPos === -1) endPos = p + 1;
+      return [labels.join("."), endPos];
+    };
+    let offset = 12;
+    for (let i = 0; i < qdcount; i++) {
+      const [, end] = parseName(offset);
+      offset = Number(end) + 4;
+    }
+    const answers = [];
+    for (let i = 0; i < ancount && offset < buf.length; i++) {
+      const [name, nameEnd] = parseName(offset);
+      offset = Number(nameEnd);
+      const type = dv.getUint16(offset);
+      offset += 2;
+      offset += 2;
+      const ttl = dv.getUint32(offset);
+      offset += 4;
+      const rdlen = dv.getUint16(offset);
+      offset += 2;
+      const rdata = buf.slice(offset, offset + rdlen);
+      offset += rdlen;
+      let data;
+      if (type === 1 && rdlen === 4) {
+        data = `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`;
+      } else if (type === 28 && rdlen === 16) {
+        const segs = [];
+        for (let j = 0; j < 16; j += 2) segs.push((rdata[j] << 8 | rdata[j + 1]).toString(16));
+        data = segs.join(":");
+      } else {
+        data = Array.from(rdata).map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
+      answers.push({ name, type, TTL: ttl, data });
+    }
+    if (DNS_CACHE.size >= DNS_CACHE_MAX_ENTRIES) {
+      const oldestKey = DNS_CACHE.keys().next().value;
+      if (oldestKey !== void 0) DNS_CACHE.delete(oldestKey);
+    }
+    DNS_CACHE.set(cacheKey, { data: answers, expires: Date.now() + DNS_CACHE_TTL });
+    return answers;
+  } catch (e) {
+    return [];
+  }
 }
 function createUpstreamQueue({ getWriter, releaseWriter, retryConnect, closeConnection, name = "UpstreamQueue" }) {
-	let chunks = [];
-	let head = 0;
-	let queuedBytes = 0;
-	let draining = false;
-	let closed = false;
-	let bundleBuffer = null;
-	let idleResolvers = [];
-	let activeCompletions = null;
-	const settleCompletions = (completions, err = null) => {
-		if (!completions) return;
-		for (const comp of completions) {
-			if (comp) {
-				if (err) comp.reject(err);
-				else comp.resolve();
-			}
-		}
-	};
-	const rejectQueued = (err) => {
-		for (let i = head; i < chunks.length; i++) {
-			const item = chunks[i];
-			if (item && item.completions) settleCompletions(item.completions, err);
-		}
-	};
-	const compact = () => {
-		if (head > 32 && head * 2 >= chunks.length) {
-			chunks = chunks.slice(head);
-			head = 0;
-		}
-	};
-	const resolveIdle = () => {
-		if (queuedBytes || draining || !idleResolvers.length) return;
-		const resolvers = idleResolvers;
-		idleResolvers = [];
-		for (const resolve of resolvers) resolve();
-	};
-	const clear = (err = null) => {
-		const closeErr = err || (closed ? new Error(`${name}: queue closed`) : null);
-		if (closeErr) {
-			rejectQueued(closeErr);
-			settleCompletions(activeCompletions, closeErr);
-			activeCompletions = null;
-		}
-		chunks = [];
-		head = 0;
-		queuedBytes = 0;
-		resolveIdle();
-	};
-	const shift = () => {
-		if (head >= chunks.length) return null;
-		const item = chunks[head];
-		chunks[head++] = undefined;
-		queuedBytes -= item.chunk.byteLength;
-		compact();
-		return item;
-	};
-	const bundle = () => {
-		const first = shift();
-		if (!first) return null;
-		if (head >= chunks.length || first.chunk.byteLength >= UPSTREAM_BUNDLE_TARGET_BYTES) return first;
-		let byteLength = first.chunk.byteLength;
-		let end = head;
-		let allowRetry = first.allowRetry;
-		let completions = first.completions || null;
-		while (end < chunks.length) {
-			const next = chunks[end];
-			const nextLength = byteLength + next.chunk.byteLength;
-			if (nextLength > UPSTREAM_BUNDLE_TARGET_BYTES) break;
-			byteLength = nextLength;
-			allowRetry = allowRetry && next.allowRetry;
-			if (next.completions) completions = completions ? completions.concat(next.completions) : next.completions;
-			end++;
-		}
-		if (end === head) return first;
-		const output = (bundleBuffer ||= new Uint8Array(UPSTREAM_BUNDLE_TARGET_BYTES));
-		output.set(first.chunk);
-		let offset = first.chunk.byteLength;
-		while (head < end) {
-			const next = chunks[head];
-			chunks[head++] = undefined;
-			queuedBytes -= next.chunk.byteLength;
-			output.set(next.chunk, offset);
-			offset += next.chunk.byteLength;
-		}
-		compact();
-		return { chunk: output.subarray(0, byteLength), allowRetry, completions };
-	};
-	const drain = async () => {
-		if (draining || closed) return;
-		draining = true;
-		try {
-			let batchCount = 0;
-			for (; ;) {
-				if (closed) break;
-				const item = bundle();
-				if (!item) break;
-				let writer = getWriter();
-				if (!writer) throw new Error(`${name}: remote writer unavailable`);
-				const completions = item.completions || null;
-				activeCompletions = completions;
-				try {
-					try {
-						await writer.write(item.chunk);
-					} catch (err) {
-						releaseWriter?.();
-						if (!item.allowRetry || typeof retryConnect !== "function") throw err;
-						await retryConnect();
-						writer = getWriter();
-						if (!writer) throw err;
-						await writer.write(item.chunk);
-					}
-					settleCompletions(completions);
-				} catch (err) {
-					settleCompletions(completions, err);
-					throw err;
-				} finally {
-					if (activeCompletions === completions) activeCompletions = null;
-				}
-				batchCount++;
-				if (batchCount >= 16) {
-					await Promise.resolve();
-					batchCount = 0;
-				}
-			}
-		} catch (err) {
-			closed = true;
-			clear(err);
-			try {
-				closeConnection?.(err);
-			} catch (_) { }
-		} finally {
-			draining = false;
-			if (!closed && head < chunks.length) queueMicrotask(drain);
-			else resolveIdle();
-		}
-	};
-	const enqueue = (data, allowRetry = true, waitForFlush = false) => {
-		if (closed) return false;
-		if (!getWriter()) return false;
-		const chunk = convertToUint8Array(data);
-		if (!chunk.byteLength) return true;
-		const nextBytes = queuedBytes + chunk.byteLength;
-		const nextItems = chunks.length - head + 1;
-		if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
-			closed = true;
-			const err = Object.assign(new Error(`${name}: upload queue overflow (${nextBytes}B/${nextItems})`), { isQueueOverflow: true });
-			clear(err);
-			try {
-				closeConnection?.(err);
-			} catch (_) { }
-			throw err;
-		}
-		let completionPromise = null;
-		let completions = null;
-		if (waitForFlush) {
-			completions = [];
-			completionPromise = new Promise((resolve, reject) => completions.push({ resolve, reject }));
-		}
-		chunks.push({ chunk, allowRetry, completions });
-		queuedBytes = nextBytes;
-		if (!draining) queueMicrotask(drain);
-		return waitForFlush ? completionPromise.then(() => true) : true;
-	};
-	return {
-		writeAndAwait(data, allowRetry = true) {
-			return enqueue(data, allowRetry, true);
-		},
-		async awaitEmpty() {
-			if (!queuedBytes && !draining) return;
-			await new Promise((resolve) => idleResolvers.push(resolve));
-		},
-		clear() {
-			closed = true;
-			clear();
-		},
-	};
+  let chunks = [];
+  let head = 0;
+  let queuedBytes = 0;
+  let draining = false;
+  let closed = false;
+  let bundleBuffer = null;
+  let idleResolvers = [];
+  let activeCompletions = null;
+  const settleCompletions = (completions, err = null) => {
+    if (!completions) return;
+    for (const comp of completions) {
+      if (comp) {
+        if (err) comp.reject(err);
+        else comp.resolve();
+      }
+    }
+  };
+  const rejectQueued = (err) => {
+    for (let i = head; i < chunks.length; i++) {
+      const item = chunks[i];
+      if (item && item.completions) settleCompletions(item.completions, err);
+    }
+  };
+  const compact = () => {
+    if (head > 32 && head * 2 >= chunks.length) {
+      chunks = chunks.slice(head);
+      head = 0;
+    }
+  };
+  const resolveIdle = () => {
+    if (queuedBytes || draining || !idleResolvers.length) return;
+    const resolvers = idleResolvers;
+    idleResolvers = [];
+    for (const resolve of resolvers) resolve();
+  };
+  const clear = (err = null) => {
+    const closeErr = err || (closed ? new Error(`${name}: queue closed`) : null);
+    if (closeErr) {
+      rejectQueued(closeErr);
+      settleCompletions(activeCompletions, closeErr);
+      activeCompletions = null;
+    }
+    chunks = [];
+    head = 0;
+    queuedBytes = 0;
+    resolveIdle();
+  };
+  const shift = () => {
+    if (head >= chunks.length) return null;
+    const item = chunks[head];
+    chunks[head++] = void 0;
+    queuedBytes -= item.chunk.byteLength;
+    compact();
+    return item;
+  };
+  const bundle = () => {
+    const first = shift();
+    if (!first) return null;
+    if (head >= chunks.length || first.chunk.byteLength >= UPSTREAM_BUNDLE_TARGET_BYTES) return first;
+    let byteLength = first.chunk.byteLength;
+    let end = head;
+    let allowRetry = first.allowRetry;
+    let completions = first.completions || null;
+    while (end < chunks.length) {
+      const next = chunks[end];
+      const nextLength = byteLength + next.chunk.byteLength;
+      if (nextLength > UPSTREAM_BUNDLE_TARGET_BYTES) break;
+      byteLength = nextLength;
+      allowRetry = allowRetry && next.allowRetry;
+      if (next.completions) completions = completions ? completions.concat(next.completions) : next.completions;
+      end++;
+    }
+    if (end === head) return first;
+    const output = bundleBuffer ||= new Uint8Array(UPSTREAM_BUNDLE_TARGET_BYTES);
+    output.set(first.chunk);
+    let offset = first.chunk.byteLength;
+    while (head < end) {
+      const next = chunks[head];
+      chunks[head++] = void 0;
+      queuedBytes -= next.chunk.byteLength;
+      output.set(next.chunk, offset);
+      offset += next.chunk.byteLength;
+    }
+    compact();
+    return { chunk: output.subarray(0, byteLength), allowRetry, completions };
+  };
+  const drain = async () => {
+    if (draining || closed) return;
+    draining = true;
+    try {
+      let batchCount = 0;
+      for (; ; ) {
+        if (closed) break;
+        const item = bundle();
+        if (!item) break;
+        let writer = getWriter();
+        if (!writer) throw new Error(`${name}: remote writer unavailable`);
+        const completions = item.completions || null;
+        activeCompletions = completions;
+        try {
+          try {
+            await writer.write(item.chunk);
+          } catch (err) {
+            releaseWriter?.();
+            if (!item.allowRetry || typeof retryConnect !== "function") throw err;
+            await retryConnect();
+            writer = getWriter();
+            if (!writer) throw err;
+            await writer.write(item.chunk);
+          }
+          settleCompletions(completions);
+        } catch (err) {
+          settleCompletions(completions, err);
+          throw err;
+        } finally {
+          if (activeCompletions === completions) activeCompletions = null;
+        }
+        batchCount++;
+        if (batchCount >= 16) {
+          await Promise.resolve();
+          batchCount = 0;
+        }
+      }
+    } catch (err) {
+      closed = true;
+      clear(err);
+      try {
+        closeConnection?.(err);
+      } catch (_) {
+      }
+    } finally {
+      draining = false;
+      if (!closed && head < chunks.length) queueMicrotask(drain);
+      else resolveIdle();
+    }
+  };
+  const enqueue = (data, allowRetry = true, waitForFlush = false) => {
+    if (closed) return false;
+    if (!getWriter()) return false;
+    const chunk = convertToUint8Array(data);
+    if (!chunk.byteLength) return true;
+    const nextBytes = queuedBytes + chunk.byteLength;
+    const nextItems = chunks.length - head + 1;
+    if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
+      closed = true;
+      const err = Object.assign(new Error(`${name}: upload queue overflow (${nextBytes}B/${nextItems})`), { isQueueOverflow: true });
+      clear(err);
+      try {
+        closeConnection?.(err);
+      } catch (_) {
+      }
+      throw err;
+    }
+    let completionPromise = null;
+    let completions = null;
+    if (waitForFlush) {
+      completions = [];
+      completionPromise = new Promise((resolve, reject) => completions.push({ resolve, reject }));
+    }
+    chunks.push({ chunk, allowRetry, completions });
+    queuedBytes = nextBytes;
+    if (!draining) queueMicrotask(drain);
+    return waitForFlush ? completionPromise.then(() => true) : true;
+  };
+  return {
+    writeAndAwait(data, allowRetry = true) {
+      return enqueue(data, allowRetry, true);
+    },
+    async awaitEmpty() {
+      if (!queuedBytes && !draining) return;
+      await new Promise((resolve) => idleResolvers.push(resolve));
+    },
+    clear() {
+      closed = true;
+      clear();
+    }
+  };
 }
 function createDownstreamSender(webSocket, headerData = null) {
-	const MAX_CAP = 256 * 1024;
-	const MIN_CAP = 16 * 1024;
-	let currentPacketCap = 128 * 1024;
-	const tailBytes = 512;
-	let header = headerData;
-	let pendingBuffer = null;
-	let pendingBytes = 0;
-	let flushPromise = null;
-	let microtaskQueued = false;
-	const adjustSmartBuffer = () => {
-		const buffered = webSocket.bufferedAmount || 0;
-		if (buffered > 256 * 1024) {
-			currentPacketCap = Math.max(MIN_CAP, Math.floor(currentPacketCap / 2));
-		} else if (buffered < 32 * 1024) {
-			currentPacketCap = Math.min(MAX_CAP, currentPacketCap * 2);
-		}
-	};
-	const sendRawChunk = async (chunk) => {
-		if (webSocket.readyState !== 1) throw new Error("ws.readyState is not open");
-		webSocket.send(chunk);
-	};
-	const attachResponseHeader = (chunk) => {
-		if (!header) return chunk;
-		const merged = new Uint8Array(header.length + chunk.byteLength);
-		merged.set(header, 0);
-		merged.set(chunk, header.length);
-		header = null;
-		return merged;
-	};
-	const flush = async () => {
-		microtaskQueued = false;
-		while (flushPromise) await flushPromise;
-		if (!pendingBytes) return;
-		const output = pendingBuffer.slice(0, pendingBytes);
-		adjustSmartBuffer();
-		pendingBytes = 0;
-		flushPromise = sendRawChunk(output).finally(() => {
-			flushPromise = null;
-		});
-		return flushPromise;
-	};
-	return {
-		async sendDirect(data) {
-			let chunk = convertToUint8Array(data);
-			if (!chunk.byteLength) return;
-			chunk = attachResponseHeader(chunk);
-			await sendRawChunk(chunk);
-		},
-		async send(data) {
-			let chunk = convertToUint8Array(data);
-			if (!chunk.byteLength) return;
-			chunk = attachResponseHeader(chunk);
-			let offset = 0;
-			const totalBytes = chunk.byteLength;
-			while (offset < totalBytes) {
-				if (!pendingBytes && totalBytes - offset >= currentPacketCap) {
-					const sendBytes = Math.min(currentPacketCap, totalBytes - offset);
-					const view = offset || sendBytes !== totalBytes ? chunk.subarray(offset, offset + sendBytes) : chunk;
-					await sendRawChunk(view);
-					offset += sendBytes;
-					adjustSmartBuffer();
-					continue;
-				}
-				const copyBytes = Math.min(currentPacketCap - pendingBytes, totalBytes - offset);
-				if (!pendingBuffer) pendingBuffer = new Uint8Array(MAX_CAP);
-				pendingBuffer.set(chunk.subarray(offset, offset + copyBytes), pendingBytes);
-				pendingBytes += copyBytes;
-				offset += copyBytes;
-				if (pendingBytes >= currentPacketCap || currentPacketCap - pendingBytes < tailBytes) {
-					await flush();
-				} else if (!microtaskQueued) {
-					microtaskQueued = true;
-					queueMicrotask(() => {
-						if (pendingBytes) flush().catch(() => closeSocketQuietly(webSocket));
-					});
-				}
-			}
-		},
-		flush,
-	};
+  const MAX_CAP = 256 * 1024;
+  const MIN_CAP = 16 * 1024;
+  let currentPacketCap = 128 * 1024;
+  const tailBytes = 512;
+  let header = headerData;
+  let pendingBuffer = null;
+  let pendingBytes = 0;
+  let flushPromise = null;
+  let microtaskQueued = false;
+  const adjustSmartBuffer = () => {
+    const buffered = webSocket.bufferedAmount || 0;
+    if (buffered > 256 * 1024) {
+      currentPacketCap = Math.max(MIN_CAP, Math.floor(currentPacketCap / 2));
+    } else if (buffered < 32 * 1024) {
+      currentPacketCap = Math.min(MAX_CAP, currentPacketCap * 2);
+    }
+  };
+  const sendRawChunk = async (chunk) => {
+    if (webSocket.readyState !== 1) throw new Error("ws.readyState is not open");
+    webSocket.send(chunk);
+  };
+  const attachResponseHeader = (chunk) => {
+    if (!header) return chunk;
+    const merged = new Uint8Array(header.length + chunk.byteLength);
+    merged.set(header, 0);
+    merged.set(chunk, header.length);
+    header = null;
+    return merged;
+  };
+  const flush = async () => {
+    microtaskQueued = false;
+    while (flushPromise) await flushPromise;
+    if (!pendingBytes) return;
+    const output = pendingBuffer.slice(0, pendingBytes);
+    adjustSmartBuffer();
+    pendingBytes = 0;
+    flushPromise = sendRawChunk(output).finally(() => {
+      flushPromise = null;
+    });
+    return flushPromise;
+  };
+  return {
+    async sendDirect(data) {
+      let chunk = convertToUint8Array(data);
+      if (!chunk.byteLength) return;
+      chunk = attachResponseHeader(chunk);
+      await sendRawChunk(chunk);
+    },
+    async send(data) {
+      let chunk = convertToUint8Array(data);
+      if (!chunk.byteLength) return;
+      chunk = attachResponseHeader(chunk);
+      let offset = 0;
+      const totalBytes = chunk.byteLength;
+      while (offset < totalBytes) {
+        if (!pendingBytes && totalBytes - offset >= currentPacketCap) {
+          const sendBytes = Math.min(currentPacketCap, totalBytes - offset);
+          const view = offset || sendBytes !== totalBytes ? chunk.subarray(offset, offset + sendBytes) : chunk;
+          await sendRawChunk(view);
+          offset += sendBytes;
+          adjustSmartBuffer();
+          continue;
+        }
+        const copyBytes = Math.min(currentPacketCap - pendingBytes, totalBytes - offset);
+        if (!pendingBuffer) pendingBuffer = new Uint8Array(MAX_CAP);
+        pendingBuffer.set(chunk.subarray(offset, offset + copyBytes), pendingBytes);
+        pendingBytes += copyBytes;
+        offset += copyBytes;
+        if (pendingBytes >= currentPacketCap || currentPacketCap - pendingBytes < tailBytes) {
+          await flush();
+        } else if (!microtaskQueued) {
+          microtaskQueued = true;
+          queueMicrotask(() => {
+            if (pendingBytes) flush().catch(() => closeSocketQuietly(webSocket));
+          });
+        }
+      }
+    },
+    flush
+  };
 }
 async function waitForBackpressure(ws) {
-	if (typeof ws.bufferedAmount === "number") {
-		while (ws.bufferedAmount > 1024 * 1024) {
-			if (ws.readyState !== 1) break;
-			await new Promise((r) => setTimeout(r, 20));
-		}
-	}
+  if (typeof ws.bufferedAmount === "number") {
+    while (ws.bufferedAmount > 1024 * 1024) {
+      if (ws.readyState !== 1) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
 }
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, onBytes) {
-	let header = headerData,
-		hasData = false;
-	const downstreamSender = createDownstreamSender(webSocket, header);
-	header = null;
-	try {
-		let reader = remoteSocket.readable.getReader({ mode: "byob" });
-		let useBYOB = true;
-		reader.releaseLock();
-		if (useBYOB) {
-			const transformStream = new TransformStream({
-				transform(chunk, controller) {
-					hasData = true;
-					if (typeof onBytes === "function") onBytes(chunk.byteLength);
-					controller.enqueue(chunk);
-				}
-			});
-			const writePromise = transformStream.readable.pipeTo(new WritableStream({
-				async write(chunk) {
-					await downstreamSender.send(chunk);
-				}
-			}));
-			await remoteSocket.readable.pipeTo(transformStream.writable);
-			await writePromise;
-		}
-	} catch (e) {
-		let reader = remoteSocket.readable.getReader();
-		try {
-			while (true) {
-				if (webSocket.bufferedAmount > 1024 * 1024) await waitForBackpressure(webSocket);
-				const { done, value } = await reader.read();
-				if (done) break;
-				if (!value || value.byteLength === 0) continue;
-				hasData = true;
-				if (typeof onBytes === "function") onBytes(value.byteLength);
-				await downstreamSender.send(value);
-			}
-		} finally {
-			try { reader.cancel(); } catch (err) {}
-			try { reader.releaseLock(); } catch (err) {}
-		}
-	} finally {
-		await downstreamSender.flush();
-		closeSocketQuietly(webSocket);
-	}
-	if (!hasData && retryFunc) await retryFunc();
+  let header = headerData, hasData = false;
+  const downstreamSender = createDownstreamSender(webSocket, header);
+  header = null;
+  try {
+    let reader = remoteSocket.readable.getReader({ mode: "byob" });
+    let useBYOB = true;
+    reader.releaseLock();
+    if (useBYOB) {
+      const transformStream = new TransformStream({
+        transform(chunk, controller) {
+          hasData = true;
+          if (typeof onBytes === "function") onBytes(chunk.byteLength);
+          controller.enqueue(chunk);
+        }
+      });
+      const writePromise = transformStream.readable.pipeTo(new WritableStream({
+        async write(chunk) {
+          await downstreamSender.send(chunk);
+        }
+      }));
+      await remoteSocket.readable.pipeTo(transformStream.writable);
+      await writePromise;
+    }
+  } catch (e) {
+    let reader = remoteSocket.readable.getReader();
+    try {
+      while (true) {
+        if (webSocket.bufferedAmount > 1024 * 1024) await waitForBackpressure(webSocket);
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
+        hasData = true;
+        if (typeof onBytes === "function") onBytes(value.byteLength);
+        await downstreamSender.send(value);
+      }
+    } finally {
+      try {
+        reader.cancel();
+      } catch (err) {
+      }
+      try {
+        reader.releaseLock();
+      } catch (err) {
+      }
+    }
+  } finally {
+    await downstreamSender.flush();
+    closeSocketQuietly(webSocket);
+  }
+  if (!hasData && retryFunc) await retryFunc();
 }
 function bracketIPv6(host) {
-	return typeof host === "string" && host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return typeof host === "string" && host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
-async function waitSocketOpened(socket, ms = 12000) {
-	let timer;
-	try {
-		await Promise.race([
-			socket.opened,
-			new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), ms); })
-		]);
-	} catch (e) {
-		try { socket.close(); } catch (_) {}
-		throw e;
-	} finally {
-		clearTimeout(timer);
-	}
+async function waitSocketOpened(socket, ms = 12e3) {
+  let timer;
+  try {
+    await Promise.race([
+      socket.opened,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("timeout")), ms);
+      })
+    ]);
+  } catch (e) {
+    try {
+      socket.close();
+    } catch (_) {
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 async function connectDirect(address, port, initialData = null, targetDoh = "https://cloudflare-dns.com/dns-query") {
-	const socket = connect({ hostname: bracketIPv6(address), port: port });
-	await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000))]);
-	if (initialData && initialData.byteLength > 0) {
-		const w = socket.writable.getWriter();
-		await w.write(convertToUint8Array(initialData));
-		w.releaseLock();
-	}
-	return socket;
+  const socket = connect({ hostname: bracketIPv6(address), port });
+  await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5e3))]);
+  if (initialData && initialData.byteLength > 0) {
+    const w = socket.writable.getWriter();
+    await w.write(convertToUint8Array(initialData));
+    w.releaseLock();
+  }
+  return socket;
 }
 function sha224Pure(message) {
-	function rotateRight(n, x) { return (x >>> n) | (x << (32 - n)); }
-	function choice(x, y, z) { return (x & y) ^ (~x & z); }
-	function majority(x, y, z) { return (x & y) ^ (x & z) ^ (y & z); }
-	function sigma0(x) { return rotateRight(2, x) ^ rotateRight(13, x) ^ rotateRight(22, x); }
-	function sigma1(x) { return rotateRight(6, x) ^ rotateRight(11, x) ^ rotateRight(25, x); }
-	function gamma0(x) { return rotateRight(7, x) ^ rotateRight(18, x) ^ (x >>> 3); }
-	function gamma1(x) { return rotateRight(17, x) ^ rotateRight(19, x) ^ (x >>> 10); }
-	const K = [
-		0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-		0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-		0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-		0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-		0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-		0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-		0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-		0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-	];
-	let H = [
-		0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939,
-		0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4
-	];
-	const msgBytes = typeof message === 'string' ? new TextEncoder().encode(message) : message;
-	const bitLen = msgBytes.length * 8;
-	const newLen = (((msgBytes.length + 8) >> 6) + 1) << 6;
-	const padded = new Uint8Array(newLen);
-	padded.set(msgBytes);
-	padded[msgBytes.length] = 0x80;
-	const view = new DataView(padded.buffer);
-	view.setUint32(newLen - 4, bitLen, false);
-	const W = new Uint32Array(64);
-	for (let i = 0; i < newLen; i += 64) {
-		for (let t = 0; t < 16; t++) {
-			W[t] = view.getUint32(i + t * 4, false);
-		}
-		for (let t = 16; t < 64; t++) {
-			W[t] = (gamma1(W[t - 2]) + W[t - 7] + gamma0(W[t - 15]) + W[t - 16]) >>> 0;
-		}
-		let [a, b, c, d, e, f, g, h] = H;
-		for (let t = 0; t < 64; t++) {
-			const T1 = (h + sigma1(e) + choice(e, f, g) + K[t] + W[t]) >>> 0;
-			const T2 = (sigma0(a) + majority(a, b, c)) >>> 0;
-			h = g;
-			g = f;
-			f = e;
-			e = (d + T1) >>> 0;
-			d = c;
-			c = b;
-			b = a;
-			a = (T1 + T2) >>> 0;
-		}
-		H[0] = (H[0] + a) >>> 0;
-		H[1] = (H[1] + b) >>> 0;
-		H[2] = (H[2] + c) >>> 0;
-		H[3] = (H[3] + d) >>> 0;
-		H[4] = (H[4] + e) >>> 0;
-		H[5] = (H[5] + f) >>> 0;
-		H[6] = (H[6] + g) >>> 0;
-		H[7] = (H[7] + h) >>> 0;
-	}
-	return H.slice(0, 7).map(w => w.toString(16).padStart(8, '0')).join('');
+  function rotateRight(n, x) {
+    return x >>> n | x << 32 - n;
+  }
+  function choice(x, y, z) {
+    return x & y ^ ~x & z;
+  }
+  function majority(x, y, z) {
+    return x & y ^ x & z ^ y & z;
+  }
+  function sigma0(x) {
+    return rotateRight(2, x) ^ rotateRight(13, x) ^ rotateRight(22, x);
+  }
+  function sigma1(x) {
+    return rotateRight(6, x) ^ rotateRight(11, x) ^ rotateRight(25, x);
+  }
+  function gamma0(x) {
+    return rotateRight(7, x) ^ rotateRight(18, x) ^ x >>> 3;
+  }
+  function gamma1(x) {
+    return rotateRight(17, x) ^ rotateRight(19, x) ^ x >>> 10;
+  }
+  const K = [
+    1116352408,
+    1899447441,
+    3049323471,
+    3921009573,
+    961987163,
+    1508970993,
+    2453635748,
+    2870763221,
+    3624381080,
+    310598401,
+    607225278,
+    1426881987,
+    1925078388,
+    2162078206,
+    2614888103,
+    3248222580,
+    3835390401,
+    4022224774,
+    264347078,
+    604807628,
+    770255983,
+    1249150122,
+    1555081692,
+    1996064986,
+    2554220882,
+    2821834349,
+    2952996808,
+    3210313671,
+    3336571891,
+    3584528711,
+    113926993,
+    338241895,
+    666307205,
+    773529912,
+    1294757372,
+    1396182291,
+    1695183700,
+    1986661051,
+    2177026350,
+    2456956037,
+    2730485921,
+    2820302411,
+    3259730800,
+    3345764771,
+    3516065817,
+    3600352804,
+    4094571909,
+    275423344,
+    430227734,
+    506948616,
+    659060556,
+    883997877,
+    958139571,
+    1322822218,
+    1537002063,
+    1747873779,
+    1955562222,
+    2024104815,
+    2227730452,
+    2361852424,
+    2428436474,
+    2756734187,
+    3204031479,
+    3329325298
+  ];
+  let H = [
+    3238371032,
+    914150663,
+    812702999,
+    4144912697,
+    4290775857,
+    1750603025,
+    1694076839,
+    3204075428
+  ];
+  const msgBytes = typeof message === "string" ? new TextEncoder().encode(message) : message;
+  const bitLen = msgBytes.length * 8;
+  const newLen = (msgBytes.length + 8 >> 6) + 1 << 6;
+  const padded = new Uint8Array(newLen);
+  padded.set(msgBytes);
+  padded[msgBytes.length] = 128;
+  const view = new DataView(padded.buffer);
+  view.setUint32(newLen - 4, bitLen, false);
+  const W = new Uint32Array(64);
+  for (let i = 0; i < newLen; i += 64) {
+    for (let t = 0; t < 16; t++) {
+      W[t] = view.getUint32(i + t * 4, false);
+    }
+    for (let t = 16; t < 64; t++) {
+      W[t] = gamma1(W[t - 2]) + W[t - 7] + gamma0(W[t - 15]) + W[t - 16] >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let t = 0; t < 64; t++) {
+      const T1 = h + sigma1(e) + choice(e, f, g) + K[t] + W[t] >>> 0;
+      const T2 = sigma0(a) + majority(a, b, c) >>> 0;
+      h = g;
+      g = f;
+      f = e;
+      e = d + T1 >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = T1 + T2 >>> 0;
+    }
+    H[0] = H[0] + a >>> 0;
+    H[1] = H[1] + b >>> 0;
+    H[2] = H[2] + c >>> 0;
+    H[3] = H[3] + d >>> 0;
+    H[4] = H[4] + e >>> 0;
+    H[5] = H[5] + f >>> 0;
+    H[6] = H[6] + g >>> 0;
+    H[7] = H[7] + h >>> 0;
+  }
+  return H.slice(0, 7).map((w) => w.toString(16).padStart(8, "0")).join("");
 }
 async function forwardTrojanUDP(udpChunk, webSocket, onBytes, dnsServer = "8.8.4.4") {
-	try {
-		let targetDoh = "https://cloudflare-dns.com/dns-query";
-		if (dnsServer === "94.140.14.15") targetDoh = "https://family.adguard-dns.com/dns-query";
-		else if (dnsServer === "1.1.1.3") targetDoh = "https://family.cloudflare-dns.com/dns-query";
-		else if (dnsServer === "94.140.14.14") targetDoh = "https://dns.adguard-dns.com/dns-query";
-		const data = convertToUint8Array(udpChunk);
-		if (data.byteLength < 7) return;
-		let offset = 0;
-		const addrType = data[offset++];
-		let headerAddrBytes = [];
-		
-		if (addrType === 1) {
-			if (data.byteLength < offset + 4) return;
-			headerAddrBytes = [addrType, data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
-			offset += 4;
-		} else if (addrType === 3) {
-			if (data.byteLength < offset + 1) return;
-			const domainLen = data[offset++];
-			if (data.byteLength < offset + domainLen) return;
-			headerAddrBytes = [addrType, domainLen, ...data.slice(offset, offset + domainLen)];
-			offset += domainLen;
-		} else if (addrType === 4) {
-			if (data.byteLength < offset + 16) return;
-			headerAddrBytes = [addrType, ...data.slice(offset, offset + 16)];
-			offset += 16;
-		} else {
-			return;
-		}
-		
-		if (data.byteLength < offset + 4) return;
-		const port = (data[offset++] << 8) | data[offset++];
-		const length = (data[offset++] << 8) | data[offset++];
-		offset += 2; 
-		if (data.byteLength < offset + length) return;
-		
-		const dnsPayload = data.slice(offset, offset + length);
-		const response = await fetch(targetDoh, {
-			method: 'POST',
-			headers: {
-				'Accept': 'application/dns-message',
-				'Content-Type': 'application/dns-message'
-			},
-			body: dnsPayload
-		});
-		if (!response.ok) return;
-		const rawResponse = new Uint8Array(await response.arrayBuffer());
-		if (typeof onBytes === "function") onBytes(rawResponse.byteLength);
-		if (webSocket.readyState !== WebSocket.OPEN) return;
-		const resLen = rawResponse.byteLength;
-		const udpHeader = new Uint8Array(headerAddrBytes.length + 2 + 2 + 2);
-		let hOff = 0;
-		for (let b of headerAddrBytes) udpHeader[hOff++] = b;
-		udpHeader[hOff++] = (port >> 8) & 0xff;
-		udpHeader[hOff++] = port & 0xff;
-		udpHeader[hOff++] = (resLen >> 8) & 0xff;
-		udpHeader[hOff++] = resLen & 0xff;
-		udpHeader[hOff++] = 0x0D;
-		udpHeader[hOff++] = 0x0A;
-		const merged = new Uint8Array(udpHeader.length + resLen);
-		merged.set(udpHeader, 0);
-		merged.set(rawResponse, udpHeader.length);
-		webSocket.send(merged.buffer);
-	} catch (e) { }
+  try {
+    let targetDoh = "https://cloudflare-dns.com/dns-query";
+    if (dnsServer === "94.140.14.15") targetDoh = "https://family.adguard-dns.com/dns-query";
+    else if (dnsServer === "1.1.1.3") targetDoh = "https://family.cloudflare-dns.com/dns-query";
+    else if (dnsServer === "94.140.14.14") targetDoh = "https://dns.adguard-dns.com/dns-query";
+    const data = convertToUint8Array(udpChunk);
+    if (data.byteLength < 7) return;
+    let offset = 0;
+    const addrType = data[offset++];
+    let headerAddrBytes = [];
+    if (addrType === 1) {
+      if (data.byteLength < offset + 4) return;
+      headerAddrBytes = [addrType, data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+      offset += 4;
+    } else if (addrType === 3) {
+      if (data.byteLength < offset + 1) return;
+      const domainLen = data[offset++];
+      if (data.byteLength < offset + domainLen) return;
+      headerAddrBytes = [addrType, domainLen, ...data.slice(offset, offset + domainLen)];
+      offset += domainLen;
+    } else if (addrType === 4) {
+      if (data.byteLength < offset + 16) return;
+      headerAddrBytes = [addrType, ...data.slice(offset, offset + 16)];
+      offset += 16;
+    } else {
+      return;
+    }
+    if (data.byteLength < offset + 4) return;
+    const port = data[offset++] << 8 | data[offset++];
+    const length = data[offset++] << 8 | data[offset++];
+    offset += 2;
+    if (data.byteLength < offset + length) return;
+    const dnsPayload = data.slice(offset, offset + length);
+    const response = await fetch(targetDoh, {
+      method: "POST",
+      headers: {
+        "Accept": "application/dns-message",
+        "Content-Type": "application/dns-message"
+      },
+      body: dnsPayload
+    });
+    if (!response.ok) return;
+    const rawResponse = new Uint8Array(await response.arrayBuffer());
+    if (typeof onBytes === "function") onBytes(rawResponse.byteLength);
+    if (webSocket.readyState !== WebSocket.OPEN) return;
+    const resLen = rawResponse.byteLength;
+    const udpHeader = new Uint8Array(headerAddrBytes.length + 2 + 2 + 2);
+    let hOff = 0;
+    for (let b of headerAddrBytes) udpHeader[hOff++] = b;
+    udpHeader[hOff++] = port >> 8 & 255;
+    udpHeader[hOff++] = port & 255;
+    udpHeader[hOff++] = resLen >> 8 & 255;
+    udpHeader[hOff++] = resLen & 255;
+    udpHeader[hOff++] = 13;
+    udpHeader[hOff++] = 10;
+    const merged = new Uint8Array(udpHeader.length + resLen);
+    merged.set(udpHeader, 0);
+    merged.set(rawResponse, udpHeader.length);
+    webSocket.send(merged.buffer);
+  } catch (e) {
+  }
 }
 async function forwardvIeesUDP(udpChunk, webSocket, respHeader, onBytes, dnsServer = "8.8.4.4") {
-	try {
-		let targetDoh = "https://cloudflare-dns.com/dns-query";
-		if (dnsServer === "94.140.14.15") targetDoh = "https://family.adguard-dns.com/dns-query";
-		else if (dnsServer === "1.1.1.3") targetDoh = "https://family.cloudflare-dns.com/dns-query";
-		else if (dnsServer === "94.140.14.14") targetDoh = "https://dns.adguard-dns.com/dns-query";
-		const data = convertToUint8Array(udpChunk);
-		if (data.byteLength < 2) return;
-		const length = (data[0] << 8) | data[1];
-		if (data.byteLength < 2 + length) return;
-		
-		const dnsPayload = data.slice(2, 2 + length);
-		
-		const response = await fetch(targetDoh, {
-			method: 'POST',
-			headers: {
-				'Accept': 'application/dns-message',
-				'Content-Type': 'application/dns-message'
-			},
-			body: dnsPayload
-		});
-		if (!response.ok) return;
-		const rawResponse = new Uint8Array(await response.arrayBuffer());
-		if (typeof onBytes === "function") onBytes(rawResponse.byteLength);
-		if (webSocket.readyState !== WebSocket.OPEN) return;
-		const resLen = rawResponse.byteLength;
-		const udpPacket = new Uint8Array(2 + resLen);
-		udpPacket[0] = (resLen >> 8) & 0xff;
-		udpPacket[1] = resLen & 0xff;
-		udpPacket.set(rawResponse, 2);
-		const header = respHeader || new Uint8Array(0);
-		const merged = new Uint8Array(header.length + udpPacket.byteLength);
-		merged.set(header, 0);
-		merged.set(udpPacket, header.length);
-		webSocket.send(merged.buffer);
-	} catch (e) { }
+  try {
+    let targetDoh = "https://cloudflare-dns.com/dns-query";
+    if (dnsServer === "94.140.14.15") targetDoh = "https://family.adguard-dns.com/dns-query";
+    else if (dnsServer === "1.1.1.3") targetDoh = "https://family.cloudflare-dns.com/dns-query";
+    else if (dnsServer === "94.140.14.14") targetDoh = "https://dns.adguard-dns.com/dns-query";
+    const data = convertToUint8Array(udpChunk);
+    if (data.byteLength < 2) return;
+    const length = data[0] << 8 | data[1];
+    if (data.byteLength < 2 + length) return;
+    const dnsPayload = data.slice(2, 2 + length);
+    const response = await fetch(targetDoh, {
+      method: "POST",
+      headers: {
+        "Accept": "application/dns-message",
+        "Content-Type": "application/dns-message"
+      },
+      body: dnsPayload
+    });
+    if (!response.ok) return;
+    const rawResponse = new Uint8Array(await response.arrayBuffer());
+    if (typeof onBytes === "function") onBytes(rawResponse.byteLength);
+    if (webSocket.readyState !== WebSocket.OPEN) return;
+    const resLen = rawResponse.byteLength;
+    const udpPacket = new Uint8Array(2 + resLen);
+    udpPacket[0] = resLen >> 8 & 255;
+    udpPacket[1] = resLen & 255;
+    udpPacket.set(rawResponse, 2);
+    const header = respHeader || new Uint8Array(0);
+    const merged = new Uint8Array(header.length + udpPacket.byteLength);
+    merged.set(header, 0);
+    merged.set(udpPacket, header.length);
+    webSocket.send(merged.buffer);
+  } catch (e) {
+  }
 }
 function extractUUIDFromvIees(data) {
-	if (data.byteLength < 17) return null;
-	const hex = [...data.slice(1, 17)].map((b) => b.toString(16).padStart(2, "0")).join("");
-	return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
+  if (data.byteLength < 17) return null;
+  const hex = [...data.slice(1, 17)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
 }
 function trackRequest(env, ctx) {
-	GLOBAL_REQ_COUNT++;
-	const now = Date.now();
-	if ((now - GLOBAL_LAST_REQ_WRITE > 900000 || GLOBAL_REQ_COUNT > 5000) && GLOBAL_REQ_COUNT > 0) {
-		GLOBAL_LAST_REQ_WRITE = now;
-		const countToSave = GLOBAL_REQ_COUNT;
-		GLOBAL_REQ_COUNT = 0;
-		const task = async () => {
-			try {
-				const today = new Date().toISOString().split("T")[0];
-				await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
-				const lastDateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
-				if (!lastDateRow || lastDateRow.value !== today) {
-					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
-					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(countToSave), String(countToSave)).run();
-				} else {
-					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
-				}
-				// این یکی جدا از today/req_today بالاست: اون‌ها مخصوص ریست global_req_limit سر هر روز
-				// تقویمی UTC هستن (منطقشون عمداً دست نخورده)، این یکی جدول تاریخچه‌ی 7/30 روزه‌ست که حالا
-				// روی کلید ساعتی ذخیره می‌شه تا بازه‌های رولینگ دقیق‌تری قابل محاسبه باشن (به utcHourKey نگاه کنید).
-				const hourKey = utcHourKey(Date.now());
-				await env.DB.prepare("INSERT INTO daily_requests (date, count) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET count = count + excluded.count").bind(hourKey, countToSave).run();
-				try {
-					const cutoffDateStr = new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0];
-					await env.DB.prepare("DELETE FROM daily_requests WHERE date < ?").bind(cutoffDateStr).run();
-				} catch (e) { }
-			} catch (e) { }
-		};
-		if (ctx) ctx.waitUntil(task());
-		else task();
-	}
+  GLOBAL_REQ_COUNT++;
+  const now = Date.now();
+  if ((now - GLOBAL_LAST_REQ_WRITE > 9e5 || GLOBAL_REQ_COUNT > 5e3) && GLOBAL_REQ_COUNT > 0) {
+    GLOBAL_LAST_REQ_WRITE = now;
+    const countToSave = GLOBAL_REQ_COUNT;
+    GLOBAL_REQ_COUNT = 0;
+    const task = async () => {
+      try {
+        const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+        await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
+        const lastDateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
+        if (!lastDateRow || lastDateRow.value !== today) {
+          await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
+          await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(countToSave), String(countToSave)).run();
+        } else {
+          await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
+        }
+        const hourKey = utcHourKey(Date.now());
+        await env.DB.prepare("INSERT INTO daily_requests (date, count) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET count = count + excluded.count").bind(hourKey, countToSave).run();
+        try {
+          const cutoffDateStr = new Date(Date.now() - 30 * 864e5).toISOString().split("T")[0];
+          await env.DB.prepare("DELETE FROM daily_requests WHERE date < ?").bind(cutoffDateStr).run();
+        } catch (e) {
+        }
+      } catch (e) {
+      }
+    };
+    if (ctx) ctx.waitUntil(task());
+    else task();
+  }
 }
 async function connectProxy(proxyStr, destAddr, destPort, initialData) {
-	let normalized = proxyStr;
-	if (proxyStr.includes("t.me/socks") || proxyStr.includes("tg://socks")) {
-		const server = proxyStr.match(/server=([^&]+)/)?.[1];
-		const port = proxyStr.match(/port=([^&]+)/)?.[1];
-		const user = proxyStr.match(/user=([^&]+)/)?.[1];
-		const pass = proxyStr.match(/pass=([^&]+)/)?.[1];
-		if (server && port) {
-			normalized = user && pass ? `socks5://${user}:${pass}@${server}:${port}` : `socks5://${server}:${port}`;
-		}
-	}
-	const hasProtocol = /^(socks4|socks5|socks|http|https):\/\//i.test(normalized);
-	const isHttp = normalized.toLowerCase().startsWith("http://") || normalized.toLowerCase().startsWith("https://");
-	const isSocks4 = normalized.toLowerCase().startsWith("socks4://");
-	let cleanStr = normalized.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-	if (isHttp) {
-		return await connectHttp(cleanStr, destAddr, destPort, initialData);
-	}
-	if (isSocks4) {
-		return await connectSocks4(cleanStr, destAddr, destPort, initialData);
-	}
-	if (hasProtocol) {
-		return await connectSocks5(cleanStr, destAddr, destPort, initialData);
-	}
-	return await Promise.any([
-		connectSocks5(cleanStr, destAddr, destPort, initialData),
-		connectHttp(cleanStr, destAddr, destPort, initialData)
-	]);
+  let normalized = proxyStr;
+  if (proxyStr.includes("t.me/socks") || proxyStr.includes("tg://socks")) {
+    const server = proxyStr.match(/server=([^&]+)/)?.[1];
+    const port = proxyStr.match(/port=([^&]+)/)?.[1];
+    const user = proxyStr.match(/user=([^&]+)/)?.[1];
+    const pass = proxyStr.match(/pass=([^&]+)/)?.[1];
+    if (server && port) {
+      normalized = user && pass ? `socks5://${user}:${pass}@${server}:${port}` : `socks5://${server}:${port}`;
+    }
+  }
+  const hasProtocol = /^(socks4|socks5|socks|http|https):\/\//i.test(normalized);
+  const isHttp = normalized.toLowerCase().startsWith("http://") || normalized.toLowerCase().startsWith("https://");
+  const isSocks4 = normalized.toLowerCase().startsWith("socks4://");
+  let cleanStr = normalized.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+  if (isHttp) {
+    return await connectHttp(cleanStr, destAddr, destPort, initialData);
+  }
+  if (isSocks4) {
+    return await connectSocks4(cleanStr, destAddr, destPort, initialData);
+  }
+  if (hasProtocol) {
+    return await connectSocks5(cleanStr, destAddr, destPort, initialData);
+  }
+  return await Promise.any([
+    connectSocks5(cleanStr, destAddr, destPort, initialData),
+    connectHttp(cleanStr, destAddr, destPort, initialData)
+  ]);
 }
 async function connectSocks4(proxyStr, destAddr, destPort, initialData) {
-	const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 1080);
-	const socket = connect({ hostname: bracketIPv6(host), port: port });
-	await waitSocketOpened(socket, 12000);
-	const reader = socket.readable.getReader();
-	const writer = socket.writable.getWriter();
-	// همون رفع باگ «یک read ممکنه نصفه‌نیمه برسه» که در connectSocks5 اعمال شد، اینجا هم لازمه.
-	const readAtLeast = async (r, minBytes, ms) => {
-		let chunks = [];
-		let total = 0;
-		const deadline = Date.now() + ms;
-		while (total < minBytes) {
-			const remaining = deadline - Date.now();
-			if (remaining <= 0) throw new Error("timeout");
-			const res = await Promise.race([
-				r.read(),
-				new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), remaining))
-			]);
-			if (res.done || !res.value) throw new Error("proxy_closed");
-			chunks.push(res.value);
-			total += res.value.byteLength;
-		}
-		if (chunks.length === 1) return chunks[0];
-		const merged = new Uint8Array(total);
-		let offset = 0;
-		for (const c of chunks) { merged.set(c, offset); offset += c.byteLength; }
-		return merged;
-	};
-	try {
-		const portHigh = (destPort >> 8) & 0xff;
-		const portLow = destPort & 0xff;
-		let req;
-		if (isIPv4(destAddr)) {
-			const ipBytes = destAddr.split(".").map(Number);
-			req = new Uint8Array([0x04, 0x01, portHigh, portLow, ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3], 0x00]);
-		} else {
-			const hostBytes = new TextEncoder().encode(destAddr);
-			req = new Uint8Array(9 + hostBytes.length + 1);
-			req[0] = 0x04;
-			req[1] = 0x01;
-			req[2] = portHigh;
-			req[3] = portLow;
-			req[4] = 0x00;
-			req[5] = 0x00;
-			req[6] = 0x00;
-			req[7] = 0x01;
-			req[8] = 0x00;
-			req.set(hostBytes, 9);
-			req[9 + hostBytes.length] = 0x00;
-		}
-		await writer.write(req);
-		let res = await readAtLeast(reader, 2, 4000);
-		if (res[0] !== 0x00 || res[1] !== 0x5a) {
-			throw new Error("پـروکـسـی SOCKS4 وصل نشد یا اتصال را رد کرد");
-		}
-		if (initialData && initialData.byteLength > 0) {
-			await writer.write(convertToUint8Array(initialData));
-		}
-		writer.releaseLock();
-		reader.releaseLock();
-		return socket;
-	} catch (e) {
-		try { writer.releaseLock(); } catch (err) { }
-		try { reader.releaseLock(); } catch (err) { }
-		try { socket.close(); } catch (err) { }
-		throw e;
-	}
+  const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 1080);
+  const socket = connect({ hostname: bracketIPv6(host), port });
+  await waitSocketOpened(socket, 12e3);
+  const reader = socket.readable.getReader();
+  const writer = socket.writable.getWriter();
+  const readAtLeast = async (r, minBytes, ms) => {
+    let chunks = [];
+    let total = 0;
+    const deadline = Date.now() + ms;
+    while (total < minBytes) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error("timeout");
+      const res = await Promise.race([
+        r.read(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), remaining))
+      ]);
+      if (res.done || !res.value) throw new Error("proxy_closed");
+      chunks.push(res.value);
+      total += res.value.byteLength;
+    }
+    if (chunks.length === 1) return chunks[0];
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      merged.set(c, offset);
+      offset += c.byteLength;
+    }
+    return merged;
+  };
+  try {
+    const portHigh = destPort >> 8 & 255;
+    const portLow = destPort & 255;
+    let req;
+    if (isIPv4(destAddr)) {
+      const ipBytes = destAddr.split(".").map(Number);
+      req = new Uint8Array([4, 1, portHigh, portLow, ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3], 0]);
+    } else {
+      const hostBytes = new TextEncoder().encode(destAddr);
+      req = new Uint8Array(9 + hostBytes.length + 1);
+      req[0] = 4;
+      req[1] = 1;
+      req[2] = portHigh;
+      req[3] = portLow;
+      req[4] = 0;
+      req[5] = 0;
+      req[6] = 0;
+      req[7] = 1;
+      req[8] = 0;
+      req.set(hostBytes, 9);
+      req[9 + hostBytes.length] = 0;
+    }
+    await writer.write(req);
+    let res = await readAtLeast(reader, 2, 4e3);
+    if (res[0] !== 0 || res[1] !== 90) {
+      throw new Error("پـروکـسـی SOCKS4 وصل نشد یا اتصال را رد کرد");
+    }
+    if (initialData && initialData.byteLength > 0) {
+      await writer.write(convertToUint8Array(initialData));
+    }
+    writer.releaseLock();
+    reader.releaseLock();
+    return socket;
+  } catch (e) {
+    try {
+      writer.releaseLock();
+    } catch (err) {
+    }
+    try {
+      reader.releaseLock();
+    } catch (err) {
+    }
+    try {
+      socket.close();
+    } catch (err) {
+    }
+    throw e;
+  }
 }
 function parseProxyConfig(proxyStr, defaultPort) {
-	let user = "",
-		pass = "",
-		host = "",
-		port = defaultPort;
-	let auth = false,
-		remain = proxyStr;
-	if (remain.includes("@")) {
-		const atIdx = remain.lastIndexOf("@");
-		const authPart = remain.substring(0, atIdx);
-		remain = remain.substring(atIdx + 1);
-		const colonIdx = authPart.indexOf(":");
-		if (colonIdx !== -1) {
-			user = authPart.substring(0, colonIdx);
-			pass = authPart.substring(colonIdx + 1);
-		} else {
-			user = authPart;
-		}
-		auth = true;
-	}
-	if (remain.startsWith("[")) {
-		const closeIdx = remain.indexOf("]");
-		if (closeIdx !== -1) {
-			host = remain.substring(1, closeIdx);
-			if (remain.length > closeIdx + 1 && remain[closeIdx + 1] === ":") port = parseInt(remain.substring(closeIdx + 2)) || defaultPort;
-		}
-	} else {
-		const lastColon = remain.lastIndexOf(":");
-		if (lastColon !== -1 && remain.indexOf(":") === lastColon) {
-			host = remain.substring(0, lastColon);
-			port = parseInt(remain.substring(lastColon + 1)) || defaultPort;
-		} else {
-			host = remain;
-		}
-	}
-	return { user, pass, host, port, auth };
+  let user = "", pass = "", host = "", port = defaultPort;
+  let auth = false, remain = proxyStr;
+  if (remain.includes("@")) {
+    const atIdx = remain.lastIndexOf("@");
+    const authPart = remain.substring(0, atIdx);
+    remain = remain.substring(atIdx + 1);
+    const colonIdx = authPart.indexOf(":");
+    if (colonIdx !== -1) {
+      user = authPart.substring(0, colonIdx);
+      pass = authPart.substring(colonIdx + 1);
+    } else {
+      user = authPart;
+    }
+    auth = true;
+  }
+  if (remain.startsWith("[")) {
+    const closeIdx = remain.indexOf("]");
+    if (closeIdx !== -1) {
+      host = remain.substring(1, closeIdx);
+      if (remain.length > closeIdx + 1 && remain[closeIdx + 1] === ":") port = parseInt(remain.substring(closeIdx + 2)) || defaultPort;
+    }
+  } else {
+    const lastColon = remain.lastIndexOf(":");
+    if (lastColon !== -1 && remain.indexOf(":") === lastColon) {
+      host = remain.substring(0, lastColon);
+      port = parseInt(remain.substring(lastColon + 1)) || defaultPort;
+    } else {
+      host = remain;
+    }
+  }
+  return { user, pass, host, port, auth };
 }
 async function connectSocks5(socksStr, destAddr, destPort, initialData) {
-	const { user, pass, host, port, auth } = parseProxyConfig(socksStr, 1080);
-	const socket = connect({ hostname: bracketIPv6(host), port: port });
-	await waitSocketOpened(socket, 12000);
-	const reader = socket.readable.getReader();
-	const writer = socket.writable.getWriter();
-	// بعضی پـروکـسـی‌ها پاسخ SOCKS5 رو توی چند بسته‌ی جدا (چند تا TCP read) می‌فرستن.
-	// یک read تنها ممکنه فقط ۱ بایت برگردونه؛ چک کردن ایندکس ۱ روی همچین آرایه‌ای
-	// همیشه false می‌شه و باعث خطای الکی «وصل شد ولی دسترسی نداره» می‌شه با اینکه
-	// اتصال واقعاً سالمه و فقط باید صبر کرد بقیه‌ی بایت‌ها هم برسن. این تابع به‌جای
-	// یک read، تا وقتی حداقل تعداد بایت لازم برسه (یا تایم‌اوت بشه) صبر می‌کنه.
-	const readAtLeast = async (r, minBytes, ms) => {
-		let chunks = [];
-		let total = 0;
-		const deadline = Date.now() + ms;
-		while (total < minBytes) {
-			const remaining = deadline - Date.now();
-			if (remaining <= 0) throw new Error("timeout");
-			const res = await Promise.race([
-				r.read(),
-				new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), remaining))
-			]);
-			if (res.done || !res.value) throw new Error("proxy_closed");
-			chunks.push(res.value);
-			total += res.value.byteLength;
-		}
-		if (chunks.length === 1) return chunks[0];
-		const merged = new Uint8Array(total);
-		let offset = 0;
-		for (const c of chunks) { merged.set(c, offset); offset += c.byteLength; }
-		return merged;
-	};
-	try {
-		if (auth) {
-			await writer.write(new Uint8Array([0x05, 0x02, 0x00, 0x02]));
-		} else {
-			await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
-		}
-		let res = await readAtLeast(reader, 2, 4000);
-		if (res[0] !== 0x05) throw new Error("پاسخ نامعتبر از سرور (پـروکـسـی SOCKS5 نیست یا خاموش است)");
-		const method = res[1];
-		if (method === 0x02) {
-			const uEnc = new TextEncoder().encode(user);
-			const pEnc = new TextEncoder().encode(pass);
-			const authReq = new Uint8Array(1 + 1 + uEnc.length + 1 + pEnc.length);
-			authReq[0] = 0x01;
-			authReq[1] = uEnc.length;
-			authReq.set(uEnc, 2);
-			authReq[2 + uEnc.length] = pEnc.length;
-			authReq.set(pEnc, 3 + uEnc.length);
-			await writer.write(authReq);
-			let authRes = await readAtLeast(reader, 2, 4000);
-			if (authRes[1] !== 0x00) throw new Error("نام کاربری یا رمز عبور پـروکـسـی اشتباه است");
-		}
-		let addrType = 0x03;
-		let addrBytes;
-		if (isIPv4(destAddr)) {
-			addrType = 0x01;
-			addrBytes = new Uint8Array(destAddr.split(".").map(Number));
-		} else if (destAddr.includes(":")) {
-			addrType = 0x04;
-			addrBytes = new Uint8Array(16);
-			const blocks = destAddr.split(":");
-			for (let i = 0; i < 8; i++) {
-				const val = parseInt(blocks[i] || "0", 16);
-				addrBytes[i * 2] = (val >> 8) & 0xff;
-				addrBytes[i * 2 + 1] = val & 0xff;
-			}
-		} else {
-			const enc = new TextEncoder().encode(destAddr);
-			addrBytes = new Uint8Array(1 + enc.length);
-			addrBytes[0] = enc.length;
-			addrBytes.set(enc, 1);
-		}
-		const req = new Uint8Array(4 + addrBytes.length + 2);
-		req[0] = 0x05;
-		req[1] = 0x01;
-		req[2] = 0x00;
-		req[3] = addrType;
-		req.set(addrBytes, 4);
-		const portOffset = 4 + addrBytes.length;
-		req[portOffset] = (destPort >> 8) & 0xff;
-		req[portOffset + 1] = destPort & 0xff;
-		await writer.write(req);
-		let connRes = await readAtLeast(reader, 2, 4000);
-		if (connRes[1] !== 0x00) throw new Error("پـروکـسـی وصل شد اما دسترسی به اینترنت آزاد ندارد");
-		if (initialData && initialData.byteLength > 0) {
-			await writer.write(convertToUint8Array(initialData));
-		}
-		writer.releaseLock();
-		reader.releaseLock();
-		return socket;
-	} catch (e) {
-		try { writer.releaseLock(); } catch (err) { }
-		try { reader.releaseLock(); } catch (err) { }
-		try { socket.close(); } catch (err) { }
-		throw e;
-	}
+  const { user, pass, host, port, auth } = parseProxyConfig(socksStr, 1080);
+  const socket = connect({ hostname: bracketIPv6(host), port });
+  await waitSocketOpened(socket, 12e3);
+  const reader = socket.readable.getReader();
+  const writer = socket.writable.getWriter();
+  const readAtLeast = async (r, minBytes, ms) => {
+    let chunks = [];
+    let total = 0;
+    const deadline = Date.now() + ms;
+    while (total < minBytes) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error("timeout");
+      const res = await Promise.race([
+        r.read(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), remaining))
+      ]);
+      if (res.done || !res.value) throw new Error("proxy_closed");
+      chunks.push(res.value);
+      total += res.value.byteLength;
+    }
+    if (chunks.length === 1) return chunks[0];
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      merged.set(c, offset);
+      offset += c.byteLength;
+    }
+    return merged;
+  };
+  try {
+    if (auth) {
+      await writer.write(new Uint8Array([5, 2, 0, 2]));
+    } else {
+      await writer.write(new Uint8Array([5, 1, 0]));
+    }
+    let res = await readAtLeast(reader, 2, 4e3);
+    if (res[0] !== 5) throw new Error("پاسخ نامعتبر از سرور (پـروکـسـی SOCKS5 نیست یا خاموش است)");
+    const method = res[1];
+    if (method === 2) {
+      const uEnc = new TextEncoder().encode(user);
+      const pEnc = new TextEncoder().encode(pass);
+      const authReq = new Uint8Array(1 + 1 + uEnc.length + 1 + pEnc.length);
+      authReq[0] = 1;
+      authReq[1] = uEnc.length;
+      authReq.set(uEnc, 2);
+      authReq[2 + uEnc.length] = pEnc.length;
+      authReq.set(pEnc, 3 + uEnc.length);
+      await writer.write(authReq);
+      let authRes = await readAtLeast(reader, 2, 4e3);
+      if (authRes[1] !== 0) throw new Error("نام کاربری یا رمز عبور پـروکـسـی اشتباه است");
+    }
+    let addrType = 3;
+    let addrBytes;
+    if (isIPv4(destAddr)) {
+      addrType = 1;
+      addrBytes = new Uint8Array(destAddr.split(".").map(Number));
+    } else if (destAddr.includes(":")) {
+      addrType = 4;
+      addrBytes = new Uint8Array(16);
+      const blocks = destAddr.split(":");
+      for (let i = 0; i < 8; i++) {
+        const val = parseInt(blocks[i] || "0", 16);
+        addrBytes[i * 2] = val >> 8 & 255;
+        addrBytes[i * 2 + 1] = val & 255;
+      }
+    } else {
+      const enc = new TextEncoder().encode(destAddr);
+      addrBytes = new Uint8Array(1 + enc.length);
+      addrBytes[0] = enc.length;
+      addrBytes.set(enc, 1);
+    }
+    const req = new Uint8Array(4 + addrBytes.length + 2);
+    req[0] = 5;
+    req[1] = 1;
+    req[2] = 0;
+    req[3] = addrType;
+    req.set(addrBytes, 4);
+    const portOffset = 4 + addrBytes.length;
+    req[portOffset] = destPort >> 8 & 255;
+    req[portOffset + 1] = destPort & 255;
+    await writer.write(req);
+    let connRes = await readAtLeast(reader, 2, 4e3);
+    if (connRes[1] !== 0) throw new Error("پـروکـسـی وصل شد اما دسترسی به اینترنت آزاد ندارد");
+    if (initialData && initialData.byteLength > 0) {
+      await writer.write(convertToUint8Array(initialData));
+    }
+    writer.releaseLock();
+    reader.releaseLock();
+    return socket;
+  } catch (e) {
+    try {
+      writer.releaseLock();
+    } catch (err) {
+    }
+    try {
+      reader.releaseLock();
+    } catch (err) {
+    }
+    try {
+      socket.close();
+    } catch (err) {
+    }
+    throw e;
+  }
 }
 async function connectHttp(proxyStr, destAddr, destPort, initialData) {
-	const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 80);
-	const socket = connect({ hostname: bracketIPv6(host), port: port });
-	await waitSocketOpened(socket, 12000);
-	const reader = socket.readable.getReader();
-	const writer = socket.writable.getWriter();
-	const readWithTimeout = (r, ms) => Promise.race([
-		r.read(),
-		new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms))
-	]);
-	try {
-		const safeDest = destAddr.includes(":") ? `[${destAddr}]` : destAddr;
-		let req = `CONNECT ${safeDest}:${destPort} HTTP/1.1\r\nHost: ${safeDest}:${destPort}\r\n`;
-		if (auth) {
-			const authBase64 = btoa(`${user}:${pass}`);
-			req += `Proxy-Authorization: Basic ${authBase64}\r\n`;
-		}
-		req += "\r\n";
-		await writer.write(new TextEncoder().encode(req));
-		let resStr = "";
-		const dec = new TextDecoder();
-		while (true) {
-			const res = await readWithTimeout(reader, 4000);
-			if (res.done || !res.value) throw new Error("proxy_closed");
-			resStr += dec.decode(res.value, { stream: true });
-			if (resStr.includes("\r\n\r\n")) {
-				const match = resStr.match(/^HTTP\/\d\.\d\s+(\d+)/);
-				if (match && match[1] === "200") {
-					break;
-				} else {
-					throw new Error("proxy_error_" + (match ? match[1] : "unknown"));
-				}
-			}
-		}
-		if (initialData && initialData.byteLength > 0) {
-			await writer.write(convertToUint8Array(initialData));
-		}
-		writer.releaseLock();
-		reader.releaseLock();
-		return socket;
-	} catch (e) {
-		try { writer.releaseLock(); } catch (err) { }
-		try { reader.releaseLock(); } catch (err) { }
-		try { socket.close(); } catch (err) { }
-		throw e;
-	}
+  const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 80);
+  const socket = connect({ hostname: bracketIPv6(host), port });
+  await waitSocketOpened(socket, 12e3);
+  const reader = socket.readable.getReader();
+  const writer = socket.writable.getWriter();
+  const readWithTimeout = (r, ms) => Promise.race([
+    r.read(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms))
+  ]);
+  try {
+    const safeDest = destAddr.includes(":") ? `[${destAddr}]` : destAddr;
+    let req = `CONNECT ${safeDest}:${destPort} HTTP/1.1\r
+Host: ${safeDest}:${destPort}\r
+`;
+    if (auth) {
+      const authBase64 = btoa(`${user}:${pass}`);
+      req += `Proxy-Authorization: Basic ${authBase64}\r
+`;
+    }
+    req += "\r\n";
+    await writer.write(new TextEncoder().encode(req));
+    let resStr = "";
+    const dec = new TextDecoder();
+    while (true) {
+      const res = await readWithTimeout(reader, 4e3);
+      if (res.done || !res.value) throw new Error("proxy_closed");
+      resStr += dec.decode(res.value, { stream: true });
+      if (resStr.includes("\r\n\r\n")) {
+        const match = resStr.match(/^HTTP\/\d\.\d\s+(\d+)/);
+        if (match && match[1] === "200") {
+          break;
+        } else {
+          throw new Error("proxy_error_" + (match ? match[1] : "unknown"));
+        }
+      }
+    }
+    if (initialData && initialData.byteLength > 0) {
+      await writer.write(convertToUint8Array(initialData));
+    }
+    writer.releaseLock();
+    reader.releaseLock();
+    return socket;
+  } catch (e) {
+    try {
+      writer.releaseLock();
+    } catch (err) {
+    }
+    try {
+      reader.releaseLock();
+    } catch (err) {
+    }
+    try {
+      socket.close();
+    } catch (err) {
+    }
+    throw e;
+  }
 }
 const COMMON_HEAD = `
 	<script>
@@ -5939,10 +5688,10 @@ const COMMON_HEAD = `
 			document.documentElement.classList.add('dark');
 		}
 		try { localStorage.removeItem('proxy_flag_cache'); } catch(e) {}
-	</script>
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/qr-code-styling@1.5.0/lib/qr-code-styling.js"></script>
+	<\/script>
+<script src="https://cdn.tailwindcss.com"><\/script>
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"><\/script>
+<script src="https://cdn.jsdelivr.net/npm/qr-code-styling@1.5.0/lib/qr-code-styling.js"><\/script>
 	<link rel="manifest" href="/manifest.json">
 	<link rel="icon" type="image/svg+xml" href="/icon.svg">
 	<link rel="apple-touch-icon" href="/icon.svg">
@@ -5967,7 +5716,7 @@ const COMMON_HEAD = `
 			}
 		}
 	}
-</script>
+<\/script>
 `;
 const COMMON_TOAST_HTML = `<div id="toast-container" class="fixed top-5 left-1/2 -translate-x-1/2 z-[9999] flex flex-col gap-2 pointer-events-none"></div>`;
 const COMMON_TOAST_JS = `
@@ -6001,7 +5750,7 @@ const COMMON_TOAST_JS = `
 		};
 `;
 const HTML_TEMPLATES = {
-	nginx: `<!DOCTYPE html>
+  nginx: `<!DOCTYPE html>
 <html>
 <head>
 <title>Welcome to nginx!</title>
@@ -6027,7 +5776,7 @@ Commercial support is available at
 </body>
 </html>
 `,
-	setup: `<!DOCTYPE html>
+  setup: `<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
 	<meta charset="UTF-8">
@@ -6092,10 +5841,10 @@ Commercial support is available at
 				btn.innerText = 'ثبت و ورود';
 			}
 		}
-	</script>
+	<\/script>
 </body>
 </html>`,
-	login: `<!DOCTYPE html>
+  login: `<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
 	<meta charset="UTF-8">
@@ -6201,10 +5950,10 @@ Commercial support is available at
 				btn.innerText = 'بازیابی رمز پـنـل';
 			}
 		}
-	</script>
+	<\/script>
 </body>
 </html>`,
-	panel: `
+  panel: `
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
@@ -6218,7 +5967,7 @@ Commercial support is available at
 			if (typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com')) return;
 			originalWarn(...args);
 		};
-	</script>
+	<\/script>
 	${COMMON_HEAD}
 	<link href="https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,500;0,600;0,700;1,500;1,600&display=swap" rel="stylesheet">
 	<style>
@@ -7772,7 +7521,7 @@ Commercial support is available at
 					محیط <code class="font-bold">CMD</code> (Command Prompt) را در ویندوز باز کنید و کد زیر را برای اجرای اسکنر در آن پیست کنید و اینتر بزنید.
 				</p>
 				<div class="flex flex-col gap-2">
-					<div class="w-full bg-gray-100 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md p-2.5 text-[10px] font-mono text-left text-gray-800 dark:text-zinc-300 break-all select-all overflow-x-auto whitespace-pre-wrap max-h-24 overflow-y-auto" dir="ltr">powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13; $wc = New-Object System.Net.WebClient; $wc.Encoding = [System.Text.Encoding]::UTF8; $text = ($wc.DownloadString('https://hoplimit.shop/zeus-scanner.txt') -split '---POWERSHELL---')[1].Trim(); [IO.File]::WriteAllText('zeus-scanner.ps1', $text, [System.Text.Encoding]::UTF8); .\zeus-scanner.ps1"</div>
+					<div class="w-full bg-gray-100 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md p-2.5 text-[10px] font-mono text-left text-gray-800 dark:text-zinc-300 break-all select-all overflow-x-auto whitespace-pre-wrap max-h-24 overflow-y-auto" dir="ltr">powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13; $wc = New-Object System.Net.WebClient; $wc.Encoding = [System.Text.Encoding]::UTF8; $text = ($wc.DownloadString('https://hoplimit.shop/zeus-scanner.txt') -split '---POWERSHELL---')[1].Trim(); [IO.File]::WriteAllText('zeus-scanner.ps1', $text, [System.Text.Encoding]::UTF8); .zeus-scanner.ps1"</div>
 					<button type="button" onclick="copyScannerCode('powershell -ExecutionPolicy Bypass -Command &quot;[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13; $wc = New-Object System.Net.WebClient; $wc.Encoding = [System.Text.Encoding]::UTF8; $text = ($wc.DownloadString(\\'https://hoplimit.shop/zeus-scanner.txt\\') -split \\'---POWERSHELL---\\')[1].Trim(); [IO.File]::WriteAllText(\\'zeus-scanner.ps1\\', $text, [System.Text.Encoding]::UTF8); .\\\\zeus-scanner.ps1&quot;', this)" class="w-full flex items-center justify-center gap-1.5 py-2 bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-gray-600 dark:text-zinc-300 hover:bg-gray-50 dark:hover:bg-zinc-700/80 rounded text-xs font-bold transition shadow-sm">
 						<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
 						<span>کپی کد CMD</span>
@@ -8399,9 +8148,9 @@ ${COMMON_TOAST_HTML}
 				'https://hoplimit.shop/' + path,
 				'https://raw.githubusercontent.com/hmditts/XYD-Panel/main/' + path
 			];
-			if (path.includes('zeus.obfuscated.js')) {
-				urls.push('https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main/zeus.obfuscated.js' + (path.includes('?') ? path.substring(path.indexOf('?')) : ''));
-			}
+			// فاز ۵ (بازبینی نهایی): شاخه‌ی مرده‌ی zeus.obfuscated.js/میرور رسمی Zeus از اینجا هم حذف شد —
+			// هیچ فراخواننده‌ای این مسیر را با آن نام صدا نمی‌زد (فقط برای vip-list/proxy_vip/ips.txt استفاده می‌شود)
+			// و وجودش فقط یک ارجاع بی‌استفاده به مخزن غیرشخصی بود که دیگر جایی در جریان کد/آپدیت ندارد.
 			for (const url of urls) {
 				try {
 					const res = await fetch(url, options);
@@ -12149,7 +11898,9 @@ const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 				if (isManual) {
 					document.getElementById('update-toggle').classList.add('animate-pulse');
 				}
-				const res = await fetchWithFallbackUI('zeus.obfuscated.js?t=' + Date.now());
+				// دیگر به مخزن رسمی/میرورها وصل نیست؛ فقط worker.js شخصی شما را می‌خواند - دقیقاً همان
+				// چیزی که با زدن دکمه‌ی آپدیت واقعاً دیپلوی می‌شود، پس این چک هیچ‌وقت با عمل واقعی آپدیت فرق ندارد.
+				const res = await fetch('https://raw.githubusercontent.com/hmditts/XYD-Panel/main/worker.js?t=' + Date.now(), { headers: { 'Cache-Control': 'no-cache' } });
 				if (!res.ok) throw new Error('Network response was not ok');
 				const text = await res.text();
 				const match = text.match(/CURRENT_VERSION.*?['"]([0-9]+\\.[0-9]+\\.[0-9]+)['"]/i);
@@ -13130,10 +12881,10 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 				btn.innerHTML = '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg><span>تست اتصال مستقیم</span>';
 			}
 		};
-	</script>
+	<\/script>
 	  </body>
 </html>`,
-	status: `<!DOCTYPE html>
+  status: `<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
 	<meta charset="UTF-8">
@@ -13906,9 +13657,8 @@ const flagContainer = document.getElementById('display-flag');
 		window.addEventListener('click', (e) => {
 			if (e.target.id === 'qr-modal') toggleQrModal(false);
 		});
-	</script>
+	<\/script>
 </body>
-</html>`,
+</html>`
 };
-
-return __WORKER_EXPORT__;
+export default __WORKER_EXPORT__;
