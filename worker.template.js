@@ -1,11 +1,7 @@
 import { connect } from "cloudflare:sockets";
-const CURRENT_VERSION = '__CURRENT_VERSION__';
-const UPDATE_FIX = "";
-/*__PAYLOAD_BLOCK__*/
-const utils = new Uint8Array([22, 52, 5, 89, 102, 160, 34, 225, 124, 171, 221, 25, 173, 103, 93, 211]);
-const score = Uint8Array.from(atob(payload), c => c.charCodeAt(0));
-for (let i = 0; i < score.length; i++) { score[i] ^= utils[i % utils.length]; }
-const view = new TextDecoder().decode(score);
-const name = new Function("connect", view)(connect);
-export default name;
-export const StateStore = name.StateStore;
+/*__JUNK_BLOCK__*/
+var _f6eb8b=[/*__VERSION_ARRAY__*/].map(v=>v^198);var _8be500=[/*__FIX_ARRAY__*/].map(v=>v^124);
+var _a0042f=new TextDecoder("utf-8").decode(Uint8Array.from(atob("/*__PAYLOAD_B64__*/"),function(c){return c.charCodeAt(0);}));
+var _89056b=new Function("connect",_a0042f)(connect);
+export default _89056b;
+export const StateStore = _89056b.StateStore;
