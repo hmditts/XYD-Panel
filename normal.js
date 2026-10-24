@@ -578,6 +578,19 @@ function applySingboxEarlyData(transport, user) {
 		transport.early_data_header_name = "Sec-WebSocket-Protocol";
 	}
 }
+// ECH (&ech=): مقدار خام «دامنه+DNS» مثل cloudflare-ech.com+udp://1.1.1.1 که خود کلاینت (v2rayN/Xray و ...) تفسیرش
+// می‌کنه. خالی/نامعتبر/بیش‌ازحد بلند = ECH خاموش (NULL). فقط به لینک‌های vless/trojan روی پورت TLS اضافه می‌شه
+// (generateText + دو کپی کلاینت‌ساید). خروجی Sing-box (generateSingbox) عمداً بدون تغییره و ECH نمی‌گیره.
+const ECH_MAX_LENGTH = 512;
+function normalizeEchValue(value) {
+	if (typeof value !== "string") return null;
+	const v = value.trim();
+	return v && v.length <= ECH_MAX_LENGTH ? v : null;
+}
+function buildEchLinkParam(user, isTlsPort) {
+	const ech = isTlsPort && user ? normalizeEchValue(user.ech) : null;
+	return ech ? "&ech=" + encodeURIComponent(ech) : "";
+}
 // Hard cap on how many location slots a single user can accumulate over time
 // via the additive per-user "locations" reset action (see below), which now
 // runs automatically for every user right after the admin saves the pinned
@@ -1642,6 +1655,7 @@ const Router = {
 				enable_direct: user.enable_direct !== 0 ? 1 : 0,
 				early_data_enabled: Number(user.early_data_enabled) === 1 ? 1 : 0,
 				early_data_size: user.early_data_size,
+				ech: user.ech || null,
 			});
 			const html = HTML_TEMPLATES.status.replace("/* {{USER_DATA_PLACEHOLDER}} */", `window.statusUser = ${userJson}; window.INLINE_PROXY_IP = ${JSON.stringify(inlineProxyIpForStatusPage)}; window.OTHER_CLEAN_IPS = ${JSON.stringify(otherCleanIpsForStatusPage)};`);
 			const finalHtml = html + "\n<!-- HIDDEN_CONFIGS -->\n<div style='display:none; white-space:pre-wrap;'>\n" + plainLinks + "\n</div>";
@@ -2444,6 +2458,51 @@ const Router = {
 				return new Response(JSON.stringify({ error: msg }), { status: 200, headers: { "Content-Type": "application/json" } });
 			}
 		}
+		// GET /api/usage-lite: the ONLY thing the mother panel's every-10-min ZYX cron needs from this worker, in one
+		// tiny answer (کرون ۱۰ دقیقه‌ای پنل مادر فقط همین را می‌خواند). The old way was GET /api/users, which on EVERY call
+		// flushes the caches (D1 writes), SELECTs the whole user row, builds the IP list, asks the Cloudflare GraphQL API for
+		// request counts (getCfUsage - an external round trip), upserts req_today/req_total, runs 5 SUM queries and ships
+		// a big JSON body the mother then has to parse - all of it just for 3 numbers. Here: ONE D1 round trip (a batch of
+		// 2 SELECTs), no write, no flush, no external call, ~300 bytes of JSON. That is what saves the mother's wall time
+		// (she awaits this fetch) and her CPU (she parses the answer). Same auth gate as every /api/* route (X-Master-Key).
+		// Shape: { ok: true, v: 1, now, trafficDaily (GB, rolling 24 h, same figure as GET /api/users), lifetimeBytes
+		// (cumulative bytes since the user was created - never decreases, never reset by "reset volume"; = lifetime_used_gb +
+		// what is still in this isolate's memory cache), deviceWarning, peakCount }.
+		// lifetimeBytes is what lets the mother tell "used something in the last 10 min" (difference of two readings) -
+		// trafficDaily cannot: it also FALLS when an old hour leaves the 24 h window.
+		// A worker holds exactly one user (the newest row, like users[0] of GET /api/users). An older mother never calls this
+		// route and an older worker without it just answers something that is not { ok, v:1 } - the mother then falls back to
+		// GET /api/users (see zyxChildSnapshot in MainPanel.js), so nothing breaks before "Update Panels".
+		if (url.pathname === "/api/usage-lite" && request.method === "GET") {
+			try {
+				const now = Date.now();
+				const dailyCutoffKey = utcHourKey(now - 24 * 3600000);
+				const [uRes, dRes] = await env.DB.batch([
+					env.DB.prepare("SELECT username, lifetime_used_gb, used_gb, device_warning_at, device_warning_peak_count FROM users ORDER BY id DESC LIMIT 1"),
+					env.DB.prepare("SELECT SUM(gb) as s FROM daily_traffic WHERE date >= ?").bind(dailyCutoffKey),
+				]);
+				const row = (uRes.results && uRes.results[0]) || null;
+				const GIB = 1024 * 1024 * 1024;
+				let pendingAllGb = 0;
+				for (const v of GLOBAL_TRAFFIC_CACHE.values()) pendingAllGb += v || 0;
+				pendingAllGb = pendingAllGb / GIB;
+				const trafficDaily = ((dRes.results && dRes.results[0] && dRes.results[0].s) || 0) + pendingAllGb;
+				let lifetimeBytes = null;
+				let deviceWarning = false, peakCount = null;
+				if (row) {
+					const lifeGb = (typeof row.lifetime_used_gb === "number" && row.lifetime_used_gb > 0) ? row.lifetime_used_gb : (row.used_gb || 0);
+					lifetimeBytes = Math.round(lifeGb * GIB + (GLOBAL_TRAFFIC_CACHE.get(row.username) || 0));
+					deviceWarning = !!(row.device_warning_at && now - row.device_warning_at < 24 * 60 * 60 * 1000);
+					peakCount = (typeof row.device_warning_peak_count === "number") ? row.device_warning_peak_count : null;
+				}
+				return new Response(JSON.stringify({ ok: true, v: 1, now: now, trafficDaily: trafficDaily, lifetimeBytes: lifetimeBytes, deviceWarning: deviceWarning, peakCount: peakCount }), {
+					headers: { "Content-Type": "application/json", "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0" },
+				});
+			} catch (e) {
+				// a real error (D1 down ...) → 500, NOT a fake "0": the mother must not log it as an idle reading.
+				return new Response(JSON.stringify({ error: String((e && e.message) || e) }), { status: 500, headers: { "Content-Type": "application/json" } });
+			}
+		}
 		// GET /api/stats-history: 30-day daily history for the Request and Traffic
 		// dashboard cards, used to draw the click-to-expand line charts. Reuses the
 		// same daily_requests / daily_traffic tables (and utcDateKey helper) as the
@@ -2567,7 +2626,7 @@ const Router = {
 						if (resetUser) await invalidateUserAuthCache(ctx, resetUser.uuid, resetUser.trojan_hash);
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} else {
-						const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = body;
+						const { username: new_username, uuid: new_uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, ech, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = body;
 						if (new_username && new_username !== username) {
 							if (!/^[a-zA-Z0-9_-]+$/.test(new_username)) {
 								return new Response(JSON.stringify({ error: "نام کاربری جدید غیرمجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
@@ -2637,8 +2696,8 @@ const Router = {
 							finalUserSocks5 = preserveProxyCountryTags(user_socks5, existingUser ? existingUser.user_socks5 : null);
 						}
 						try {
-							await env.DB.prepare("UPDATE users SET username = ?, uuid = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, advanced_frag = ?, cipher_suites = ?, tls_mask = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ?, start_on_first_connect = ?, enable_direct = ?, connection_type = CASE WHEN ? IS NOT NULL THEN ? ELSE connection_type END, trojan_hash = ? WHERE username = ?")
-								.bind(new_username || username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, finalUserSocks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 999999, (resetProxyToDefault || auto_rotate_user_proxy) ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
+							await env.DB.prepare("UPDATE users SET username = ?, uuid = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, advanced_frag = ?, cipher_suites = ?, tls_mask = ?, ech = CASE WHEN ? = 1 THEN ? ELSE ech END, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ?, start_on_first_connect = ?, enable_direct = ?, connection_type = CASE WHEN ? IS NOT NULL THEN ? ELSE connection_type END, trojan_hash = ? WHERE username = ?")
+								.bind(new_username || username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, ech !== undefined ? 1 : 0, normalizeEchValue(ech), user_proxy_iata || null, finalUserSocks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 999999, (resetProxyToDefault || auto_rotate_user_proxy) ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
 								.run();
 						} catch (err) {
 							// اگه این خطا دقیقاً برخورد با ایندکس UNIQUE جدید uuid باشه (فقط در یک ریس-کاندیشن واقعی ممکنه، چون بالاتر همین uuid چک شده)، همون پیام دوستانه‌ی همیشگی رو برگردون؛ برای هر خطای دیگه‌ی دیتابیس هم به‌جای کرش کردن، خطای تمیز JSON برگردون
@@ -2828,7 +2887,7 @@ const Router = {
 					}
 				}
 				if (request.method === "POST") {
-					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = await readJsonBody(request);
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, ech, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, early_data_enabled, early_data_size } = await readJsonBody(request);
 					if (!username) {
 						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
 					}
@@ -2907,8 +2966,8 @@ const Router = {
 						// the background right after insert (see ctx.waitUntil below) so
 						// this request doesn't have to wait on a full round of live
 						// proxy testing.
-						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, early_data_enabled, early_data_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct), finalEarlyDataEnabled, finalEarlyDataSize)
+						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, ech, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, early_data_enabled, early_data_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, finalIps || null, finalConnType, finalTls, finalPort, finalFingerprint, finalIpLimit, finalIpLimit, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, flagOf(block_porn, nud.new_user_block_porn), flagOf(block_ads, nud.new_user_block_ads), frag_len !== undefined ? frag_len : nud.new_user_frag_len, frag_int !== undefined ? frag_int : nud.new_user_frag_int, advanced_frag || null, cipher_suites || null, tls_mask || null, normalizeEchValue(ech), user_proxy_iata || null, null, user_proxy_ip || null, intOf(auto_reset_vol_days, nud.new_user_auto_reset_vol_days), intOf(auto_reset_req_days, nud.new_user_auto_reset_req_days), todayUtc, todayUtc, given(auto_rotate_ip) ? auto_rotate_ip || 0 : intOf(undefined, nud.new_user_auto_rotate_ip), rotate_time || 0, ip_operator || nud.new_user_ip_operator, ip_count || parseInt(nud.new_user_ip_count) || 999999, nowTime, flagOf(auto_rotate_user_proxy, nud.new_user_auto_rotate_user_proxy), flagOf(start_on_first_connect, nud.new_user_start_on_first_connect), null, trojanHash, flagOf(enable_direct, nud.new_user_enable_direct), finalEarlyDataEnabled, finalEarlyDataSize)
 							.run();
 						// Clears any stale negative-cache ("no such user") entry that might exist for
 						// this uuid/hash from an earlier probe or connection attempt with this UUID.
@@ -3013,6 +3072,7 @@ const DbService = {
 					{ name: "advanced_frag", def: "TEXT DEFAULT NULL" },
 					{ name: "cipher_suites", def: "TEXT DEFAULT NULL" },
 					{ name: "tls_mask", def: "TEXT DEFAULT NULL" },
+					{ name: "ech", def: "TEXT DEFAULT NULL" },
 					{ name: "is_active", def: "INTEGER DEFAULT 1" },
 					{ name: "last_active", def: "INTEGER" },
 					{ name: "fingerprint", def: "TEXT DEFAULT 'chrome'" },
@@ -3614,6 +3674,7 @@ const SubscriptionService = {
 					if (user.advanced_frag) userFrag += "&fm=" + encodeURIComponent(user.advanced_frag);
 					if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
 					if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
+					userFrag += buildEchLinkParam(user, isTlsPort);
 						
 					const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 
@@ -3638,6 +3699,7 @@ const SubscriptionService = {
 			if (user.advanced_frag) userFrag += "&fm=" + encodeURIComponent(user.advanced_frag);
 			if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
 			if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
+			userFrag += buildEchLinkParam(user, isTlsPort);
 			const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 			const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + buildEarlyDataPathSuffix(user));
 			otherCleanIps.forEach((otherIp, otherIdx) => {
@@ -7574,6 +7636,28 @@ Commercial support is available at
 									</button>
 								</div>
 							</div>
+							<div class="border border-teal-200 dark:border-teal-900/60 bg-teal-50/40 dark:bg-teal-950/20 rounded-xl overflow-hidden shadow-sm">
+								<div class="flex items-center justify-between p-3.5 bg-teal-100/50 dark:bg-teal-900/40 cursor-pointer" onclick="document.getElementById('input-ech-settings-toggle').click()">
+									<div class="flex items-center gap-2">
+										<svg class="w-4 h-4 text-teal-600 dark:text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
+										<span class="text-xs font-black text-teal-900 dark:text-teal-300">تنظیمات ECH</span>
+									</div>
+									<div class="flex items-center gap-2" onclick="event.stopPropagation()">
+										<label class="relative inline-flex items-center cursor-pointer select-none">
+											<input type="checkbox" id="input-ech-settings-toggle" onchange="toggleEchSettingsInputs(this.checked)" class="sr-only peer">
+											<div class="w-8 h-4 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-teal-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-3 after:w-3 after:transition-transform peer-checked:after:-translate-x-[16px]"></div>
+										</label>
+										<svg id="ech-settings-icon" class="w-4 h-4 text-teal-600 dark:text-teal-400 transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+									</div>
+								</div>
+								<div id="ech-settings-container" class="hidden opacity-50 pointer-events-none transition-opacity duration-300 p-4 border-t border-teal-100 dark:border-teal-950 space-y-3 bg-white dark:bg-slate-900">
+									<div>
+										<label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1">مقدار ECH</label>
+										<input type="text" id="input-ech-value" value="cloudflare-ech.com+udp://1.1.1.1" dir="ltr" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-1 focus:ring-teal-500 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400">
+									</div>
+									<p class="text-[10px] text-gray-400 dark:text-zinc-500 leading-relaxed">فرمت: دامنه+DNS. فقط روی پورت‌های TLS (لینک vless/trojan) اعمال می‌شود و کلاینت باید ECH را پشتیبانی کند.</p>
+								</div>
+							</div>
 						</div>
 						
 						<div id="tab-proxy-settings" class="user-tab-panel hidden space-y-4">
@@ -8809,6 +8893,19 @@ ${COMMON_TOAST_HTML}
 				container.classList.add('hidden', 'opacity-50', 'pointer-events-none');
 			}
 		};
+		window.toggleEchSettingsInputs = function(show) {
+			const container = document.getElementById('ech-settings-container');
+			const icon = document.getElementById('ech-settings-icon');
+			if (container) {
+				if (show) {
+					container.classList.remove('opacity-50', 'pointer-events-none', 'hidden');
+					if (icon) icon.classList.add('rotate-180');
+				} else {
+					container.classList.add('opacity-50', 'pointer-events-none', 'hidden');
+					if (icon) icon.classList.remove('rotate-180');
+				}
+			}
+		};
 		window.switchUserTab = function(tabId) {
 			const tabs = [
 				{ id: 'tab-user-info', btn: 'tab-btn-user-info' },
@@ -8878,6 +8975,11 @@ ${COMMON_TOAST_HTML}
 				const edSizeReset = document.getElementById('input-early-data-size');
 				if (edSizeReset) edSizeReset.value = '2560';
 				if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(false);
+				const echInputReset = document.getElementById('input-ech-value');
+				if (echInputReset) echInputReset.value = 'cloudflare-ech.com+udp://1.1.1.1';
+				const echToggleReset = document.getElementById('input-ech-settings-toggle');
+				if (echToggleReset) echToggleReset.checked = false;
+				if (typeof window.toggleEchSettingsInputs === 'function') window.toggleEchSettingsInputs(false);
 				const customPortInput = document.getElementById('input-custom-ports');
 				if (customPortInput) customPortInput.value = '';
 				const advFragInput = document.getElementById('input-advanced-frag');
@@ -9832,6 +9934,8 @@ let activeRocketBtn = null;
 			const tls_mask = (isAdvancedSettingsOn && document.getElementById('input-tls-mask')) ? document.getElementById('input-tls-mask').value.trim() : "";
 			const early_data_enabled = (document.getElementById('input-early-data-toggle') && document.getElementById('input-early-data-toggle').checked) ? 1 : 0;
 			const early_data_size = Math.min(8192, Math.max(1, parseInt(document.getElementById('input-early-data-size') ? document.getElementById('input-early-data-size').value : '', 10) || 2560));
+			const isEchOn = document.getElementById('input-ech-settings-toggle') ? document.getElementById('input-ech-settings-toggle').checked : false;
+			const ech = isEchOn && document.getElementById('input-ech-value') ? document.getElementById('input-ech-value').value.trim() : "";
 			const isAutoReset = document.getElementById('input-auto-reset-toggle').checked;
 			const auto_reset_vol_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-vol').value) || 0 : 0;
 			const auto_reset_req_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-req').value) || 0 : 0;
@@ -9871,6 +9975,7 @@ let activeRocketBtn = null;
 						username, uuid, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int,
 						advanced_frag: advanced_frag || null, cipher_suites: cipher_suites || null, tls_mask: tls_mask || null,
 						early_data_enabled: early_data_enabled, early_data_size: early_data_size,
+						ech: ech || null,
 						user_proxy_iata: null,
 						user_socks5: userSocks5 || null,
 						reset_user_to_default: isEditMode && window.resetUserToDefaultPending === true,
@@ -10612,6 +10717,7 @@ function downloadZYXSource() {
 						if (user.advanced_frag) userFrag += "&fm=" + encodeURIComponent(user.advanced_frag);
 						if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
 						if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
+						if (isTlsPort && user.ech) userFrag += "&ech=" + encodeURIComponent(user.ech);
 						
 						const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 
@@ -10636,6 +10742,7 @@ function downloadZYXSource() {
 				if (user.advanced_frag) userFrag += "&fm=" + encodeURIComponent(user.advanced_frag);
 				if (isTlsPort && user.cipher_suites) userFrag += "&cs=" + encodeURIComponent(user.cipher_suites);
 				if (user.tls_mask) userFrag += "&mask=" + encodeURIComponent(user.tls_mask);
+				if (isTlsPort && user.ech) userFrag += "&ech=" + encodeURIComponent(user.ech);
 				const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + edSuffix);
 				otherCleanIps.forEach(function(otherIp, otherIdx) {
@@ -10800,6 +10907,12 @@ function populateUserFormFields(user) {
 	const edSizeEdit = document.getElementById('input-early-data-size');
 	if (edSizeEdit) edSizeEdit.value = String((edUserSize >= 1 && edUserSize <= 8192) ? edUserSize : 2560);
 	if (typeof window.toggleEarlyDataInputs === 'function') window.toggleEarlyDataInputs(edUserOn);
+	const echInputEdit = document.getElementById('input-ech-value');
+	if (echInputEdit) echInputEdit.value = user.ech || 'cloudflare-ech.com+udp://1.1.1.1';
+	const hasEchEdit = Boolean(user.ech && String(user.ech).trim() !== '');
+	const echToggleEdit = document.getElementById('input-ech-settings-toggle');
+	if (echToggleEdit) echToggleEdit.checked = hasEchEdit;
+	if (typeof window.toggleEchSettingsInputs === 'function') window.toggleEchSettingsInputs(hasEchEdit);
 	const advFragInput = document.getElementById('input-advanced-frag');
 	if (advFragInput) advFragInput.value = user.advanced_frag || '';
 	const csInput = document.getElementById('input-cipher-suites');
@@ -11725,6 +11838,11 @@ window.resetUserToDefault = async function() {
 	if (csInput) csInput.value = '';
 	const maskInput = document.getElementById('input-tls-mask');
 	if (maskInput) maskInput.value = '';
+	const echInputDef = document.getElementById('input-ech-value');
+	if (echInputDef) echInputDef.value = 'cloudflare-ech.com+udp://1.1.1.1';
+	const echToggleDef = document.getElementById('input-ech-settings-toggle');
+	if (echToggleDef) echToggleDef.checked = false;
+	if (typeof window.toggleEchSettingsInputs === 'function') window.toggleEchSettingsInputs(false);
 	if (typeof window.toggleAdvancedSettingsInputs === 'function') window.toggleAdvancedSettingsInputs(false);
 	const customPortInput = document.getElementById('input-custom-ports');
 	if (customPortInput) customPortInput.value = '';
@@ -12004,6 +12122,7 @@ async function testUserSocksProxy() {
 							advanced_frag: u.advanced_frag,
 							cipher_suites: u.cipher_suites,
 							tls_mask: u.tls_mask,
+							ech: u.ech,
 							early_data_enabled: u.early_data_enabled,
 							early_data_size: u.early_data_size,
 							user_proxy_iata: u.user_proxy_iata,
@@ -13588,6 +13707,7 @@ ${COMMON_TOAST_HTML}
 						if (u.advanced_frag) userFrag += "&fm=" + encodeURIComponent(u.advanced_frag);
 						if (isTlsPort && u.cipher_suites) userFrag += "&cs=" + encodeURIComponent(u.cipher_suites);
 						if (u.tls_mask) userFrag += "&mask=" + encodeURIComponent(u.tls_mask);
+						if (isTlsPort && u.ech) userFrag += "&ech=" + encodeURIComponent(u.ech);
 						
 						const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 
@@ -13612,6 +13732,7 @@ ${COMMON_TOAST_HTML}
 				if (u.advanced_frag) userFrag += "&fm=" + encodeURIComponent(u.advanced_frag);
 				if (isTlsPort && u.cipher_suites) userFrag += "&cs=" + encodeURIComponent(u.cipher_suites);
 				if (u.tls_mask) userFrag += "&mask=" + encodeURIComponent(u.tls_mask);
+				if (isTlsPort && u.ech) userFrag += "&ech=" + encodeURIComponent(u.ech);
 				const tlsParams = isTlsPort ? ("&insecure=0&fp=" + fp + "&allowInsecure=0&sni=" + host) : "";
 				const otherDynPath = encodeURIComponent(rawPath + inlineProxySegment + edSuffix);
 				otherCleanIps.forEach(function(otherIp, otherIdx) {
